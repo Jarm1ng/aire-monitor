@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# SwiftPM and build products
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Local runtime state
+.runtime/
+ssh-control/
+*.log
+snapshot.json
+latest_snapshot*.json
+last_snapshot.json
+job_state.json
+snapshot_history.json
+
+# Local secrets and environment
+.env
+.env.*
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+
+# Editor state
+.vscode/
+.idea/
+*.swp

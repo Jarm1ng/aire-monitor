@@ -1,0 +1,163 @@
+#!/usr/bin/expect -f
+#
+# Interactive AIRE login helper for the macOS app.
+#
+# Reads configuration from environment variables:
+#   AIRE_CONNECTION_MODE ("alias" or "explicit")
+#   AIRE_SSH_ALIAS
+#   AIRE_USERNAME
+#   AIRE_HOSTNAME
+#   AIRE_JUMP_HOSTNAME
+#   AIRE_DUO_OPTION
+#   AIRE_CONTROL_PATH
+#   AIRE_TIMEOUT
+#
+# Reads the password from stdin unless AIRE_PASSWORD is set. The helper only
+# starts an OpenSSH ControlMaster and verifies it with a read-only command.
+
+proc env_or_default {name default} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} {
+        return $::env($name)
+    }
+    return $default
+}
+
+set username [env_or_default "AIRE_USERNAME" ""]
+set connection_mode [env_or_default "AIRE_CONNECTION_MODE" "alias"]
+set ssh_alias [env_or_default "AIRE_SSH_ALIAS" "aire"]
+set aire_hostname [env_or_default "AIRE_HOSTNAME" "aire.leeds.ac.uk"]
+set jump_hostname [env_or_default "AIRE_JUMP_HOSTNAME" "rash.leeds.ac.uk"]
+set duo_option [env_or_default "AIRE_DUO_OPTION" "1"]
+set control_path [env_or_default "AIRE_CONTROL_PATH" ""]
+set timeout [env_or_default "AIRE_TIMEOUT" "120"]
+
+if {$connection_mode ne "alias" && $username eq ""} {
+    puts stderr "AIRE_USERNAME is required"
+    exit 2
+}
+
+if {$connection_mode eq "alias" && $ssh_alias eq ""} {
+    puts stderr "AIRE_SSH_ALIAS is required when AIRE_CONNECTION_MODE=alias"
+    exit 2
+}
+
+if {[info exists ::env(AIRE_PASSWORD)] && $::env(AIRE_PASSWORD) ne ""} {
+    set password $::env(AIRE_PASSWORD)
+} else {
+    if {[gets stdin password] < 0} {
+        puts stderr "Password was not provided on stdin"
+        exit 2
+    }
+}
+
+set ssh_args [list \
+    ssh \
+    -M \
+    -o StrictHostKeyChecking=accept-new \
+    -o PubkeyAuthentication=no \
+    -o PreferredAuthentications=password,keyboard-interactive \
+    -o KbdInteractiveAuthentication=yes \
+    -o PasswordAuthentication=yes \
+    -o NumberOfPasswordPrompts=8 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=6 \
+    -o ConnectTimeout=20 \
+]
+
+if {$control_path ne ""} {
+    lappend ssh_args \
+        -o ControlMaster=yes \
+        -o ControlPersist=2h \
+        -o ControlPath=$control_path
+}
+
+if {$connection_mode eq "alias"} {
+    lappend ssh_args \
+        $ssh_alias \
+        {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
+} else {
+    lappend ssh_args \
+        -o User=$username \
+        -o ProxyJump=$username@$jump_hostname \
+        $aire_hostname \
+        {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
+}
+
+eval spawn $ssh_args
+
+set saw_success 0
+
+expect {
+    -nocase -re "are you sure you want to continue connecting.*" {
+        send "yes\r"
+        exp_continue
+    }
+    -nocase -re "password.*:" {
+        send "$password\r"
+        exp_continue
+    }
+    -nocase -re "passcode.*option" {
+        send "$duo_option\r"
+        exp_continue
+    }
+    -nocase -re "select one of the following options" {
+        send "$duo_option\r"
+        exp_continue
+    }
+    -nocase -re "enter a passcode.*:" {
+        send "$duo_option\r"
+        exp_continue
+    }
+    -nocase -re "select.*option.*:" {
+        send "$duo_option\r"
+        exp_continue
+    }
+    -nocase -re "verification code.*:" {
+        send "$duo_option\r"
+        exp_continue
+    }
+    -re "auth_ok\\|.*" {
+        set saw_success 1
+        puts $expect_out(0,string)
+        exp_continue
+    }
+    eof {
+        set wait_result [wait]
+        set exit_code [lindex $wait_result 3]
+        if {$saw_success == 1 && $exit_code == 0} {
+            set verify_args [list \
+                ssh \
+                -o BatchMode=yes \
+                -o ConnectTimeout=20 \
+            ]
+            if {$control_path ne ""} {
+                lappend verify_args \
+                    -o ControlPath=$control_path \
+                    -o ControlMaster=auto \
+                    -o ControlPersist=2h
+            }
+            if {$connection_mode eq "alias"} {
+                lappend verify_args \
+                    $ssh_alias \
+                    {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
+            } else {
+                lappend verify_args \
+                    -o User=$username \
+                    -o ProxyJump=$username@$jump_hostname \
+                    $aire_hostname \
+                    {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
+            }
+            if {[catch {exec {*}$verify_args} verify_output]} {
+                puts stderr $verify_output
+                exit 1
+            }
+            puts $verify_output
+            exit 0
+        }
+        exit $exit_code
+    }
+    timeout {
+        puts stderr "Timed out while waiting for SSH, password, or Duo prompt"
+        exit 124
+    }
+}

@@ -1,0 +1,30 @@
+Host aire
+    HostName aire.leeds.ac.uk
+    User <your-username>
+    ProxyJump %r@rash.leeds.ac.uk
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 8
+    ControlMaster auto
+    ControlPersist 2h
+    ControlPath .runtime/ssh-control/%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    ConnectTimeout 20
+
+Host rash
+    HostName rash.leeds.ac.uk
+    User <your-username>
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 8
+    ControlMaster auto
+    ControlPersist 2h
+    ControlPath .runtime/ssh-control/%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    ConnectTimeout 20
