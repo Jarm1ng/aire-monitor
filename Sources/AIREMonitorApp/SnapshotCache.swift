@@ -169,6 +169,19 @@ extension JSONEncoder {
 final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
     private var isAuthorized = false
     private var didRequestAuthorization = false
+    private let terminalStateKeywords = [
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "SPECIAL_EXIT",
+        "TIMEOUT"
+    ]
 
     func configure() {
         guard !didRequestAuthorization else {
@@ -199,30 +212,72 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         let currentById = Dictionary(uniqueKeysWithValues: jobs.map { ($0.jobId, $0) })
 
         for job in jobs {
-            guard let old = previous.jobs[job.jobId], old.state != job.state else {
+            guard let old = previous.jobs[job.jobId],
+                  old.state != job.state,
+                  isTerminalState(job.state) else {
                 continue
             }
-            send(
-                title: "AIRE job changed",
-                body: "\(job.name) moved \(old.state) -> \(job.state)",
-                identifier: "job-state-\(job.jobId)-\(job.state)"
+            sendJobEndedNotification(
+                name: job.name,
+                jobId: job.jobId,
+                partition: job.partition,
+                lastState: old.state,
+                finalState: job.state,
+                detail: "Final state reported by Slurm."
             )
         }
 
-        for old in previous.jobs.values where currentById[old.jobId] == nil {
-            send(
-                title: "AIRE job left queue",
-                body: "\(old.name) is no longer visible in squeue",
-                identifier: "job-left-\(old.jobId)-\(previous.updatedAt)"
+        for old in previous.jobs.values where currentById[old.jobId] == nil && !isTerminalState(old.state) {
+            sendJobEndedNotification(
+                name: old.name,
+                jobId: old.jobId,
+                partition: old.partition,
+                lastState: old.state,
+                finalState: "Left queue",
+                detail: "The job is no longer visible in squeue."
             )
         }
     }
 
-    private func send(title: String, body: String, identifier: String) {
+    private func isTerminalState(_ state: String) -> Bool {
+        let normalized = state.uppercased()
+        return terminalStateKeywords.contains { normalized.contains($0) }
+    }
+
+    private func sendJobEndedNotification(
+        name: String,
+        jobId: String,
+        partition: String,
+        lastState: String,
+        finalState: String,
+        detail: String
+    ) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = cleanName.isEmpty ? "Job \(jobId)" : cleanName
+        let subtitle = finalState == "Left queue"
+            ? "Job finished or left the queue"
+            : "Job ended: \(finalState)"
+        let body = [
+            "\(displayName) (#\(jobId))",
+            "Partition \(partition) • previous state \(lastState)",
+            detail
+        ].joined(separator: "\n")
+
+        send(
+            title: "AIRE Monitor",
+            subtitle: subtitle,
+            body: body,
+            identifier: "job-ended-\(jobId)-\(finalState)-\(ISO8601DateFormatter().string(from: Date()))"
+        )
+    }
+
+    private func send(title: String, subtitle: String, body: String, identifier: String) {
         let content = UNMutableNotificationContent()
         content.title = title
+        content.subtitle = subtitle
         content.body = body
         content.sound = .default
+        content.threadIdentifier = "aire-job-events"
 
         let request = UNNotificationRequest(
             identifier: identifier,

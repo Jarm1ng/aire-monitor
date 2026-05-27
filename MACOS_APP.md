@@ -60,6 +60,23 @@ The main app sidebar also includes a `Widget` button that opens the desktop widg
 
 This repository is currently built with Command Line Tools only, not full Xcode. A true macOS WidgetKit extension requires an Xcode app target and extension target, so the current implementation is a local desktop companion rather than a system Notification Center widget.
 
+## Visual Design
+
+The app uses macOS system materials for the main sidebar, dashboard cards, menu bar panel, and desktop widget shell. This gives the interface a glass-like layered feel while keeping dense monitoring content, tables, logs, paths, and quota numbers on readable surfaces. Motion is intentionally local: hover lift on cards, smooth meter changes, restrained status transitions, and animated detail surfaces inside the dashboard and menu panel.
+
+Menu bar monitor:
+
+When the main app is running, it also installs a compact native AppKit menu bar item. The top label is intentionally simple and low overhead: if a job is running, it shows the current job name and elapsed runtime; if multiple jobs are running, it shows the running count; if no job is running, it falls back to GPU availability such as `GPU 8`. The visible status text is self-drawn so it remains white across menu bar appearances, while the background stays transparent until the menu is open. Refresh, live, cached, offline, running-job, and GPU states are communicated with short text rather than a continuously animated SwiftUI status view. The tooltip includes running/pending counts, storage status, live/cached/offline state, and GPU fleet context. Clicking it opens a small monitoring panel with:
+
+- live/cached/offline state
+- running jobs, pending jobs, and storage risk summary tiles
+- current running/pending jobs, including job name, job id, partition, state, elapsed/time limit, node or pending reason, and Slurm TRES resource summary
+- enhanced home/scratch storage rows with percent used, free space, quota, limit, and file-count pressure when quota data is available
+- GPU allocation as a secondary fleet summary
+- quick actions for Refresh, Open, and Widget
+
+The menu bar monitor uses the same shared `AppModel` as the main dashboard, so it follows the same 10-second read-only refresh loop and cached/offline behavior.
+
 The app expects to be launched from this repository so it can find:
 
 ```text
@@ -115,7 +132,7 @@ In local SSH alias mode, the app uses the `ControlPath` and `ProxyJump` from the
 
 In explicit mode, the app uses a relative OpenSSH `ControlPath` (`.runtime/ssh-control/%C`) because macOS Unix domain sockets have a short path-length limit. Do not change this to a long absolute path.
 
-Follow-up refreshes use that local control socket with `BatchMode=yes`, so they should not repeatedly ask for password and Duo while the control connection is alive.
+Follow-up refreshes use that local control socket with `BatchMode=yes`, so they should not repeatedly ask for password and Duo while the control connection is alive. When the main app starts, it loads the latest local cache first, starts a 10-second auto-refresh loop, then does one non-interactive refresh probe. If an existing SSH ControlMaster/session is usable, the app switches to live mode. If not, it stays in cached/offline mode and keeps retrying every 10 seconds until Login, a restored SSH session, or a successful manual Refresh restores live data.
 
 If login fails, the app now shows a short diagnosis plus raw SSH output. For example, a `Connection timed out during banner exchange` after the jump host usually means the generated explicit ProxyJump path could not open the AIRE SSH banner; switch back to local SSH alias mode first.
 
@@ -159,7 +176,7 @@ The main app now keeps a local read-only cache under:
 .runtime/snapshot_history.json
 ```
 
-After login, the main app refreshes in the background every 30 seconds and updates the cache. If a refresh fails, the app keeps the latest cached snapshot visible instead of blanking the dashboard.
+While the main app is open, it refreshes in the background every 10 seconds and updates the cache after each successful read-only snapshot. If a refresh fails, the app keeps the latest cached snapshot visible, marks the session as cached/offline, keeps retrying, and avoids overwriting the cache with failed data.
 
 The history file stores compact trend points from each successful snapshot. The Trends tab visualizes GPU availability, GPU allocation, job queue pressure, unavailable GPU nodes, and home/scratch storage pressure over time. The chart history is local only and capped at the newest 1440 points.
 
@@ -170,10 +187,12 @@ The Storage tab reads quota-backed storage data from read-only commands:
 
 It visualizes used percentage, remaining GB/TB, quota limit, and file-count pressure where the server exposes file limits.
 
-Task notifications are local macOS notifications. The app asks for notification permission, compares the previous job state in `.runtime/job_state.json` against the newest `squeue` snapshot, and notifies when:
+Task notifications are local macOS notifications. The app asks for notification permission, compares the previous job state in `.runtime/job_state.json` against the newest `squeue` snapshot, and only notifies when a job appears to have ended. Starting jobs and ordinary pending-to-running transitions are intentionally quiet. End notifications are sent when:
 
-- a visible job changes state
-- a previously visible job leaves `squeue`
+- a visible job reaches a terminal Slurm state such as `COMPLETED`, `FAILED`, `CANCELLED`, `TIMEOUT`, `OUT_OF_MEMORY`, or `NODE_FAIL`
+- a previously visible non-terminal job leaves `squeue`
+
+Notification copy uses the native macOS banner style with the AIRE Monitor app identity, a concise end-state subtitle, and a short body containing the job name, job id, partition, previous state, and why the app considers it finished.
 
 Job cards in the Jobs view are clickable. The detail sheet combines `squeue` with read-only `scontrol show job -o` fields, including submit/start/end time, batch host, node list, requested/allocated TRES, work directory, command, stdout, and stderr paths when Slurm exposes them.
 

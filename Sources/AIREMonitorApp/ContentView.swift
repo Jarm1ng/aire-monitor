@@ -9,27 +9,106 @@ private enum AIRETheme {
     static let border = Color.primary.opacity(0.08)
     static let softBorder = Color.primary.opacity(0.05)
     static let mutedFill = Color.primary.opacity(0.035)
+    static let glassHighlight = Color.white.opacity(0.18)
+    static let cardShadow = Color.black.opacity(0.08)
     static let gpu = Color.cyan
     static let cpu = Color.teal
     static let storage = Color.indigo
     static let warning = Color.orange
+
+    static let softSpring = Animation.spring(response: 0.32, dampingFraction: 0.86)
+    static let smoothEase = Animation.easeInOut(duration: 0.22)
+}
+
+private struct DashboardBackdrop: View {
+    var body: some View {
+        ZStack {
+            AIRETheme.pageBackground
+            LinearGradient(
+                colors: [
+                    Color.primary.opacity(0.035),
+                    AIRETheme.gpu.opacity(0.035),
+                    Color.clear
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct GlassCardModifier: ViewModifier {
+    let padding: CGFloat
+    let cornerRadius: CGFloat
+    let accent: Color
+    let isInteractive: Bool
+
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+
+        content
+            .padding(padding)
+            .background {
+                shape
+                    .fill(.regularMaterial)
+                    .overlay {
+                        shape
+                            .fill(accent.opacity(isHovered ? 0.095 : 0.045))
+                    }
+                    .overlay(alignment: .top) {
+                        LinearGradient(
+                            colors: [
+                                AIRETheme.glassHighlight.opacity(isHovered ? 1 : 0.72),
+                                Color.white.opacity(0.02)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .clipShape(shape)
+                    }
+            }
+            .overlay {
+                shape
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(isHovered ? 0.34 : 0.20),
+                                AIRETheme.border,
+                                accent.opacity(isHovered ? 0.24 : 0.10)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+            .clipShape(shape)
+            .contentShape(shape)
+            .shadow(color: AIRETheme.cardShadow.opacity(isHovered ? 1 : 0.68), radius: isHovered ? 14 : 9, x: 0, y: isHovered ? 7 : 4)
+            .scaleEffect(isInteractive && isHovered ? 1.012 : 1)
+            .onHover { hovering in
+                guard isInteractive else { return }
+                isHovered = hovering
+            }
+            .animation(AIRETheme.softSpring, value: isHovered)
+    }
 }
 
 private extension View {
-    func dashboardCard(padding: CGFloat = 12) -> some View {
-        self
-            .padding(padding)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(AIRETheme.panelBackground)
+    func dashboardCard(padding: CGFloat = 12, accent: Color = .primary, isInteractive: Bool = false) -> some View {
+        modifier(
+            GlassCardModifier(
+                padding: padding,
+                cornerRadius: 10,
+                accent: accent,
+                isInteractive: isInteractive
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(AIRETheme.border, lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .shadow(color: Color.black.opacity(0.045), radius: 8, x: 0, y: 3)
+        )
     }
+
 }
 
 struct AIRELogoMark: View {
@@ -52,8 +131,9 @@ struct AIRELogoMark: View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                .stroke(Color.white.opacity(0.24), lineWidth: 1)
         )
+        .shadow(color: Color.black.opacity(0.10), radius: 8, x: 0, y: 3)
     }
 
     private static func logoImage() -> NSImage? {
@@ -67,7 +147,7 @@ struct AIRELogoMark: View {
 }
 
 struct ContentView: View {
-    @StateObject private var model = AppModel()
+    @ObservedObject var model: AppModel
 
     var body: some View {
         NavigationSplitView {
@@ -79,12 +159,17 @@ struct ContentView: View {
                 Spacer()
             }
             .padding(16)
-            .background(AIRETheme.sidebarBackground)
+            .background(.thinMaterial)
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(AIRETheme.border)
+                    .frame(width: 1)
+            }
             .navigationTitle("AIRE")
             .frame(minWidth: 340)
         } detail: {
             DashboardView(model: model)
-                .background(AIRETheme.pageBackground)
+                .background(DashboardBackdrop())
         }
         .frame(minWidth: 1240, minHeight: 780)
     }
@@ -172,15 +257,15 @@ struct ContentView: View {
 
     private var statusPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionTitle(title: "Session", subtitle: model.isLoggedIn ? "Connected" : "Not connected")
+            SectionTitle(title: "Session", subtitle: sessionSubtitle)
             HStack {
                 Circle()
-                    .fill(model.isLoggedIn ? Color.green : Color.gray)
+                    .fill(sessionColor)
                     .frame(width: 8, height: 8)
                 Text(model.statusMessage)
                     .lineLimit(3)
                     .font(.callout)
-                    .foregroundStyle(model.isLoggedIn ? .primary : .secondary)
+                    .foregroundStyle(model.isLoggedIn || model.hasCachedSnapshot ? .primary : .secondary)
             }
 
             if let error = model.errorMessage, !error.isEmpty {
@@ -193,11 +278,37 @@ struct ContentView: View {
                 }
                 .frame(minHeight: 90, maxHeight: 180)
                 .padding(8)
-                .background(AIRETheme.insetBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.red.opacity(0.18), lineWidth: 1)
+                )
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .dashboardCard()
+        .dashboardCard(accent: sessionColor)
+        .animation(AIRETheme.smoothEase, value: model.errorMessage)
+        .animation(AIRETheme.softSpring, value: sessionSubtitle)
+    }
+
+    private var sessionSubtitle: String {
+        if model.isLoggedIn {
+            return "Connected"
+        }
+        if model.hasCachedSnapshot {
+            return "Cached / offline"
+        }
+        return "Not connected"
+    }
+
+    private var sessionColor: Color {
+        if model.isLoggedIn {
+            return .green
+        }
+        if model.hasCachedSnapshot {
+            return .orange
+        }
+        return .gray
     }
 }
 
@@ -276,7 +387,7 @@ struct PageHeader<Trailing: View>: View {
             Spacer(minLength: 12)
             trailing
         }
-        .dashboardCard(padding: 12)
+        .dashboardCard(padding: 12, accent: accent)
     }
 }
 
@@ -302,6 +413,11 @@ struct InfoChip: View {
         .background(color.opacity(0.10))
         .foregroundStyle(color)
         .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        )
+        .animation(AIRETheme.smoothEase, value: value)
     }
 }
 
@@ -330,11 +446,13 @@ struct SegmentedMeter: View {
                         RoundedRectangle(cornerRadius: height / 2)
                             .fill(segment.color)
                             .frame(width: max(proxy.size.width * CGFloat(segment.value) / CGFloat(total), 7))
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     }
                 }
             }
         }
         .frame(height: height)
+        .animation(AIRETheme.softSpring, value: total)
     }
 }
 
@@ -380,16 +498,17 @@ struct DashboardView: View {
                 }
             }
             Spacer()
-            StatusBadge(isConnected: model.isLoggedIn)
+            StatusBadge(isConnected: model.isLoggedIn, isCached: model.hasCachedSnapshot)
             Button {
                 model.refresh()
             } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+                Label(model.isRefreshing ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
             }
             .disabled(model.isRefreshing || model.isLoggingIn)
             .buttonStyle(.bordered)
             .controlSize(.large)
         }
+        .animation(AIRETheme.smoothEase, value: model.isRefreshing)
     }
 
     private var summaryCards: some View {
@@ -408,20 +527,53 @@ struct DashboardView: View {
 
 struct StatusBadge: View {
     let isConnected: Bool
+    let isCached: Bool
+
+    private var label: String {
+        if isConnected {
+            return "Connected"
+        }
+        if isCached {
+            return "Cached"
+        }
+        return "Offline"
+    }
+
+    private var color: Color {
+        if isConnected {
+            return .green
+        }
+        if isCached {
+            return .orange
+        }
+        return .gray
+    }
 
     var body: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(isConnected ? Color.green : Color.gray)
+                .fill(color)
                 .frame(width: 8, height: 8)
-            Text(isConnected ? "Connected" : "Offline")
+            Text(label)
                 .font(.caption.weight(.medium))
-                .foregroundStyle(isConnected ? .green : .secondary)
+                .foregroundStyle(isConnected || isCached ? color : .secondary)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background((isConnected ? Color.green : Color.gray).opacity(0.10))
+        .background {
+            Capsule()
+                .fill(.thinMaterial)
+                .overlay {
+                    Capsule()
+                        .fill(color.opacity(0.11))
+                }
+        }
+        .overlay {
+            Capsule()
+                .stroke(color.opacity(0.18), lineWidth: 1)
+        }
         .clipShape(Capsule())
+        .animation(AIRETheme.softSpring, value: label)
     }
 }
 
@@ -456,7 +608,8 @@ struct MetricView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dashboardCard(padding: 11)
+        .dashboardCard(padding: 11, accent: accent, isInteractive: true)
+        .animation(AIRETheme.softSpring, value: value)
     }
 }
 
@@ -507,7 +660,8 @@ struct EmptyVisual: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 150)
-        .dashboardCard(padding: 20)
+        .dashboardCard(padding: 20, accent: .secondary)
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
     }
 }
 
@@ -571,6 +725,7 @@ struct JobsDashboard: View {
                 )
             } else {
                 JobPulsePanel(jobs: jobs)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
 
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 340), spacing: 10)], spacing: 10) {
@@ -589,8 +744,10 @@ struct JobsDashboard: View {
                 SectionHeader(title: "Job details", subtitle: "\(jobs.count) rows")
                 JobsTable(jobs: jobs)
                     .frame(minHeight: 220)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+        .animation(AIRETheme.smoothEase, value: showDetails)
         .sheet(item: $selectedJob) { job in
             JobDetailView(job: job)
                 .frame(width: 720, height: 620)
@@ -664,20 +821,24 @@ struct JobPulsePanel: View {
                         .font(.caption)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(AIRETheme.mutedFill)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(AIRETheme.border, lineWidth: 1)
+                        )
                     }
                 }
             }
             .frame(maxWidth: 330)
         }
-        .dashboardCard(padding: 13)
+        .dashboardCard(padding: 13, accent: .blue)
     }
 }
 
 struct JobCard: View {
     let job: Job
     var onSelect: (() -> Void)?
+    @State private var isHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
@@ -703,12 +864,14 @@ struct JobCard: View {
                 Label(job.partition, systemImage: isGPU ? "memorychip" : "cpu")
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(accentColor.opacity(0.10))
+                    .background(accentColor.opacity(0.10), in: Capsule())
+                    .overlay(Capsule().stroke(accentColor.opacity(0.18), lineWidth: 1))
                     .clipShape(Capsule())
                 Label("\(job.nodes) node\(job.nodes == "1" ? "" : "s")", systemImage: "server.rack")
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(AIRETheme.mutedFill)
+                    .background(.thinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
                     .clipShape(Capsule())
             }
             .font(.caption)
@@ -739,24 +902,35 @@ struct JobCard: View {
             }
         }
         .padding(13)
-        .background(jobCardBackground)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(isHovered ? hoveredJobCardTint : jobCardTint)
+                }
+        }
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(accentColor.opacity(0.22), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(accentColor.opacity(isHovered ? 0.34 : 0.22), lineWidth: 1)
         )
         .overlay(alignment: .top) {
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(accentColor.opacity(0.70))
-                .frame(height: 3)
+                .frame(height: isHovered ? 4 : 3)
                 .padding(.horizontal, 10)
                 .padding(.top, 0)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .shadow(color: Color.black.opacity(0.035), radius: 6, x: 0, y: 2)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .shadow(color: Color.black.opacity(isHovered ? 0.10 : 0.04), radius: isHovered ? 12 : 6, x: 0, y: isHovered ? 6 : 2)
+        .scaleEffect(isHovered ? 1.01 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onHover { isHovered = $0 }
         .onTapGesture {
             onSelect?()
         }
+        .animation(AIRETheme.softSpring, value: isHovered)
+        .animation(AIRETheme.smoothEase, value: job.state)
     }
 
     private var isGPU: Bool {
@@ -774,7 +948,7 @@ struct JobCard: View {
         return .secondary
     }
 
-    private var jobCardBackground: Color {
+    private var jobCardTint: Color {
         let state = job.state.lowercased()
         if state.contains("run") {
             return isGPU ? AIRETheme.gpu.opacity(0.08) : Color.green.opacity(0.08)
@@ -783,6 +957,17 @@ struct JobCard: View {
             return Color.orange.opacity(0.08)
         }
         return Color(nsColor: .controlBackgroundColor)
+    }
+
+    private var hoveredJobCardTint: Color {
+        let state = job.state.lowercased()
+        if state.contains("run") {
+            return isGPU ? AIRETheme.gpu.opacity(0.11) : Color.green.opacity(0.11)
+        }
+        if state.contains("pend") {
+            return Color.orange.opacity(0.11)
+        }
+        return Color.primary.opacity(0.045)
     }
 }
 
@@ -857,7 +1042,7 @@ struct JobDetailView: View {
             }
         }
         .padding(18)
-        .background(AIRETheme.pageBackground)
+        .background(DashboardBackdrop())
     }
 
     private var isGPU: Bool {
@@ -895,7 +1080,7 @@ struct DetailMetric: View {
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dashboardCard(padding: 11)
+        .dashboardCard(padding: 11, accent: accent, isInteractive: true)
     }
 }
 
@@ -920,7 +1105,7 @@ struct DetailSection<Content: View>: View {
             }
             content
         }
-        .dashboardCard(padding: 13)
+        .dashboardCard(padding: 13, accent: AIRETheme.gpu)
     }
 }
 
@@ -1024,8 +1209,10 @@ struct PartitionsDashboard: View {
                 SectionHeader(title: "Partition details", subtitle: "\(partitions.count) rows")
                 PartitionsTable(partitions: partitions)
                     .frame(minHeight: 220)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+        .animation(AIRETheme.smoothEase, value: showDetails)
     }
 
     private var gpuCapacity: Int {
@@ -1099,7 +1286,7 @@ struct PartitionPortfolioPanel: View {
             }
             .frame(width: 190, alignment: .leading)
         }
-        .dashboardCard(padding: 13)
+        .dashboardCard(padding: 13, accent: .purple)
     }
 }
 
@@ -1133,8 +1320,12 @@ struct PartitionPortfolioRow: View {
             }
         }
         .padding(8)
-        .background(AIRETheme.mutedFill)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(accentColor.opacity(0.16), lineWidth: 1)
+        )
+        .animation(AIRETheme.smoothEase, value: group.totalNodes)
     }
 
     private var iconName: String {
@@ -1211,13 +1402,14 @@ struct PartitionCard: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
-        .dashboardCard()
+        .dashboardCard(accent: accentColor, isInteractive: true)
         .overlay(alignment: .top) {
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(accentColor.opacity(0.70))
                 .frame(height: 3)
                 .padding(.horizontal, 12)
         }
+        .animation(AIRETheme.smoothEase, value: group.totalNodes)
     }
 
     private var partitionSubtitle: String {
@@ -1503,7 +1695,7 @@ struct InsightCard: View {
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dashboardCard(padding: 11)
+        .dashboardCard(padding: 11, accent: color, isInteractive: true)
     }
 }
 
@@ -1534,7 +1726,7 @@ struct TrendChartCard: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .dashboardCard(padding: 13)
+        .dashboardCard(padding: 13, accent: color, isInteractive: true)
     }
 }
 
@@ -1664,7 +1856,8 @@ struct StorageCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dashboardCard(padding: 14)
+        .dashboardCard(padding: 14, accent: color, isInteractive: true)
+        .animation(AIRETheme.smoothEase, value: percent)
     }
 }
 
@@ -1686,8 +1879,11 @@ struct StorageStat: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
-        .background(AIRETheme.mutedFill)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(color.opacity(0.14), lineWidth: 1)
+        )
     }
 }
 
@@ -1743,7 +1939,7 @@ struct StorageComparison: View {
                 }
             }
         }
-        .dashboardCard(padding: 13)
+        .dashboardCard(padding: 13, accent: .teal)
     }
 
     private func storageColor(_ item: StorageSummary) -> Color {
@@ -1873,8 +2069,10 @@ struct NodesDashboard: View {
                 SectionHeader(title: "Node details", subtitle: "\(visibleNodes.count) rows")
                 NodesTable(nodes: visibleNodes)
                     .frame(minHeight: 240)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+        .animation(AIRETheme.smoothEase, value: showDetails)
     }
 
     private var gpuOverview: some View {
@@ -1990,7 +2188,8 @@ struct GPUFleetPanel: View {
             }
             .frame(width: 310)
         }
-        .dashboardCard(padding: 14)
+        .dashboardCard(padding: 14, accent: AIRETheme.gpu)
+        .animation(AIRETheme.smoothEase, value: stats.utilizationPercent)
     }
 }
 
@@ -2008,6 +2207,7 @@ struct GPUNodeHeatmap: View {
                             .stroke(Color.primary.opacity(0.08), lineWidth: 1)
                     )
                     .help("\(node.node): \(gpuAllocated(node))/\(gpuTotal(node)) GPU, \(node.state)")
+                    .animation(AIRETheme.smoothEase, value: node.state)
             }
         }
     }
@@ -2049,6 +2249,7 @@ struct GPUFleetBar: View {
                 }
             }
             .frame(height: 10)
+            .animation(AIRETheme.softSpring, value: stats.allocated)
 
             HStack {
                 Label("\(stats.allocated) allocated", systemImage: "circle.fill")
@@ -2059,6 +2260,7 @@ struct GPUFleetBar: View {
             }
             .font(.caption)
         }
+        .animation(AIRETheme.smoothEase, value: stats.idle)
     }
 }
 
@@ -2104,6 +2306,7 @@ struct NodeSection: View {
                         }
                     }
                 }
+                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
             }
         }
     }
@@ -2120,6 +2323,7 @@ struct NodeSection: View {
 struct GPUNodeCard: View {
     let node: NodeSummary
     let hasUserJob: Bool
+    @State private var isHovered = false
 
     private var total: Int { gpuTotal(node) }
     private var allocated: Int { gpuAllocated(node) }
@@ -2195,16 +2399,29 @@ struct GPUNodeCard: View {
             .lineLimit(1)
         }
         .padding(12)
-        .background(cardBackground)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(cardTint)
+                }
+        }
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(hasUserJob ? Color.purple.opacity(0.55) : AIRETheme.border, lineWidth: hasUserJob ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(hasUserJob ? Color.purple.opacity(isHovered ? 0.70 : 0.55) : AIRETheme.border, lineWidth: hasUserJob ? 1.5 : 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .shadow(color: Color.black.opacity(0.035), radius: 6, x: 0, y: 2)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .shadow(color: Color.black.opacity(isHovered ? 0.10 : 0.04), radius: isHovered ? 12 : 6, x: 0, y: isHovered ? 6 : 2)
+        .scaleEffect(isHovered ? 1.01 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onHover { isHovered = $0 }
+        .animation(AIRETheme.softSpring, value: isHovered)
+        .animation(AIRETheme.smoothEase, value: allocated)
+        .animation(AIRETheme.smoothEase, value: node.state)
     }
 
-    private var cardBackground: Color {
+    private var cardTint: Color {
         if !isAvailable(node) {
             return Color.gray.opacity(0.12)
         }
@@ -2229,6 +2446,7 @@ struct GeneralNodeCard: View {
     let node: NodeSummary
     let style: NodeVisualStyle
     let hasUserJob: Bool
+    @State private var isHovered = false
 
     private var cpuRatio: Double {
         guard let allocated = node.cpuAllocated, let total = node.cpuTotal, total > 0 else {
@@ -2297,13 +2515,26 @@ struct GeneralNodeCard: View {
             .lineLimit(1)
         }
         .padding(12)
-        .background(cardBackground)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(cardTint)
+                }
+        }
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(hasUserJob ? Color.purple.opacity(0.55) : AIRETheme.border, lineWidth: hasUserJob ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(hasUserJob ? Color.purple.opacity(isHovered ? 0.70 : 0.55) : AIRETheme.border, lineWidth: hasUserJob ? 1.5 : 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .shadow(color: Color.black.opacity(0.035), radius: 6, x: 0, y: 2)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .shadow(color: Color.black.opacity(isHovered ? 0.10 : 0.04), radius: isHovered ? 12 : 6, x: 0, y: isHovered ? 6 : 2)
+        .scaleEffect(isHovered ? 1.01 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onHover { isHovered = $0 }
+        .animation(AIRETheme.softSpring, value: isHovered)
+        .animation(AIRETheme.smoothEase, value: cpuRatio)
+        .animation(AIRETheme.smoothEase, value: node.state)
     }
 
     private var accentColor: Color {
@@ -2319,7 +2550,7 @@ struct GeneralNodeCard: View {
         }
     }
 
-    private var cardBackground: Color {
+    private var cardTint: Color {
         if !isAvailable(node) {
             return Color.gray.opacity(0.12)
         }
@@ -2347,6 +2578,7 @@ struct RingMeter: View {
                 .trim(from: 0, to: min(max(value, 0), 1))
                 .stroke(color, style: StrokeStyle(lineWidth: 9, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .animation(AIRETheme.softSpring, value: value)
             VStack(spacing: 2) {
                 Text("\(Int((value * 100).rounded()))%")
                     .font(.headline.monospacedDigit())
@@ -2366,9 +2598,21 @@ struct StatePill: View {
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
-            .background(stateColor.opacity(0.14))
+            .background {
+                Capsule()
+                    .fill(.thinMaterial)
+                    .overlay {
+                        Capsule()
+                            .fill(stateColor.opacity(0.14))
+                    }
+            }
             .foregroundStyle(stateColor)
+            .overlay(
+                Capsule()
+                    .stroke(stateColor.opacity(0.20), lineWidth: 1)
+            )
             .clipShape(Capsule())
+            .animation(AIRETheme.smoothEase, value: state)
     }
 
     private var stateColor: Color {

@@ -14,6 +14,7 @@ final class AppModel: ObservableObject {
     @Published var isLoggingIn = false
     @Published var isRefreshing = false
     @Published var isLoggedIn = false
+    @Published var hasCachedSnapshot = false
     @Published var statusMessage = "Not connected"
     @Published var errorMessage: String?
     @Published var snapshot: ClusterSnapshot?
@@ -22,6 +23,7 @@ final class AppModel: ObservableObject {
     private let service = MonitorService()
     private let notificationService = JobNotificationService()
     private var backgroundTimer: Timer?
+    private let backgroundRefreshInterval: TimeInterval = 10
 
     init() {
         notificationService.configure()
@@ -29,12 +31,15 @@ final class AppModel: ObservableObject {
         history = cache.loadHistory()
         if let cachedSnapshot = cache.loadLatestSnapshot() {
             snapshot = cachedSnapshot
-            statusMessage = "Loaded cached snapshot"
+            hasCachedSnapshot = true
+            statusMessage = "Cached snapshot available • auto-refreshing every 10s"
             history = (try? cache.recordHistory(from: cachedSnapshot)) ?? history
             if cache.loadJobStateSnapshot() == nil {
                 try? cache.saveJobStates(from: cachedSnapshot.jobs)
             }
         }
+        startBackgroundRefresh()
+        refresh(reason: .startupProbe)
     }
 
     var settings: ServerSettings {
@@ -78,8 +83,7 @@ final class AppModel: ObservableObject {
                 password = ""
                 statusMessage = loginSummary(from: output)
                 isLoggingIn = false
-                refresh()
-                startBackgroundRefresh()
+                refresh(reason: .login)
             } catch {
                 isLoggedIn = false
                 isLoggingIn = false
@@ -90,16 +94,38 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
+        refresh(reason: .manual)
+    }
+
+    private func refresh(reason: RefreshReason) {
         guard !isRefreshing else {
             return
         }
         isRefreshing = true
-        errorMessage = nil
+        if reason.showsErrors {
+            errorMessage = nil
+        }
+        if reason == .startupProbe && snapshot != nil {
+            statusMessage = "Cached snapshot available • checking SSH session"
+        }
+        let currentSettings = settings
 
         Task {
+            defer {
+                isRefreshing = false
+            }
             do {
-                let nextSnapshot = try await service.collectSnapshot(settings: settings)
-                let cache = SnapshotCache(projectRoot: settings.projectRoot)
+                let nextSnapshot = try await service.collectSnapshot(settings: currentSettings)
+                guard nextSnapshot.errors.isEmpty else {
+                    handleRefreshFailure(
+                        message: nextSnapshot.errors.joined(separator: "\n"),
+                        settings: currentSettings,
+                        showsErrors: reason.showsErrors
+                    )
+                    return
+                }
+
+                let cache = SnapshotCache(projectRoot: currentSettings.projectRoot)
                 let previousJobState = cache.loadJobStateSnapshot()
                 try? cache.saveLatestSnapshot(nextSnapshot)
                 history = (try? cache.recordHistory(from: nextSnapshot)) ?? cache.loadHistory()
@@ -107,22 +133,18 @@ final class AppModel: ObservableObject {
                 try? cache.saveJobStates(from: nextSnapshot.jobs)
 
                 snapshot = nextSnapshot
-                isLoggedIn = nextSnapshot.errors.isEmpty
+                hasCachedSnapshot = true
+                isLoggedIn = true
+                errorMessage = nil
                 statusMessage = "Last refresh \(Date().formatted(date: .omitted, time: .standard)) • cache updated"
-                if !nextSnapshot.errors.isEmpty {
-                    errorMessage = nextSnapshot.errors.joined(separator: "\n")
-                }
+                startBackgroundRefresh()
             } catch {
-                let cache = SnapshotCache(projectRoot: settings.projectRoot)
-                if let cachedSnapshot = cache.loadLatestSnapshot() {
-                    snapshot = cachedSnapshot
-                    statusMessage = "Refresh failed • showing cached snapshot"
-                } else {
-                    statusMessage = "Refresh failed"
-                }
-                errorMessage = error.localizedDescription
+                handleRefreshFailure(
+                    message: error.localizedDescription,
+                    settings: currentSettings,
+                    showsErrors: reason.showsErrors
+                )
             }
-            isRefreshing = false
         }
     }
 
@@ -130,11 +152,31 @@ final class AppModel: ObservableObject {
         guard backgroundTimer == nil else {
             return
         }
-        backgroundTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: backgroundRefreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.refresh()
+                self?.refresh(reason: .automatic)
             }
         }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+        backgroundTimer = timer
+    }
+
+    private func handleRefreshFailure(message: String, settings: ServerSettings, showsErrors: Bool) {
+        let cache = SnapshotCache(projectRoot: settings.projectRoot)
+        if let cachedSnapshot = cache.loadLatestSnapshot() {
+            snapshot = cachedSnapshot
+            hasCachedSnapshot = true
+            statusMessage = "Cached snapshot offline • retrying every 10s"
+        } else if snapshot != nil {
+            hasCachedSnapshot = true
+            statusMessage = "Previous snapshot offline • retrying every 10s"
+        } else {
+            hasCachedSnapshot = false
+            statusMessage = "Offline • retrying every 10s"
+        }
+        isLoggedIn = false
+        errorMessage = showsErrors ? message : nil
     }
 
     func openDesktopWidget() {
@@ -191,5 +233,16 @@ final class AppModel: ObservableObject {
         }
 
         return current
+    }
+}
+
+private enum RefreshReason {
+    case startupProbe
+    case login
+    case manual
+    case automatic
+
+    var showsErrors: Bool {
+        self == .login || self == .manual
     }
 }

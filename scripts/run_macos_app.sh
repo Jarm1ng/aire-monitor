@@ -11,15 +11,17 @@ cd "$ROOT_DIR"
 
 SDKROOT="${SDKROOT:-/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk}"
 BUILD_LOG="$ROOT_DIR/.runtime/swift-build.log"
+BUILD_DIR="${AIRE_SWIFTPM_BUILD_DIR:-/tmp/aire_server_app_swiftpm_build}"
+APP_EXECUTABLE="$BUILD_DIR/debug/AIREMonitorApp"
 mkdir -p "$ROOT_DIR/.runtime"
 
 set +e
-SDKROOT="$SDKROOT" swift build --disable-sandbox --jobs 1 >"$BUILD_LOG" 2>&1
+SDKROOT="$SDKROOT" swift build --disable-sandbox --scratch-path "$BUILD_DIR" --jobs 1 >"$BUILD_LOG" 2>&1
 BUILD_STATUS=$?
 set -e
 
 if [[ $BUILD_STATUS -ne 0 ]]; then
-    if [[ -x "$ROOT_DIR/.build/debug/AIREMonitorApp" ]] && grep -q "Build complete" "$BUILD_LOG"; then
+    if [[ -x "$APP_EXECUTABLE" ]] && grep -q "Build complete" "$BUILD_LOG"; then
         echo "swift build returned $BUILD_STATUS after producing the executable; continuing."
         echo "Build log: $BUILD_LOG"
     else
@@ -33,7 +35,7 @@ pkill -f "$MACOS_DIR/AIREMonitorApp" 2>/dev/null || true
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-cp "$ROOT_DIR/.build/debug/AIREMonitorApp" "$MACOS_DIR/AIREMonitorApp"
+cp "$APP_EXECUTABLE" "$MACOS_DIR/AIREMonitorApp"
 if [[ -f "$ROOT_DIR/assets/AIRELogo.png" ]]; then
     cp "$ROOT_DIR/assets/AIRELogo.png" "$RESOURCES_DIR/AIRELogo.png"
 fi
@@ -70,4 +72,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-open "$APP_DIR"
+if ! open "$APP_DIR"; then
+    echo "macOS open failed; launching the app executable directly."
+    "$MACOS_DIR/AIREMonitorApp" >/dev/null 2>&1 &
+fi

@@ -8,10 +8,11 @@ private enum WidgetLayout {
 }
 
 private enum WidgetPalette {
-    static let background = Color(nsColor: .controlBackgroundColor).opacity(0.96)
-    static let fill = Color.primary.opacity(0.045)
-    static let fillStrong = Color.primary.opacity(0.075)
-    static let border = Color.primary.opacity(0.09)
+    static let backgroundOverlay = Color(nsColor: .windowBackgroundColor).opacity(0.42)
+    static let fill = Color.primary.opacity(0.040)
+    static let fillStrong = Color.primary.opacity(0.070)
+    static let border = Color.primary.opacity(0.085)
+    static let highlight = Color.white.opacity(0.16)
     static let cyan = Color.cyan
     static let green = Color.green
     static let orange = Color.orange
@@ -226,13 +227,21 @@ struct DesktopWidgetView: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(WidgetPalette.background)
+            WidgetVisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(WidgetPalette.backgroundOverlay)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(WidgetPalette.border, lineWidth: 1)
                 )
-                .shadow(color: .black.opacity(0.16), radius: 18, x: 0, y: 9)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(WidgetPalette.highlight, lineWidth: 1)
+                        .blendMode(.screen)
+                )
+                .shadow(color: .black.opacity(0.18), radius: 22, x: 0, y: 10)
 
             VStack(alignment: .leading, spacing: 12) {
                 header
@@ -257,6 +266,10 @@ struct DesktopWidgetView: View {
         }
         .frame(width: WidgetLayout.width, height: WidgetLayout.height, alignment: .topLeading)
         .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.28), value: gpuAllocated)
+        .animation(.easeInOut(duration: 0.28), value: gpuTotal)
+        .animation(.easeInOut(duration: 0.28), value: runningJobs.count)
+        .animation(.easeInOut(duration: 0.28), value: pendingJobs.count)
         .task {
             model.start()
         }
@@ -270,6 +283,7 @@ struct DesktopWidgetView: View {
             Text("AIRE")
                 .font(.title3.weight(.semibold))
                 .singleLine()
+                .contentTransition(.opacity)
 
             StatusChip(
                 title: model.usingCache ? "cached" : "live",
@@ -283,6 +297,7 @@ struct DesktopWidgetView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .singleLine()
+                .contentTransition(.opacity)
 
             Button {
                 model.openMainApp()
@@ -327,6 +342,7 @@ struct DesktopWidgetView: View {
                     .font(.system(size: 26, weight: .semibold, design: .rounded).monospacedDigit())
                     .foregroundStyle(gpuUseColor)
                     .singleLine()
+                    .contentTransition(.opacity)
 
                 GPUUsageBar(allocated: gpuAllocated, total: gpuTotal, color: gpuUseColor)
 
@@ -402,26 +418,50 @@ struct DesktopWidgetView: View {
                 .frame(width: 24, alignment: .trailing)
         }
         .padding(.horizontal, 10)
-        .background(WidgetPalette.fill)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .background(WidgetPalette.fill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(WidgetPalette.border, lineWidth: 1)
+        )
     }
 
     private var footer: some View {
-        HStack(spacing: 7) {
+        let message = statusMessage ?? "Refreshes every 10 seconds"
+        let isWarning = model.errorMessage != nil
+        let color = isWarning ? WidgetPalette.orange : WidgetPalette.green
+
+        return HStack(alignment: .top, spacing: 7) {
             Circle()
-                .fill(model.errorMessage == nil ? WidgetPalette.green : WidgetPalette.orange)
+                .fill(color)
                 .frame(width: 6, height: 6)
-            Text(statusMessage ?? "Refreshes every 10 seconds")
+                .padding(.top, 4)
+                .shadow(
+                    color: color.opacity(0.28),
+                    radius: 3,
+                    x: 0,
+                    y: 0
+                )
+            Text(message)
                 .font(.caption2)
-                .foregroundColor(model.errorMessage == nil ? .secondary : .orange)
-                .lineLimit(1)
+                .foregroundColor(isWarning ? .primary : .secondary)
+                .lineLimit(isWarning ? 2 : 1)
                 .truncationMode(.tail)
+                .minimumScaleFactor(0.9)
             Spacer()
-            Text("10s refresh")
+            Text("10s")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .singleLine()
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background((isWarning ? WidgetPalette.orange.opacity(0.12) : WidgetPalette.fill), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(isWarning ? WidgetPalette.orange.opacity(0.18) : WidgetPalette.border, lineWidth: 1)
+        )
+        .help(message)
     }
 
     private var remoteName: String {
@@ -484,8 +524,17 @@ struct WidgetIconButtonStyle: ButtonStyle {
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.secondary)
             .frame(width: 25, height: 25)
-            .background(configuration.isPressed ? WidgetPalette.fillStrong : WidgetPalette.fill)
-            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(configuration.isPressed ? WidgetPalette.fillStrong : WidgetPalette.fill)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(WidgetPalette.border, lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
@@ -511,8 +560,12 @@ struct StatusChip: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .frame(maxWidth: 190, alignment: .leading)
-        .background(color.opacity(0.10))
-        .clipShape(Capsule())
+        .background(color.opacity(0.10), in: Capsule())
+        .background(.thinMaterial, in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(color.opacity(0.15), lineWidth: 1)
+        )
     }
 }
 
@@ -543,12 +596,12 @@ private extension View {
     func widgetSurface() -> some View {
         self
             .padding(10)
-            .background(WidgetPalette.fill)
+            .background(WidgetPalette.fill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(WidgetPalette.border, lineWidth: 1)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     func singleLine() -> some View {
@@ -572,6 +625,7 @@ struct RingMeter: View {
                 .trim(from: 0, to: min(max(value, 0), 1))
                 .stroke(color, style: StrokeStyle(lineWidth: 8, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.32), value: value)
             Text(label)
                 .font(.caption.monospacedDigit().weight(.bold))
                 .singleLine()
@@ -600,6 +654,7 @@ struct GPUUsageBar: View {
                 RoundedRectangle(cornerRadius: 5)
                     .fill(color.opacity(0.88))
                     .frame(width: width * ratio)
+                    .animation(.easeInOut(duration: 0.32), value: ratio)
             }
         }
         .frame(height: 10)
@@ -644,9 +699,13 @@ struct JobCountPill: View {
         .minimumScaleFactor(0.82)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(color.opacity(0.12))
+        .background(color.opacity(0.12), in: Capsule())
+        .background(.thinMaterial, in: Capsule())
         .foregroundStyle(color)
-        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .stroke(color.opacity(0.14), lineWidth: 1)
+        )
     }
 }
 
@@ -738,6 +797,7 @@ struct GPUHeatmapStrip: View {
                                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
                         )
                         .help("\(node.node): \(node.gpuAllocatedValue)/\(node.gpuTotalValue) GPU, \(node.state)")
+                        .transition(.opacity)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -756,6 +816,26 @@ struct GPUHeatmapStrip: View {
             return WidgetPalette.orange.opacity(0.88)
         }
         return WidgetPalette.green.opacity(0.80)
+    }
+}
+
+private struct WidgetVisualEffectBackground: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        view.isEmphasized = false
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+        nsView.state = .active
     }
 }
 

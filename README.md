@@ -11,9 +11,11 @@ This project is read-only with respect to the cluster. It does not install serve
 - SSH and Duo-compatible login flow through the user's local SSH configuration
 - Slurm job dashboard with clickable job detail sheets
 - Partition and node visualizations, with GPU-first monitoring
-- Local macOS notifications for job state changes
+- Local macOS notifications when jobs finish, fail, cancel, time out, or leave `squeue`
 - Home and scratch quota visualization
 - Historical trend charts for GPU availability, queue pressure, node health, and storage usage
+- Material-based macOS interface with glass surfaces and restrained state animations
+- Menu bar monitor that shows the current running job first, then GPU availability when no job is running
 - Desktop companion widget with quick GPU/job status
 - Local cache under `.runtime/` for resilience between refreshes
 
