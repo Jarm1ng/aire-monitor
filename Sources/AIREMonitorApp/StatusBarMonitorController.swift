@@ -8,10 +8,14 @@ final class StatusBarMonitorController: NSObject {
 
     private var model: AppModel?
     private var statusItem: NSStatusItem?
-    private var statusView: StatusBarCapsuleView?
     private var menu: NSMenu?
+    private var menuHostingView: NSHostingView<MenuBarMonitorView>?
     private var cancellables = Set<AnyCancellable>()
     private var lastSignature = ""
+
+    private let statusFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+    private let minItemLength: CGFloat = 56
+    private let maxItemLength: CGFloat = 150
 
     private override init() {
         super.init()
@@ -22,7 +26,14 @@ final class StatusBarMonitorController: NSObject {
         installStatusItemIfNeeded()
         installMenu(model: model)
         bindModel(model)
+        lastSignature = ""
         updateStatusItem()
+    }
+
+    /// Dismisses the status-bar menu, so actions that activate other windows
+    /// (Open, Widget) do not fight an in-progress menu tracking session.
+    func closeMenu() {
+        menu?.cancelTracking()
     }
 
     private func installStatusItemIfNeeded() {
@@ -32,40 +43,56 @@ final class StatusBarMonitorController: NSObject {
         statusItem = item
 
         guard let button = item.button else { return }
-        button.title = ""
-        button.image = nil
+        // The button renders the title and template image itself, so AppKit
+        // handles menu-bar appearance (light/dark), vibrancy, and the
+        // standard click highlight.
+        button.title = "AIRE"
+        button.font = statusFont
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
         button.toolTip = "AIRE Monitor"
-
-        let view = StatusBarCapsuleView(
-            frame: button.bounds
-        )
-        view.autoresizingMask = [.width, .height]
-        button.addSubview(view)
-        statusView = view
+        (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
     }
 
     private func installMenu(model: AppModel) {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.delegate = self
+        let rootView = makeMenuView(model: model)
+        if let menuHostingView {
+            // Re-entrant configure: reuse the existing menu, just swap the model.
+            menuHostingView.rootView = rootView
+            return
+        }
 
-        let hostingView = NSHostingView(rootView: MenuBarMonitorView(model: model))
-        hostingView.frame = NSRect(x: 0, y: 0, width: 370, height: 520)
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.sizingOptions = [.preferredContentSize]
+        hostingView.setFrameSize(hostingView.fittingSize)
 
         let panelItem = NSMenuItem()
         panelItem.view = hostingView
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
         menu.addItem(panelItem)
 
         statusItem?.menu = menu
         self.menu = menu
+        menuHostingView = hostingView
+    }
+
+    private func makeMenuView(model: AppModel) -> MenuBarMonitorView {
+        MenuBarMonitorView(model: model) { [weak self] in
+            self?.closeMenu()
+        }
     }
 
     private func bindModel(_ model: AppModel) {
         cancellables.removeAll()
         model.objectWillChange
-            .receive(on: RunLoop.main)
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                DispatchQueue.main.async {
+                // The queue hop above guarantees main-thread delivery (and
+                // keeps flowing during menu tracking, unlike RunLoop.main).
+                MainActor.assumeIsolated {
                     self?.updateStatusItem()
                 }
             }
@@ -73,140 +100,46 @@ final class StatusBarMonitorController: NSObject {
     }
 
     private func updateStatusItem() {
-        guard let model, let statusView, let button = statusItem?.button else { return }
+        guard let model, let button = statusItem?.button else { return }
 
         let summary = StatusBarSummary(
             snapshot: model.snapshot,
             isConnected: model.isLoggedIn,
             hasCache: model.hasCachedSnapshot,
-            isRefreshing: model.isRefreshing
+            isRefreshing: model.isRefreshing,
+            refreshIntervalText: model.refreshIntervalText
         )
         let signature = summary.signature
         guard signature != lastSignature else { return }
         lastSignature = signature
 
-        statusView.update(title: summary.title, image: summary.image, tooltip: summary.tooltip)
-        let width = statusView.preferredWidth
-        statusItem?.length = width
+        let image = summary.image
+        button.image = image
+        button.title = summary.title
         button.toolTip = summary.tooltip
         button.setAccessibilityLabel(summary.title)
-        statusView.frame = NSRect(x: 0, y: 0, width: width, height: NSStatusBar.system.thickness)
+        statusItem?.length = reservedLength(for: summary, hasIcon: image != nil)
+    }
+
+    /// Width computed from a digit-stable template of the title so the status
+    /// item does not resize on every elapsed-time tick.
+    private func reservedLength(for summary: StatusBarSummary, hasIcon: Bool) -> CGFloat {
+        let template = summary.widthTemplateTitle as NSString
+        let textWidth = ceil(template.size(withAttributes: [.font: statusFont]).width)
+        let iconWidth: CGFloat = hasIcon ? 20 : 0
+        let padding: CGFloat = 16
+        return min(max(iconWidth + textWidth + padding, minItemLength), maxItemLength)
     }
 }
 
 extension StatusBarMonitorController: NSMenuDelegate {
     nonisolated func menuWillOpen(_ menu: NSMenu) {
-        Task { @MainActor in
-            StatusBarMonitorController.shared.statusView?.isActive = true
+        // NSMenu delegate callbacks always arrive on the main thread.
+        MainActor.assumeIsolated {
+            // refresh() self-guards on isRefreshing/isLoggingIn, so opening
+            // the menu shows data at most a few seconds old.
+            model?.refresh()
         }
-    }
-
-    nonisolated func menuDidClose(_ menu: NSMenu) {
-        Task { @MainActor in
-            StatusBarMonitorController.shared.statusView?.isActive = false
-        }
-    }
-}
-
-private final class StatusBarCapsuleView: NSView {
-    var isActive = false {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    private let imageView = NSImageView()
-    private let titleField = NSTextField(labelWithString: "AIRE")
-    private let statusTextFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
-    private let horizontalPadding: CGFloat = 6
-    private let maxWidth: CGFloat = 124
-    private let minWidth: CGFloat = 44
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setup()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
-    }
-
-    var preferredWidth: CGFloat {
-        let textWidth = ceil(titleField.intrinsicContentSize.width)
-        let contentWidth = horizontalPadding * 2 + textWidth + 16
-        return min(max(contentWidth, minWidth), maxWidth)
-    }
-
-    func update(title: String, image: NSImage?, tooltip: String) {
-        titleField.stringValue = title
-        imageView.image = image
-        toolTip = tooltip
-        setAccessibilityLabel(title)
-        invalidateIntrinsicContentSize()
-        needsLayout = true
-        needsDisplay = true
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: preferredWidth, height: NSStatusBar.system.thickness)
-    }
-
-    override func layout() {
-        super.layout()
-
-        let highlightHeight: CGFloat = 20
-        let y = floor((bounds.height - highlightHeight) / 2)
-        let textX = horizontalPadding
-        let textWidth = max(bounds.width - textX - horizontalPadding, 0)
-        titleField.frame = NSRect(x: textX, y: y + 1, width: textWidth, height: highlightHeight - 2)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        guard isActive else { return }
-
-        let highlightRect = bounds.insetBy(dx: 1, dy: 3)
-        let path = NSBezierPath(
-            roundedRect: highlightRect,
-            xRadius: highlightRect.height / 2,
-            yRadius: highlightRect.height / 2
-        )
-        NSColor.white.withAlphaComponent(0.18).setFill()
-        path.fill()
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
-    }
-
-    private func setup() {
-        wantsLayer = false
-        setAccessibilityRole(.button)
-
-        imageView.imageScaling = .scaleProportionallyDown
-        imageView.contentTintColor = .white
-        imageView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
-        imageView.isHidden = true
-        addSubview(imageView)
-
-        titleField.font = statusTextFont
-        titleField.textColor = .white
-        titleField.shadow = {
-            let shadow = NSShadow()
-            shadow.shadowColor = NSColor.black.withAlphaComponent(0.32)
-            shadow.shadowBlurRadius = 1.5
-            shadow.shadowOffset = NSSize(width: 0, height: -0.5)
-            return shadow
-        }()
-        titleField.lineBreakMode = .byTruncatingTail
-        titleField.maximumNumberOfLines = 1
-        titleField.drawsBackground = false
-        titleField.isBordered = false
-        titleField.isEditable = false
-        titleField.isSelectable = false
-        addSubview(titleField)
     }
 }
 
@@ -215,6 +148,7 @@ private struct StatusBarSummary {
     let isConnected: Bool
     let hasCache: Bool
     let isRefreshing: Bool
+    let refreshIntervalText: String
 
     var title: String {
         if isRefreshing && snapshot == nil {
@@ -229,8 +163,8 @@ private struct StatusBarSummary {
             return "\(runningJobs) jobs \(name)"
         }
 
-        if gpuTotal > 0 {
-            return "GPU \(gpuIdle)"
+        if totalGPUs > 0 {
+            return "GPU \(idleGPUs)"
         }
 
         if hasCache {
@@ -240,26 +174,37 @@ private struct StatusBarSummary {
         return isConnected ? "Ready" : "Offline"
     }
 
-    var image: NSImage? {
-        let name: String
-        if isRefreshing {
-            name = "arrow.triangle.2.circlepath"
-        } else if snapshot == nil && !hasCache {
-            name = "wifi.slash"
-        } else if runningJobs > 0 {
-            name = "play.circle.fill"
-        } else if gpuTotal > 0 {
-            name = "bolt.horizontal.circle.fill"
-        } else {
-            name = "server.rack"
+    /// `title` with every elapsed digit replaced by a fixed-width placeholder,
+    /// padded to at least h:mm:ss, so the reserved width only changes when the
+    /// job (or the elapsed format) changes - not every refresh tick.
+    var widthTemplateTitle: String {
+        guard runningJobs == 1, let job = primaryRunningJob, !job.elapsed.isEmpty else {
+            return title
         }
-
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "AIRE Monitor")
-        image?.isTemplate = true
-        return image
+        let name = shortened(job.name, limit: 16)
+        return "\(name) \(elapsedWidthTemplate(job.elapsed))".trimmedStatusTitle
     }
 
-    var tint: NSColor {
+    var iconName: String {
+        if isRefreshing {
+            return "arrow.triangle.2.circlepath"
+        }
+        if snapshot == nil && !hasCache {
+            return "wifi.slash"
+        }
+        if runningJobs > 0 {
+            return "play.circle.fill"
+        }
+        if totalGPUs > 0 {
+            return "bolt.horizontal.circle.fill"
+        }
+        return "server.rack"
+    }
+
+    /// nil means "render as a standard template image" (adapts to the menu
+    /// bar appearance); a color tints the icon so connection/pressure state
+    /// is visible at a glance.
+    var tint: NSColor? {
         if isRefreshing {
             return isConnected ? .systemMint : .systemOrange
         }
@@ -272,16 +217,27 @@ private struct StatusBarSummary {
         if runningJobs > 0 {
             return .systemGreen
         }
-        if gpuTotal == 0 {
-            return .labelColor
+        if totalGPUs == 0 {
+            return nil
         }
-        if gpuIdle == 0 {
+        if idleGPUs == 0 {
             return .systemRed
         }
         if gpuUsageFraction >= 0.75 {
             return .systemOrange
         }
         return .systemTeal
+    }
+
+    var image: NSImage? {
+        let base = NSImage(systemSymbolName: iconName, accessibilityDescription: "AIRE Monitor status")
+        var configuration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        if let tint {
+            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+        }
+        let image = base?.withSymbolConfiguration(configuration)
+        image?.isTemplate = tint == nil
+        return image
     }
 
     var tooltip: String {
@@ -292,61 +248,59 @@ private struct StatusBarSummary {
             lines.append(runningJobs == 0 ? "No running jobs" : "\(runningJobs) running jobs")
         }
         lines.append("\(runningJobs) running, \(pendingJobs) pending")
-        if gpuTotal > 0 {
-            lines.append("\(gpuIdle) of \(gpuTotal) GPUs free")
+        if totalGPUs > 0 {
+            lines.append("\(idleGPUs) of \(totalGPUs) GPUs free")
         }
         if !storagePressureText.isEmpty {
             lines.append(storagePressureText)
         }
-        lines.append(isConnected ? "Live, refreshes every 10s" : (hasCache ? "Showing cached data" : "Not connected"))
+        lines.append(isConnected ? "Live, refreshes every \(refreshIntervalText)" : (hasCache ? "Showing cached data" : "Not connected"))
         return lines.joined(separator: "\n")
     }
 
     var signature: String {
         [
             title,
-            "\(isRefreshing)",
-            "\(isConnected)",
-            "\(hasCache)",
-            "\(runningJobs)",
-            "\(pendingJobs)",
-            "\(gpuIdle)",
-            "\(gpuTotal)",
-            storagePressureText
+            widthTemplateTitle,
+            iconName,
+            tint?.description ?? "template",
+            tooltip
         ].joined(separator: "|")
     }
 
     private var runningJobs: Int {
-        snapshot?.jobs.filter { $0.state.uppercased().contains("RUN") }.count ?? 0
+        snapshot?.jobs.filter { statusIsRunning($0.state) }.count ?? 0
     }
 
     private var pendingJobs: Int {
-        snapshot?.jobs.filter { $0.state.uppercased().contains("PEND") }.count ?? 0
+        snapshot?.jobs.filter { statusIsPending($0.state) }.count ?? 0
     }
 
     private var primaryRunningJob: Job? {
-        snapshot?.jobs.first { $0.state.uppercased().contains("RUN") }
+        (snapshot?.jobs ?? [])
+            .filter { statusIsRunning($0.state) }
+            .min { $0.jobId < $1.jobId }
     }
 
     private var gpuNodes: [NodeSummary] {
-        snapshot?.nodes.filter { statusGPUTotal($0) > 0 } ?? []
+        snapshot?.nodes.filter { gpuTotal($0) > 0 } ?? []
     }
 
-    private var gpuTotal: Int {
-        gpuNodes.reduce(0) { $0 + statusGPUTotal($1) }
+    private var totalGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuTotal($1) }
     }
 
-    private var gpuAllocated: Int {
-        gpuNodes.reduce(0) { $0 + ($1.gpuAllocated ?? 0) }
+    private var allocatedGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuAllocated($1) }
     }
 
-    private var gpuIdle: Int {
-        max(gpuTotal - gpuAllocated, 0)
+    private var idleGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuIdle($1) }
     }
 
     private var gpuUsageFraction: Double {
-        guard gpuTotal > 0 else { return 0 }
-        return min(Double(gpuAllocated) / Double(gpuTotal), 1)
+        guard totalGPUs > 0 else { return 0 }
+        return min(Double(allocatedGPUs) / Double(totalGPUs), 1)
     }
 
     private var storagePressureText: String {
@@ -363,16 +317,17 @@ private struct StatusBarSummary {
     }
 }
 
-private func statusGPUTotal(_ node: NodeSummary) -> Int {
-    if let gpuTotal = node.gpuTotal {
-        return gpuTotal
-    }
+private func statusIsRunning(_ state: String) -> Bool {
+    state.uppercased().contains("RUN")
+}
 
-    if node.gres.localizedCaseInsensitiveContains("gpu") {
-        return 1
-    }
+private func statusIsPending(_ state: String) -> Bool {
+    state.uppercased().contains("PEND")
+}
 
-    return 0
+private func elapsedWidthTemplate(_ elapsed: String) -> String {
+    let mapped = String(elapsed.map { $0.isNumber ? "8" : $0 })
+    return mapped.count >= 7 ? mapped : "8:88:88"
 }
 
 private func shortened(_ value: String, limit: Int) -> String {

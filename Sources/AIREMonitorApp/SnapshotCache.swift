@@ -1,5 +1,12 @@
 import Foundation
 import UserNotifications
+import os
+
+private let cacheLogger = Logger(subsystem: "AIREMonitor", category: "SnapshotCache")
+
+// ISO8601DateFormatter is documented as thread-safe; share one instance
+// instead of allocating a formatter per call.
+nonisolated(unsafe) private let iso8601Formatter = ISO8601DateFormatter()
 
 struct JobStateRecord: Codable {
     let jobId: String
@@ -12,6 +19,30 @@ struct JobStateRecord: Codable {
 struct JobStateSnapshot: Codable {
     let updatedAt: String
     let jobs: [String: JobStateRecord]
+}
+
+struct ConnectionProfile: Codable {
+    let updatedAt: String
+    let useSSHAlias: Bool
+    let sshAlias: String
+    let username: String
+    let aireHostname: String
+    let useJumpHost: Bool
+    let jumpHostname: String
+    let controlPath: String
+    let jumpControlPath: String
+
+    init(settings: ServerSettings) {
+        updatedAt = iso8601Formatter.string(from: Date())
+        useSSHAlias = settings.useSSHAlias
+        sshAlias = settings.sshAlias
+        username = settings.username
+        aireHostname = settings.aireHostname
+        useJumpHost = settings.useJumpHost
+        jumpHostname = settings.jumpHostname
+        controlPath = settings.controlPath
+        jumpControlPath = settings.jumpControlPath
+    }
 }
 
 struct TrendPoint: Codable, Identifiable {
@@ -50,11 +81,32 @@ struct SnapshotCache {
         runtimeURL.appendingPathComponent("snapshot_history.json")
     }
 
-    func loadLatestSnapshot() -> ClusterSnapshot? {
-        guard let data = try? Data(contentsOf: latestSnapshotURL) else {
+    private var connectionProfileURL: URL {
+        runtimeURL.appendingPathComponent("connection_profile.json")
+    }
+
+    /// Decodes the JSON file at `url`. A file that exists but no longer
+    /// decodes is moved aside (".bad" suffix) and logged rather than being
+    /// silently discarded and overwritten on the next save.
+    private func decodeQuarantining<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
+        guard let data = try? Data(contentsOf: url) else {
             return nil
         }
-        return try? JSONDecoder().decode(ClusterSnapshot.self, from: data)
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            cacheLogger.error(
+                "Failed to decode \(url.lastPathComponent, privacy: .public); moving corrupt file aside: \(String(describing: error), privacy: .public)"
+            )
+            let quarantineURL = url.appendingPathExtension("bad")
+            try? FileManager.default.removeItem(at: quarantineURL)
+            try? FileManager.default.moveItem(at: url, to: quarantineURL)
+            return nil
+        }
+    }
+
+    func loadLatestSnapshot() -> ClusterSnapshot? {
+        decodeQuarantining(ClusterSnapshot.self, from: latestSnapshotURL)
     }
 
     func saveLatestSnapshot(_ snapshot: ClusterSnapshot) throws {
@@ -63,18 +115,29 @@ struct SnapshotCache {
         try data.write(to: latestSnapshotURL, options: .atomic)
     }
 
+    func loadConnectionProfile() -> ConnectionProfile? {
+        decodeQuarantining(ConnectionProfile.self, from: connectionProfileURL)
+    }
+
+    func saveConnectionProfile(_ profile: ConnectionProfile) throws {
+        try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
+        let data = try JSONEncoder.prettyAIRE.encode(profile)
+        try data.write(to: connectionProfileURL, options: .atomic)
+    }
+
     func loadHistory() -> [TrendPoint] {
-        guard let data = try? Data(contentsOf: historyURL) else {
-            return []
-        }
-        return (try? JSONDecoder().decode([TrendPoint].self, from: data)) ?? []
+        decodeQuarantining([TrendPoint].self, from: historyURL) ?? []
     }
 
     func recordHistory(from snapshot: ClusterSnapshot) throws -> [TrendPoint] {
         try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
         var history = loadHistory()
         let point = TrendPoint(snapshot: snapshot)
-        if history.last?.collectedAt != point.collectedAt {
+        // Dedupe by membership, not just the last entry: a stale collectedAt
+        // can reappear non-adjacently after an error gap, and TrendPoint.id is
+        // collectedAt, so duplicates would break SwiftUI identity.
+        let seenTimestamps = Set(history.map(\.collectedAt))
+        if !seenTimestamps.contains(point.collectedAt) {
             history.append(point)
         }
         if history.count > 1440 {
@@ -86,17 +149,14 @@ struct SnapshotCache {
     }
 
     func loadJobStateSnapshot() -> JobStateSnapshot? {
-        guard let data = try? Data(contentsOf: jobStateURL) else {
-            return nil
-        }
-        return try? JSONDecoder().decode(JobStateSnapshot.self, from: data)
+        decodeQuarantining(JobStateSnapshot.self, from: jobStateURL)
     }
 
     func saveJobStates(from jobs: [Job]) throws {
         try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = iso8601Formatter.string(from: Date())
         let records = Dictionary(
-            uniqueKeysWithValues: jobs.map { job in
+            jobs.map { job in
                 (
                     job.jobId,
                     JobStateRecord(
@@ -107,7 +167,8 @@ struct SnapshotCache {
                         lastSeenAt: now
                     )
                 )
-            }
+            },
+            uniquingKeysWith: { _, last in last }
         )
         let state = JobStateSnapshot(updatedAt: now, jobs: records)
         let data = try JSONEncoder.prettyAIRE.encode(state)
@@ -117,8 +178,8 @@ struct SnapshotCache {
 
 extension TrendPoint {
     init(snapshot: ClusterSnapshot) {
-        let gpuNodes = snapshot.nodes.filter { localGPUCapacity($0) > 0 }
-        let gpuTotalValue = gpuNodes.reduce(0) { $0 + localGPUCapacity($1) }
+        let gpuNodes = snapshot.nodes.filter { ($0.gpuTotal ?? slurmGPUTotal(from: $0.gres)) > 0 }
+        let gpuTotalValue = gpuNodes.reduce(0) { $0 + ($1.gpuTotal ?? slurmGPUTotal(from: $1.gres)) }
         let gpuAllocatedValue = gpuNodes.reduce(0) { $0 + ($1.gpuAllocated ?? 0) }
         let storage = snapshot.storage ?? []
         let home = storage.first { $0.label.lowercased() == "home" }
@@ -139,35 +200,16 @@ extension TrendPoint {
     }
 }
 
-private func localGPUCapacity(_ node: NodeSummary) -> Int {
-    if let total = node.gpuTotal {
-        return total
-    }
-    guard node.gres.lowercased().contains("gpu") else {
-        return 0
-    }
-    return Int(node.gres.split(separator: ":").last ?? "") ?? 0
-}
-
-private func isAvailable(_ node: NodeSummary) -> Bool {
-    let state = node.state.lowercased()
-    return !state.contains("maint")
-        && !state.contains("down")
-        && !state.contains("drain")
-        && !state.contains("fail")
-}
-
 extension JSONEncoder {
-    static var prettyAIRE: JSONEncoder {
+    static let prettyAIRE: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
-    }
+    }()
 }
 
 @MainActor
 final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
-    private var isAuthorized = false
     private var didRequestAuthorization = false
     private let terminalStateKeywords = [
         "BOOT_FAIL",
@@ -183,18 +225,27 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         "TIMEOUT"
     ]
 
+    private struct JobEnding {
+        let name: String
+        let jobId: String
+        let partition: String
+        let lastState: String
+        let finalState: String
+        let detail: String
+    }
+
+    // UNUserNotificationCenter aborts when the process has no app bundle
+    // (e.g. running the bare debug binary instead of the assembled .app).
+    static let notificationsSupported = Bundle.main.bundleIdentifier != nil
+
     func configure() {
-        guard !didRequestAuthorization else {
+        guard Self.notificationsSupported, !didRequestAuthorization else {
             return
         }
         didRequestAuthorization = true
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
-            Task { @MainActor in
-                self?.isAuthorized = granted
-            }
-        }
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     nonisolated func userNotificationCenter(
@@ -204,39 +255,131 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         [.banner, .sound]
     }
 
-    func notifyChanges(previous: JobStateSnapshot?, current jobs: [Job]) {
-        guard isAuthorized, let previous else {
-            return
+    /// Diffs the previous and current job lists and posts notifications for
+    /// job starts and endings. Returns true when the diff was actually
+    /// processed (or there was nothing to diff yet), so callers know whether
+    /// it is safe to persist the current job states as the new baseline.
+    func notifyChanges(previous: JobStateSnapshot?, current jobs: [Job]) async -> Bool {
+        guard Self.notificationsSupported else {
+            return false
+        }
+        // Re-query authorization every time instead of caching a one-shot
+        // flag, so a grant made later in System Settings takes effect without
+        // relaunching.
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional:
+            break
+        default:
+            return false
+        }
+        guard let previous else {
+            // First observation: nothing to diff, but the baseline may be
+            // persisted.
+            return true
         }
 
-        let currentById = Dictionary(uniqueKeysWithValues: jobs.map { ($0.jobId, $0) })
+        let currentById = Dictionary(
+            jobs.map { ($0.jobId, $0) },
+            uniquingKeysWith: { _, last in last }
+        )
 
+        var endings: [JobEnding] = []
+        var notifiedStartIds = Set<String>()
         for job in jobs {
-            guard let old = previous.jobs[job.jobId],
-                  old.state != job.state,
-                  isTerminalState(job.state) else {
+            guard let old = previous.jobs[job.jobId], old.state != job.state else {
                 continue
             }
-            sendJobEndedNotification(
-                name: job.name,
-                jobId: job.jobId,
-                partition: job.partition,
-                lastState: old.state,
-                finalState: job.state,
-                detail: "Final state reported by Slurm."
-            )
+            if isTerminalState(job.state) {
+                endings.append(
+                    JobEnding(
+                        name: job.name,
+                        jobId: job.jobId,
+                        partition: job.partition,
+                        lastState: old.state,
+                        finalState: job.state,
+                        detail: "Final state reported by Slurm."
+                    )
+                )
+            } else if isPendingState(old.state),
+                      isRunningState(job.state),
+                      notifiedStartIds.insert(job.jobId).inserted {
+                sendJobStartedNotification(name: job.name, jobId: job.jobId, partition: job.partition)
+            }
         }
 
         for old in previous.jobs.values where currentById[old.jobId] == nil && !isTerminalState(old.state) {
-            sendJobEndedNotification(
-                name: old.name,
-                jobId: old.jobId,
-                partition: old.partition,
-                lastState: old.state,
-                finalState: "Left queue",
-                detail: "The job is no longer visible in squeue."
+            endings.append(
+                JobEnding(
+                    name: old.name,
+                    jobId: old.jobId,
+                    partition: old.partition,
+                    lastState: old.state,
+                    finalState: "Left queue",
+                    detail: "The job is no longer visible in squeue."
+                )
             )
         }
+
+        if endings.count == 1, let ending = endings.first {
+            sendJobEndedNotification(ending)
+        } else if endings.count > 1 {
+            sendJobsEndedSummaryNotification(endings)
+        }
+        return true
+    }
+
+    /// Human-readable summary of the notification permission state for
+    /// display in the sidebar. Async because the authorization status has to
+    /// be queried from UNUserNotificationCenter.
+    func authorizationSummary() async -> String {
+        guard Self.notificationsSupported else {
+            return "Unavailable outside the app bundle"
+        }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized:
+            return "Allowed"
+        case .provisional:
+            return "Allowed (provisional)"
+        case .denied:
+            return "Denied — enable in System Settings"
+        case .notDetermined:
+            return "Not requested yet"
+        case .ephemeral:
+            return "Ephemeral"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+
+    /// Posts the fleet-wide "a GPU freed up" alert. Returns true when the
+    /// notification was actually queued, so the caller can start its
+    /// cooldown; the same support/authorization guards as job notifications
+    /// apply.
+    func notifyGPUBecameAvailable(idleCount: Int, partitions: [String]) async -> Bool {
+        guard Self.notificationsSupported else {
+            return false
+        }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional:
+            break
+        default:
+            return false
+        }
+        let nodesText = partitions.isEmpty
+            ? "GPU nodes"
+            : "\(partitions.joined(separator: ", ")) partition nodes"
+        let countText = "\(idleCount) GPU\(idleCount == 1 ? "" : "s")"
+        send(
+            title: "GPU available on AIRE",
+            subtitle: "Idle GPUs detected",
+            body: "\(countText) idle across \(nodesText)",
+            identifier: "gpu-available-\(iso8601Formatter.string(from: Date()))",
+            thread: "aire-gpu-availability"
+        )
+        return true
     }
 
     private func isTerminalState(_ state: String) -> Bool {
@@ -244,40 +387,71 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         return terminalStateKeywords.contains { normalized.contains($0) }
     }
 
-    private func sendJobEndedNotification(
-        name: String,
-        jobId: String,
-        partition: String,
-        lastState: String,
-        finalState: String,
-        detail: String
-    ) {
+    private func isPendingState(_ state: String) -> Bool {
+        state.uppercased().contains("PEND")
+    }
+
+    private func isRunningState(_ state: String) -> Bool {
+        state.uppercased().contains("RUN")
+    }
+
+    private func displayName(name: String, jobId: String) -> String {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = cleanName.isEmpty ? "Job \(jobId)" : cleanName
-        let subtitle = finalState == "Left queue"
+        return cleanName.isEmpty ? "Job \(jobId)" : cleanName
+    }
+
+    private func sendJobStartedNotification(name: String, jobId: String, partition: String) {
+        send(
+            title: "AIRE Monitor",
+            subtitle: "Your job started",
+            body: "\(displayName(name: name, jobId: jobId)) (#\(jobId))\nNow running on partition \(partition).",
+            identifier: "job-started-\(jobId)-\(iso8601Formatter.string(from: Date()))"
+        )
+    }
+
+    private func sendJobEndedNotification(_ ending: JobEnding) {
+        let subtitle = ending.finalState == "Left queue"
             ? "Job finished or left the queue"
-            : "Job ended: \(finalState)"
+            : "Job ended: \(ending.finalState)"
         let body = [
-            "\(displayName) (#\(jobId))",
-            "Partition \(partition) • previous state \(lastState)",
-            detail
+            "\(displayName(name: ending.name, jobId: ending.jobId)) (#\(ending.jobId))",
+            "Partition \(ending.partition) • previous state \(ending.lastState)",
+            ending.detail
         ].joined(separator: "\n")
 
         send(
             title: "AIRE Monitor",
             subtitle: subtitle,
             body: body,
-            identifier: "job-ended-\(jobId)-\(finalState)-\(ISO8601DateFormatter().string(from: Date()))"
+            identifier: "job-ended-\(ending.jobId)-\(ending.finalState)-\(iso8601Formatter.string(from: Date()))"
         )
     }
 
-    private func send(title: String, subtitle: String, body: String, identifier: String) {
+    private func sendJobsEndedSummaryNotification(_ endings: [JobEnding]) {
+        let lines = endings.map { ending in
+            "\(displayName(name: ending.name, jobId: ending.jobId)) (#\(ending.jobId)) — \(ending.finalState)"
+        }
+        send(
+            title: "AIRE Monitor",
+            subtitle: "\(endings.count) jobs ended",
+            body: lines.joined(separator: "\n"),
+            identifier: "jobs-ended-summary-\(iso8601Formatter.string(from: Date()))"
+        )
+    }
+
+    private func send(
+        title: String,
+        subtitle: String,
+        body: String,
+        identifier: String,
+        thread: String = "aire-job-events"
+    ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.subtitle = subtitle
         content.body = body
         content.sound = .default
-        content.threadIdentifier = "aire-job-events"
+        content.threadIdentifier = thread
 
         let request = UNNotificationRequest(
             identifier: identifier,

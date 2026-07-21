@@ -14,6 +14,23 @@ struct RemoteInfo: Codable {
         case cwd
         case remoteTime = "remote_time"
     }
+
+    init(host: String = "", hostname: String = "", user: String = "", cwd: String = "", remoteTime: String = "") {
+        self.host = host
+        self.hostname = hostname
+        self.user = user
+        self.cwd = cwd
+        self.remoteTime = remoteTime
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? ""
+        hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? ""
+        user = try container.decodeIfPresent(String.self, forKey: .user) ?? ""
+        cwd = try container.decodeIfPresent(String.self, forKey: .cwd) ?? ""
+        remoteTime = try container.decodeIfPresent(String.self, forKey: .remoteTime) ?? ""
+    }
 }
 
 struct Job: Codable, Identifiable {
@@ -80,7 +97,10 @@ struct PartitionSummary: Codable, Identifiable {
     let memoryMBPerNode: Int?
     let features: String
 
-    var id: String { "\(partition)-\(state)-\(gres)" }
+    // sinfo summary output can emit multiple rows sharing partition/state/gres
+    // (differing only in features or node count); include those so SwiftUI
+    // identity stays unique.
+    var id: String { "\(partition)-\(state)-\(gres)-\(features)-\(nodeCount.map(String.init) ?? "na")" }
 
     enum CodingKeys: String, CodingKey {
         case partition
@@ -189,5 +209,36 @@ struct ClusterSnapshot: Codable {
         case nodes
         case storage
         case errors
+    }
+
+    init(
+        collectedAt: String,
+        remote: RemoteInfo,
+        jobs: [Job],
+        partitions: [PartitionSummary],
+        nodes: [NodeSummary],
+        storage: [StorageSummary]?,
+        errors: [String]
+    ) {
+        self.collectedAt = collectedAt
+        self.remote = remote
+        self.jobs = jobs
+        self.partitions = partitions
+        self.nodes = nodes
+        self.storage = storage
+        self.errors = errors
+    }
+
+    // Resilient decoding: a missing or renamed peripheral key from the python
+    // emitter should not discard the whole snapshot (and with it the cache).
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        collectedAt = try container.decodeIfPresent(String.self, forKey: .collectedAt) ?? ""
+        remote = try container.decodeIfPresent(RemoteInfo.self, forKey: .remote) ?? RemoteInfo()
+        jobs = try container.decodeIfPresent([Job].self, forKey: .jobs) ?? []
+        partitions = try container.decodeIfPresent([PartitionSummary].self, forKey: .partitions) ?? []
+        nodes = try container.decodeIfPresent([NodeSummary].self, forKey: .nodes) ?? []
+        storage = try container.decodeIfPresent([StorageSummary].self, forKey: .storage)
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
     }
 }

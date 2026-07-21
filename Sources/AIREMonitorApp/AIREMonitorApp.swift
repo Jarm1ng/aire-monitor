@@ -17,23 +17,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class DashboardWindowPresenter {
     static let shared = DashboardWindowPresenter()
 
+    private static let frameAutosaveName = "AIREMonitorDashboardWindow"
+
     private var model: AppModel?
     private var window: NSWindow?
-    private var needsShowAfterConfigure = false
 
     private init() {}
 
     func configure(model: AppModel) {
         self.model = model
-        if needsShowAfterConfigure {
-            needsShowAfterConfigure = false
-            show()
-        }
     }
 
     func show() {
         guard let model else {
-            needsShowAfterConfigure = true
             return
         }
 
@@ -59,8 +55,12 @@ final class DashboardWindowPresenter {
         dashboardWindow.titlebarAppearsTransparent = true
         dashboardWindow.isReleasedWhenClosed = false
         dashboardWindow.contentViewController = hostingController
-        dashboardWindow.setFrameAutosaveName("AIREMonitorDashboardWindow")
-        dashboardWindow.center()
+        // Center only when there is no previously saved frame, so the user's
+        // window position survives relaunches.
+        if !dashboardWindow.setFrameUsingName(Self.frameAutosaveName) {
+            dashboardWindow.center()
+        }
+        dashboardWindow.setFrameAutosaveName(Self.frameAutosaveName)
         window = dashboardWindow
         return dashboardWindow
     }
@@ -77,14 +77,16 @@ struct AIREMonitorApp: App {
         _model = StateObject(wrappedValue: model)
         DashboardWindowPresenter.shared.configure(model: model)
         StatusBarMonitorController.shared.configure(model: model)
-        DispatchQueue.main.async {
-            DashboardWindowPresenter.shared.show()
-        }
     }
 
     var body: some Scene {
         Settings {
             EmptyView()
+        }
+        .commands {
+            // Suppress the standard Settings menu item, which would otherwise
+            // open a blank window.
+            CommandGroup(replacing: .appSettings) {}
         }
     }
 }

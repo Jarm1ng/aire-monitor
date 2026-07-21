@@ -3,13 +3,15 @@ import SwiftUI
 
 struct MenuBarMonitorView: View {
     @ObservedObject var model: AppModel
+    let closeMenu: @MainActor () -> Void
 
     private var summary: MenuBarSummary {
         MenuBarSummary(
             snapshot: model.snapshot,
             isConnected: model.isLoggedIn,
             hasCache: model.hasCachedSnapshot,
-            isRefreshing: model.isRefreshing
+            isRefreshing: model.isRefreshing,
+            refreshIntervalText: model.refreshIntervalText
         )
     }
 
@@ -24,23 +26,27 @@ struct MenuBarMonitorView: View {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(MenuPalette.border, lineWidth: 1)
                 )
-                .shadow(color: .black.opacity(0.16), radius: 22, x: 0, y: 12)
 
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 header
 
                 HStack(spacing: 8) {
-                    MenuMetricTile(title: "Running", value: "\(summary.runningJobs)", color: .blue)
+                    MenuMetricTile(title: "Running", value: "\(summary.runningJobs)", color: .green)
                     MenuMetricTile(title: "Pending", value: "\(summary.pendingJobs)", color: .orange)
                     MenuMetricTile(title: "Storage Risk", value: summary.storageRiskLabel, color: summary.storageRiskColor)
                 }
 
                 if !summary.attentionJobs.isEmpty {
-                    VStack(alignment: .leading, spacing: 7) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Current Jobs")
                             .font(.caption.weight(.semibold))
                         ForEach(summary.attentionJobs) { job in
                             MenuJobRow(job: job)
+                        }
+                        if summary.attentionOverflowCount > 0 {
+                            Text("+\(summary.attentionOverflowCount) more - open the dashboard for the full list")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
                     }
                     .menuSectionSurface()
@@ -54,7 +60,7 @@ struct MenuBarMonitorView: View {
                 }
 
                 if !summary.storageRows.isEmpty {
-                    VStack(alignment: .leading, spacing: 7) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Storage")
                             .font(.caption.weight(.semibold))
                         ForEach(summary.storageRows) { row in
@@ -70,7 +76,7 @@ struct MenuBarMonitorView: View {
                         Text("GPU Allocation")
                             .font(.caption.weight(.semibold))
                         Spacer()
-                        Text("\(summary.gpuAllocated)/\(summary.gpuTotal)")
+                        Text("\(summary.allocatedGPUs)/\(summary.totalGPUs)")
                             .font(.caption.monospacedDigit().weight(.semibold))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -95,12 +101,14 @@ struct MenuBarMonitorView: View {
                     .disabled(model.isRefreshing || model.isLoggingIn)
 
                     Button {
+                        closeMenu()
                         DashboardWindowPresenter.shared.show()
                     } label: {
                         Label("Open", systemImage: "macwindow")
                     }
 
                     Button {
+                        closeMenu()
                         model.openDesktopWidget()
                     } label: {
                         Label("Widget", systemImage: "rectangle.on.rectangle.angled")
@@ -109,16 +117,16 @@ struct MenuBarMonitorView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-            .padding(14)
+            .padding(12)
         }
         .frame(width: 370)
-        .animation(.easeInOut(duration: 0.24), value: summary.runningJobs)
-        .animation(.easeInOut(duration: 0.24), value: summary.pendingJobs)
-        .animation(.easeInOut(duration: 0.24), value: summary.storageRiskLabel)
+        .animation(AIRETheme.smoothEase, value: summary.runningJobs)
+        .animation(AIRETheme.smoothEase, value: summary.pendingJobs)
+        .animation(AIRETheme.smoothEase, value: summary.storageRiskLabel)
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             AIRELogoMark(cornerRadius: 7)
                 .frame(width: 34, height: 34)
 
@@ -131,14 +139,30 @@ struct MenuBarMonitorView: View {
                         .frame(width: 7, height: 7)
                         .shadow(color: summary.statusColor.opacity(0.28), radius: 3, x: 0, y: 0)
                 }
-                Text(summary.statusText)
+                Text(statusLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
+
+            if let collected = summary.collectedDate {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text("Updated \(menuRelativeAge(from: collected, to: context.date))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
         }
+    }
+
+    private var statusLine: String {
+        if model.isLoggingIn {
+            return model.loginProgress ?? "Signing in - watch for a Duo push"
+        }
+        return summary.statusText
     }
 }
 
@@ -148,7 +172,7 @@ private struct MenuMetricTile: View {
     let color: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -159,7 +183,7 @@ private struct MenuMetricTile: View {
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -185,7 +209,7 @@ private struct MenuUsageBar: View {
                 RoundedRectangle(cornerRadius: 4)
                     .fill(color)
                     .frame(width: max(proxy.size.width * CGFloat(value), value > 0 ? 7 : 0))
-                    .animation(.easeInOut(duration: 0.28), value: value)
+                    .animation(AIRETheme.smoothEase, value: value)
             }
         }
         .frame(height: 9)
@@ -226,7 +250,7 @@ private struct MenuJobRow: View {
     let job: MenuJobSummary
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 4)
                     .fill(job.color.opacity(0.18))
@@ -270,43 +294,46 @@ private struct MenuBarSummary {
     let isConnected: Bool
     let hasCache: Bool
     let isRefreshing: Bool
+    let refreshIntervalText: String
+
+    private static let maxAttentionJobs = 3
 
     var gpuNodes: [NodeSummary] {
-        snapshot?.nodes.filter { menuGPUTotal($0) > 0 } ?? []
+        snapshot?.nodes.filter { gpuTotal($0) > 0 } ?? []
     }
 
-    var gpuTotal: Int {
-        gpuNodes.reduce(0) { $0 + menuGPUTotal($1) }
+    var totalGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuTotal($1) }
     }
 
-    var gpuAllocated: Int {
-        gpuNodes.reduce(0) { $0 + ($1.gpuAllocated ?? 0) }
+    var allocatedGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuAllocated($1) }
     }
 
-    var gpuIdle: Int {
-        max(gpuTotal - gpuAllocated, 0)
+    var idleGPUs: Int {
+        gpuNodes.reduce(0) { $0 + gpuIdle($1) }
     }
 
     var runningJobs: Int {
-        snapshot?.jobs.filter { $0.state.uppercased().contains("RUN") }.count ?? 0
+        snapshot?.jobs.filter { isRunningJobState($0.state) }.count ?? 0
     }
 
     var pendingJobs: Int {
-        snapshot?.jobs.filter { $0.state.uppercased().contains("PEND") }.count ?? 0
+        snapshot?.jobs.filter { isPendingJobState($0.state) }.count ?? 0
     }
 
     var gpuUsageFraction: Double {
-        guard gpuTotal > 0 else {
+        guard totalGPUs > 0 else {
             return 0
         }
-        return min(Double(gpuAllocated) / Double(gpuTotal), 1)
+        return min(Double(allocatedGPUs) / Double(totalGPUs), 1)
     }
 
     var gpuUsageColor: Color {
-        if gpuTotal == 0 {
+        if totalGPUs == 0 {
             return .secondary
         }
-        if gpuIdle == 0 {
+        if idleGPUs == 0 {
             return .red
         }
         if gpuUsageFraction >= 0.75 {
@@ -330,19 +357,23 @@ private struct MenuBarSummary {
             return isConnected ? "Syncing live data" : "Checking AIRE session"
         }
         if isConnected {
-            return "Live - refreshes every 10s"
+            return "Live - refreshes every \(refreshIntervalText)"
         }
         if hasCache {
-            return "Cached/offline - retrying every 10s"
+            return "Cached/offline - retrying every \(refreshIntervalText)"
         }
         return "Offline - waiting for first snapshot"
     }
 
+    var collectedDate: Date? {
+        snapshot.flatMap { menuParseISODate($0.collectedAt) }
+    }
+
     var gpuCaption: String {
-        if gpuTotal == 0 {
+        if totalGPUs == 0 {
             return "GPU information will appear after the next snapshot."
         }
-        return "\(gpuIdle) free of \(gpuTotal) GPUs across \(gpuNodes.count) GPU nodes."
+        return "\(idleGPUs) free of \(totalGPUs) GPUs across \(gpuNodes.count) GPU nodes."
     }
 
     var storageRows: [MenuStorageSummary] {
@@ -368,20 +399,33 @@ private struct MenuBarSummary {
         return row.color
     }
 
+    private var sortedAttentionJobs: [Job] {
+        (snapshot?.jobs ?? [])
+            .filter { jobRank($0.state) < 2 }
+            .sorted { lhs, rhs in
+                let lhsRank = jobRank(lhs.state)
+                let rhsRank = jobRank(rhs.state)
+                if lhsRank != rhsRank {
+                    return lhsRank < rhsRank
+                }
+                return lhs.jobId < rhs.jobId
+            }
+    }
+
     var attentionJobs: [MenuJobSummary] {
-        (snapshot?.jobs ?? []).sorted { lhs, rhs in
-            jobRank(lhs.state) < jobRank(rhs.state)
-        }
-        .filter { jobRank($0.state) < 2 }
-        .prefix(3)
-        .map(MenuJobSummary.init(job:))
+        sortedAttentionJobs
+            .prefix(Self.maxAttentionJobs)
+            .map(MenuJobSummary.init(job:))
+    }
+
+    var attentionOverflowCount: Int {
+        max(sortedAttentionJobs.count - Self.maxAttentionJobs, 0)
     }
 }
 
 private struct MenuStorageSummary: Identifiable {
     let id: String
     let label: String
-    let shortLabel: String
     let usedFraction: Double
     let fileFraction: Double?
     let riskFraction: Double
@@ -389,13 +433,11 @@ private struct MenuStorageSummary: Identifiable {
     let percentLabel: String
     let spaceDetail: String
     let fileDetail: String
-    let fileHelpText: String
     let color: Color
 
     init(storage: StorageSummary) {
         id = storage.label
         label = storage.label.capitalized
-        shortLabel = storage.label.lowercased() == "scratch" ? "S" : "H"
         let percent = storage.usedPercent
         usedFraction = menuFraction(percent)
 
@@ -408,15 +450,20 @@ private struct MenuStorageSummary: Identifiable {
 
         riskFraction = max(usedFraction, fileFraction ?? 0)
         riskPercent = riskFraction * 100
-        percentLabel = percent.map { "\(Int($0.rounded()))%" } ?? "n/a"
+
+        // Show whichever pressure dominates, qualified so the tile and the
+        // row never appear to disagree (e.g. "95% files" vs a 40% space bar).
+        if let fileFraction, fileFraction > usedFraction {
+            percentLabel = "\(Int((fileFraction * 100).rounded()))% files"
+        } else {
+            percentLabel = percent.map { "\(Int($0.rounded()))%" } ?? "n/a"
+        }
         spaceDetail = "\(menuFormatGB(storage.availableGB)) free / \(menuFormatGB(storage.quotaGB)) quota / \(menuFormatGB(storage.limitGB)) limit"
 
         if let fileFraction {
             fileDetail = "files \(Int((fileFraction * 100).rounded()))%"
-            fileHelpText = fileDetail
         } else {
             fileDetail = "files n/a"
-            fileHelpText = "files n/a"
         }
 
         if riskPercent >= 90 {
@@ -424,7 +471,8 @@ private struct MenuStorageSummary: Identifiable {
         } else if riskPercent >= 80 {
             color = .orange
         } else {
-            color = .blue
+            // Matches the dashboard's storage accent instead of a stray blue.
+            color = .teal
         }
     }
 }
@@ -432,7 +480,6 @@ private struct MenuStorageSummary: Identifiable {
 private struct MenuJobSummary: Identifiable {
     let id: String
     let name: String
-    let menuBarName: String
     let jobId: String
     let partition: String
     let state: String
@@ -446,7 +493,6 @@ private struct MenuJobSummary: Identifiable {
     init(job: Job) {
         id = job.id
         name = job.name.isEmpty ? "(unnamed)" : job.name
-        menuBarName = menuCompactJobName(job.name)
         jobId = job.jobId
         partition = job.partition.isEmpty ? "n/a" : job.partition
         state = job.state.isEmpty ? "n/a" : job.state
@@ -454,8 +500,8 @@ private struct MenuJobSummary: Identifiable {
         timeLimit = job.timeLimit.isEmpty ? "n/a" : job.timeLimit
         location = menuJobLocation(job)
         resourceSummary = menuJobResources(job)
-        color = jobStateColor(job.state)
-        iconName = job.state.uppercased().contains("RUN") ? "play.fill" : "clock.fill"
+        color = SlurmState(parsing: job.state).color
+        iconName = isRunningJobState(job.state) ? "play.fill" : "clock.fill"
     }
 }
 
@@ -489,7 +535,7 @@ private struct MenuVisualEffectBackground: NSViewRepresentable {
 private extension View {
     func menuSectionSurface() -> some View {
         self
-            .padding(10)
+            .padding(12)
             .background(MenuPalette.sectionFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
@@ -499,36 +545,22 @@ private extension View {
     }
 }
 
-private func menuGPUTotal(_ node: NodeSummary) -> Int {
-    if let total = node.gpuTotal {
-        return total
-    }
-    guard node.gres.lowercased().contains("gpu") else {
-        return 0
-    }
-    return Int(node.gres.split(separator: ":").last ?? "") ?? 0
+private func isRunningJobState(_ state: String) -> Bool {
+    state.uppercased().contains("RUN")
+}
+
+private func isPendingJobState(_ state: String) -> Bool {
+    state.uppercased().contains("PEND")
 }
 
 private func jobRank(_ state: String) -> Int {
-    let value = state.uppercased()
-    if value.contains("RUN") {
+    if isRunningJobState(state) {
         return 0
     }
-    if value.contains("PEND") {
+    if isPendingJobState(state) {
         return 1
     }
     return 2
-}
-
-private func jobStateColor(_ state: String) -> Color {
-    let value = state.uppercased()
-    if value.contains("RUN") {
-        return .green
-    }
-    if value.contains("PEND") {
-        return .orange
-    }
-    return .secondary
 }
 
 private func storageSortRank(_ label: String) -> Int {
@@ -551,7 +583,7 @@ private func menuFraction(_ percent: Double?) -> Double {
 
 private func menuJobLocation(_ job: Job) -> String {
     let value = firstNonEmpty(job.nodeList, job.batchHost, job.reasonOrNodeList, job.nodes)
-    if job.state.uppercased().contains("PEND") {
+    if isPendingJobState(job.state) {
         return "reason/node \(value)"
     }
     return "node \(value)"
@@ -573,17 +605,6 @@ private func menuJobResources(_ job: Job) -> String {
     return [cpu, tasks].compactMap { $0 }.joined(separator: " ").nilIfEmpty ?? "resources n/a"
 }
 
-private func menuCompactJobName(_ name: String) -> String {
-    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else {
-        return "Running job"
-    }
-    if trimmed.count <= 18 {
-        return trimmed
-    }
-    return String(trimmed.prefix(16)) + ".."
-}
-
 private func menuKeyValue(_ key: String, _ value: String?) -> String? {
     guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
         return nil
@@ -593,7 +614,6 @@ private func menuKeyValue(_ key: String, _ value: String?) -> String? {
 
 private func menuCompactTres(_ value: String) -> String {
     value.replacingOccurrences(of: "billing=", with: "bill=")
-        .replacingOccurrences(of: "mem=", with: "mem=")
         .replacingOccurrences(of: "gres/gpu=", with: "gpu=")
 }
 
@@ -617,6 +637,42 @@ private func menuFormatGB(_ value: Double?) -> String {
         return String(format: "%.0f GB", value)
     }
     return String(format: "%.1f GB", value)
+}
+
+private func menuParseISODate(_ value: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) {
+        return date
+    }
+
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    if let date = plain.date(from: value) {
+        return date
+    }
+
+    // Python's datetime.isoformat() emits microsecond fractions that the
+    // strict three-digit fractional parser rejects; strip and retry.
+    let stripped = value.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+    return plain.date(from: stripped)
+}
+
+private func menuRelativeAge(from date: Date, to now: Date) -> String {
+    let seconds = max(Int(now.timeIntervalSince(date).rounded()), 0)
+    if seconds < 5 {
+        return "just now"
+    }
+    if seconds < 60 {
+        return "\(seconds)s ago"
+    }
+    if seconds < 3_600 {
+        return "\(seconds / 60)m ago"
+    }
+    if seconds < 86_400 {
+        return "\(seconds / 3_600)h ago"
+    }
+    return "\(seconds / 86_400)d ago"
 }
 
 private extension String {
