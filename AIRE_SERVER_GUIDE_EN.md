@@ -8,16 +8,25 @@ The information below is based on read-only checks made on 2026-05-20. Cluster r
 
 AIRE is a Slurm-managed HPC cluster. Long-running training, evaluation, parallel CPU work, GPU jobs, and memory-heavy workloads should not be run directly on login nodes. Production work should be submitted through `sbatch`.
 
-The local SSH config already defines an `aire` host alias:
+The recommended SSH configuration is in `config/aire_ssh_config.example`. Copy the Host blocks you need into `~/.ssh/config`, and create the control-socket directory first:
+
+```bash
+mkdir -m 700 ~/.ssh/ctl
+```
+
+The `aire` alias is the direct route and requires the University VPN (Ivanti):
 
 ```sshconfig
 Host aire
     HostName aire.leeds.ac.uk
     User <your-username>
-    ProxyJump rash
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/aire-%C
 ```
 
-This means local connections to `aire` go through the `rash` jump host first.
+When off the VPN, use the `aire-jump` alias instead, which routes through the `rash.leeds.ac.uk` jump host (password + Duo twice: once for rash, once for AIRE). The full set of Host blocks (`aire`, `rash`, `aire-jump`, all using `~/.ssh/ctl/*-%C` control sockets and `NumberOfPasswordPrompts 1`) is in `config/aire_ssh_config.example`.
 
 Confirmed remote information:
 
@@ -46,14 +55,20 @@ Run a one-off read-only command:
 ssh aire 'hostname; whoami; pwd; date'
 ```
 
-If the connection fails, check the jump host first:
+If the connection fails, first confirm the VPN is connected, then inspect the verbose output:
 
 ```bash
-ssh rash 'hostname'
 ssh -vv aire
 ```
 
-The current SSH configuration uses password or keyboard-interactive authentication, so it may prompt for a Leeds password or multi-factor authentication.
+When off the VPN, use the jump-host route instead:
+
+```bash
+ssh rash 'hostname'
+ssh aire-jump 'hostname'
+```
+
+Here `rash` is the jump host. The SSH configuration uses password or keyboard-interactive authentication, so it may prompt for a Leeds password or multi-factor authentication.
 
 ## 3. Login Node Rules
 

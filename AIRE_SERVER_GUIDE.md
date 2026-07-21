@@ -8,16 +8,25 @@
 
 AIRE 是通过 Slurm 调度系统使用的集群服务器。不要直接在登录节点长时间跑训练、评估、并行计算或大内存任务；正式计算应通过 `sbatch` 提交到计算节点。
 
-本机 SSH 配置中已有 `aire` 主机别名：
+推荐的 SSH 配置见 `config/aire_ssh_config.example`。把需要的 Host 块复制到 `~/.ssh/config`，并先创建控制套接字目录：
+
+```bash
+mkdir -m 700 ~/.ssh/ctl
+```
+
+其中 `aire` 别名是直连路线，需要连着大学 VPN（Ivanti）使用：
 
 ```sshconfig
 Host aire
     HostName aire.leeds.ac.uk
     User <your-username>
-    ProxyJump rash
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/aire-%C
 ```
 
-也就是说，本地连接 `aire` 时会先经过跳板机 `rash`。
+不在 VPN 上时，改用经过跳板机 `rash.leeds.ac.uk` 的 `aire-jump` 别名（密码 + Duo 各验证两次：一次 rash，一次 AIRE）。完整的三个 Host 块（`aire`、`rash`、`aire-jump`，均使用 `~/.ssh/ctl/*-%C` 控制套接字和 `NumberOfPasswordPrompts 1`）见 `config/aire_ssh_config.example`。
 
 已确认的远端信息：
 
@@ -46,11 +55,17 @@ ssh aire
 ssh aire 'hostname; whoami; pwd; date'
 ```
 
-如果连接失败，优先检查：
+如果连接失败，优先确认 VPN 是否在线，再查看详细输出：
+
+```bash
+ssh -vv aire
+```
+
+不在 VPN 上时，改用跳板机路线检查：
 
 ```bash
 ssh rash 'hostname'
-ssh -vv aire
+ssh aire-jump 'hostname'
 ```
 
 这里 `rash` 是跳板机。因为当前 SSH 配置使用密码或 keyboard-interactive 认证，可能会提示输入 Leeds 账号密码或多因素认证。
