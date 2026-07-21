@@ -1,19 +1,42 @@
+# AIRE SSH configuration example.
+#
+# Copy the Host blocks you need into ~/.ssh/config (do NOT commit a
+# personalized copy of this file). Create the control-socket directory first:
+#
+#   mkdir -m 700 ~/.ssh/ctl
+#
+# ControlPath is home-anchored so `ssh aire` works from any directory; the
+# short path also stays well under the unix-socket path-length limit.
+#
+# NumberOfPasswordPrompts is 1 on purpose: a mistyped password fails
+# immediately instead of being resent repeatedly, which with the University
+# IdP can otherwise trigger an account lockout.
+#
+# Host-key pinning (recommended): this repository does not ship fingerprints —
+# verify them yourself, e.g. from an official University of Leeds source or
+# with `ssh-keygen -F rash.leeds.ac.uk` after a first connection made from a
+# trusted network. Once verified, you can pin the keys by adding to each Host
+# block below:
+#   UserKnownHostsFile ~/.ssh/known_hosts_leeds
+#   StrictHostKeyChecking yes
+
+# Route 1: direct to AIRE — use while connected to the University VPN (Ivanti).
 Host aire
     HostName aire.leeds.ac.uk
     User <your-username>
-    ProxyJump %r@rash.leeds.ac.uk
     PubkeyAuthentication no
     PreferredAuthentications password,keyboard-interactive
     KbdInteractiveAuthentication yes
     PasswordAuthentication yes
-    NumberOfPasswordPrompts 8
+    NumberOfPasswordPrompts 1
     ControlMaster auto
-    ControlPersist 2h
-    ControlPath .runtime/ssh-control/%C
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/aire-%C
     ServerAliveInterval 30
-    ServerAliveCountMax 6
+    ServerAliveCountMax 10
     ConnectTimeout 20
 
+# Jump host used by Route 2 (off-VPN).
 Host rash
     HostName rash.leeds.ac.uk
     User <your-username>
@@ -21,10 +44,28 @@ Host rash
     PreferredAuthentications password,keyboard-interactive
     KbdInteractiveAuthentication yes
     PasswordAuthentication yes
-    NumberOfPasswordPrompts 8
+    NumberOfPasswordPrompts 1
     ControlMaster auto
-    ControlPersist 2h
-    ControlPath .runtime/ssh-control/%C
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/rash-%C
     ServerAliveInterval 30
-    ServerAliveCountMax 6
+    ServerAliveCountMax 10
+    ConnectTimeout 20
+
+# Route 2: AIRE via the rash jump host — use when off the VPN
+# (password + Duo twice: once for rash, once for AIRE).
+Host aire-jump
+    HostName aire.leeds.ac.uk
+    User <your-username>
+    ProxyJump %r@rash.leeds.ac.uk
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/aire-jump-%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 10
     ConnectTimeout 20

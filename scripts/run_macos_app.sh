@@ -9,21 +9,38 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 cd "$ROOT_DIR"
 
-SDKROOT="${SDKROOT:-/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk}"
+# Prefer the pinned CLT SDK when present; otherwise ask xcrun so the script
+# works on machines with a different SDK version installed.
+PINNED_SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
+if [[ -z "${SDKROOT:-}" ]]; then
+    if [[ -d "$PINNED_SDK" ]]; then
+        SDKROOT="$PINNED_SDK"
+    else
+        SDKROOT="$(xcrun --show-sdk-path --sdk macosx)"
+    fi
+fi
 BUILD_LOG="$ROOT_DIR/.runtime/swift-build.log"
-BUILD_DIR="${AIRE_SWIFTPM_BUILD_DIR:-/tmp/aire_server_app_swiftpm_build}"
+# Build into the per-user Darwin temp dir (mode 700, never shared or
+# world-writable). Some backup/sync tools watching the project volume break
+# llbuild's SQLite database mid-build; the per-user temp volume is immune.
+USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime/")"
+BUILD_DIR="${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}"
 APP_EXECUTABLE="$BUILD_DIR/debug/AIREMonitorApp"
 mkdir -p "$ROOT_DIR/.runtime"
 
+BUILD_START_TS="$(date +%s)"
 set +e
 SDKROOT="$SDKROOT" swift build --disable-sandbox --scratch-path "$BUILD_DIR" --jobs 1 >"$BUILD_LOG" 2>&1
 BUILD_STATUS=$?
 set -e
 
 if [[ $BUILD_STATUS -ne 0 ]]; then
-    if [[ -x "$APP_EXECUTABLE" ]] && grep -q "Build complete" "$BUILD_LOG"; then
-        echo "swift build returned $BUILD_STATUS after producing the executable; continuing."
-        echo "Build log: $BUILD_LOG"
+    # Some toolchain/macOS combinations fail the final build.db write-back
+    # ("disk I/O error") after a fully successful compile. Accept the build
+    # only when the log confirms completion AND the binary is fresh.
+    EXEC_MTIME="$(stat -f %m "$APP_EXECUTABLE" 2>/dev/null || echo 0)"
+    if grep -q "Build complete!" "$BUILD_LOG" && (( EXEC_MTIME >= BUILD_START_TS - 5 )); then
+        echo "warning: swift build exited $BUILD_STATUS but the build completed; continuing with the fresh binary." >&2
     else
         cat "$BUILD_LOG" >&2
         exit "$BUILD_STATUS"

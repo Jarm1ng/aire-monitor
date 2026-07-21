@@ -3,6 +3,7 @@
 
 # SwiftPM and build products
 .build/
+.swiftpm/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
@@ -11,6 +12,7 @@ DerivedData/
 .runtime/
 ssh-control/
 *.log
+*.pid
 snapshot.json
 latest_snapshot*.json
 last_snapshot.json
@@ -18,6 +20,7 @@ job_state.json
 snapshot_history.json
 
 # Local secrets and environment
+config/aire_ssh_config
 .env
 .env.*
 *.key
@@ -29,3 +32,6 @@ id_ed25519*
 .vscode/
 .idea/
 *.swp
+
+# Python bytecode
+__pycache__/
