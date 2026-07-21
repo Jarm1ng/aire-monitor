@@ -4,7 +4,15 @@ import SwiftUI
 private enum WidgetLayout {
     static let width: CGFloat = 548
     static let height: CGFloat = 246
+    /// Minimum spacing between fallback snapshot collections, and the cadence
+    /// the widget advertises in the footer.
     static let refreshInterval: TimeInterval = 10
+    /// How often the widget polls the snapshot file for changes (belt and
+    /// braces alongside the directory watcher).
+    static let filePollInterval: TimeInterval = 2
+    /// A snapshot older than this is considered stale: the main app is not
+    /// feeding the file, so the widget collects its own snapshot.
+    static let staleThreshold: TimeInterval = 30
 }
 
 private enum WidgetPalette {
@@ -12,20 +20,60 @@ private enum WidgetPalette {
     static let fill = Color.primary.opacity(0.040)
     static let fillStrong = Color.primary.opacity(0.070)
     static let border = Color.primary.opacity(0.085)
-    static let highlight = Color.white.opacity(0.16)
+    static let highlight = Color.primary.opacity(0.10)
     static let cyan = Color.cyan
     static let green = Color.green
     static let orange = Color.orange
     static let red = Color.red
     static let purple = Color.purple
+    static let neutral = Color.secondary
+
+    /// Matches the main app's job-state semantics: running = green,
+    /// pending = orange, anything else neutral.
+    static func jobStateColor(_ state: String) -> Color {
+        let value = state.uppercased()
+        if value.contains("RUN") {
+            return green
+        }
+        if value.contains("PEND") {
+            return orange
+        }
+        return neutral
+    }
+
+    /// Matches the main app's GPU ramp: green = free, orange = partially
+    /// allocated, cyan = fully allocated, red = unavailable.
+    static func gpuColor(allocatedRatio: Double, isAvailable: Bool = true) -> Color {
+        guard isAvailable else {
+            return red
+        }
+        if allocatedRatio >= 1 {
+            return cyan
+        }
+        if allocatedRatio > 0 {
+            return orange
+        }
+        return green
+    }
+
+    static func heatmapColor(for node: WidgetNode) -> Color {
+        let ratio = Double(node.gpuAllocatedValue) / Double(max(node.gpuTotalValue, 1))
+        let base = gpuColor(allocatedRatio: ratio, isAvailable: node.isAvailable)
+        guard node.isAvailable else {
+            return base.opacity(0.68)
+        }
+        return base.opacity(ratio > 0 ? 0.88 : 0.80)
+    }
 }
 
 struct WidgetLogoMark: View {
     var cornerRadius: CGFloat = 7
 
+    @MainActor private static let cachedLogo: NSImage? = loadLogoImage()
+
     var body: some View {
         Group {
-            if let image = Self.logoImage() {
+            if let image = Self.cachedLogo {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFill()
@@ -40,16 +88,16 @@ struct WidgetLogoMark: View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                .stroke(Color.primary.opacity(0.18), lineWidth: 1)
         )
     }
 
-    private static func logoImage() -> NSImage? {
+    private static func loadLogoImage() -> NSImage? {
         if let url = Bundle.main.url(forResource: "AIRELogo", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
-        let fallback = FileManager.default.currentDirectoryPath + "/assets/AIRELogo.png"
+        let fallback = ProjectLocator.findProjectRoot() + "/assets/AIRELogo.png"
         return NSImage(contentsOfFile: fallback)
     }
 }
@@ -93,20 +141,48 @@ struct DesktopWindowConfigurator: NSViewRepresentable {
         }
     }
 
+    /// Idempotent: runs on every SwiftUI update, so every assignment is
+    /// guarded to avoid needless AppKit relayout/flicker.
     private func configure(window: NSWindow?) {
         guard let window else {
             return
         }
-        window.title = "AIRE Desktop Widget"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.styleMask = [.borderless, .fullSizeContentView]
-        window.isMovableByWindowBackground = true
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        if window.title != "AIRE Desktop Widget" {
+            window.title = "AIRE Desktop Widget"
+        }
+        if window.titleVisibility != .hidden {
+            window.titleVisibility = .hidden
+        }
+        if !window.titlebarAppearsTransparent {
+            window.titlebarAppearsTransparent = true
+        }
+        let styleMask: NSWindow.StyleMask = [.borderless, .fullSizeContentView]
+        if window.styleMask != styleMask {
+            window.styleMask = styleMask
+        }
+        if !window.isMovableByWindowBackground {
+            window.isMovableByWindowBackground = true
+        }
+        if window.isOpaque {
+            window.isOpaque = false
+        }
+        if window.backgroundColor != .clear {
+            window.backgroundColor = .clear
+        }
+        if !window.hasShadow {
+            window.hasShadow = true
+        }
+        let collectionBehavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        if window.collectionBehavior != collectionBehavior {
+            window.collectionBehavior = collectionBehavior
+        }
+        let level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        if window.level != level {
+            window.level = level
+        }
+        if window.frameAutosaveName != "AIREDesktopWidget" {
+            window.setFrameAutosaveName("AIREDesktopWidget")
+        }
         let contentSize = NSSize(width: WidgetLayout.width, height: WidgetLayout.height)
         if window.frame.size != contentSize {
             let frame = window.frame
@@ -118,11 +194,26 @@ struct DesktopWindowConfigurator: NSViewRepresentable {
             )
             window.setFrame(nextFrame, display: true)
         }
-        window.minSize = contentSize
-        window.maxSize = contentSize
-        window.contentMinSize = contentSize
-        window.contentMaxSize = contentSize
+        if window.minSize != contentSize {
+            window.minSize = contentSize
+        }
+        if window.maxSize != contentSize {
+            window.maxSize = contentSize
+        }
+        if window.contentMinSize != contentSize {
+            window.contentMinSize = contentSize
+        }
+        if window.contentMaxSize != contentSize {
+            window.contentMaxSize = contentSize
+        }
     }
+}
+
+enum WidgetDataStatus {
+    case connecting
+    case live
+    case cached
+    case offline
 }
 
 @MainActor
@@ -130,49 +221,77 @@ final class WidgetModel: ObservableObject {
     @Published var snapshot: WidgetSnapshot?
     @Published var errorMessage: String?
     @Published var isRefreshing = false
-    @Published var lastRefresh: Date?
-    @Published var usingCache = false
+    /// When the displayed data last changed (file reload or collection).
+    @Published var lastUpdate: Date?
+    /// When the displayed snapshot was collected on the cluster.
+    @Published var snapshotDate: Date?
+    @Published var status: WidgetDataStatus = .connecting
+    @Published var launchMessage: String?
 
     let projectRoot = ProjectLocator.findProjectRoot()
-    private var timer: Timer?
+
+    private var pollTimer: Timer?
+    private var directoryWatcher: DispatchSourceFileSystemObject?
+    private var loadedModificationDate: Date?
+    private var failedModificationDate: Date?
+    private var lastFallbackAttempt: Date?
+    /// True when the displayed snapshot came from this widget's own fallback
+    /// collection (rather than the main app writing the snapshot file).
+    private var lastDataFromFallback = false
+    /// Modification date of the snapshot file as last written by this
+    /// widget's own fallback collection; reloading that same write must not
+    /// be mistaken for the main app feeding the file.
+    private var ownWriteModificationDate: Date?
+
+    private var runtimeDirectory: String {
+        "\(projectRoot)/.runtime"
+    }
+
+    private var snapshotPath: String {
+        "\(runtimeDirectory)/latest_snapshot.json"
+    }
+
+    private var legacySnapshotPath: String {
+        "\(runtimeDirectory)/last_snapshot.json"
+    }
 
     func start() {
-        guard timer == nil else {
+        guard pollTimer == nil else {
             return
         }
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: WidgetLayout.refreshInterval, repeats: true) { [weak self] _ in
+        installDirectoryWatcherIfNeeded()
+        syncWithSnapshotFile(forceReload: true)
+        pollTimer = Timer.scheduledTimer(withTimeInterval: WidgetLayout.filePollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.refresh()
+                guard let self else {
+                    return
+                }
+                self.installDirectoryWatcherIfNeeded()
+                self.syncWithSnapshotFile()
             }
         }
     }
 
     func refresh() {
-        guard !isRefreshing else {
-            return
-        }
-        isRefreshing = true
-
-        Task {
-            do {
-                let nextSnapshot = try await SnapshotRunner.collect(projectRoot: projectRoot)
-                snapshot = nextSnapshot.snapshot
-                errorMessage = nextSnapshot.errorMessage
-                usingCache = nextSnapshot.usedCache
-                lastRefresh = Date()
-            } catch {
-                errorMessage = error.localizedDescription
-                usingCache = snapshot != nil
-            }
-            isRefreshing = false
-        }
+        syncWithSnapshotFile(forceReload: true, forceCollect: true)
     }
 
     func openMainApp() {
         let appURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/AIREMonitorApp.app")
         if FileManager.default.fileExists(atPath: appURL.path) {
-            NSWorkspace.shared.open(appURL)
+            launchMessage = "Launching AIRE Monitor…"
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { [weak self] _, error in
+                Task { @MainActor in
+                    guard let self else {
+                        return
+                    }
+                    self.launchMessage = nil
+                    if let error {
+                        self.errorMessage = "Could not open AIRE Monitor: \(error.localizedDescription)"
+                    }
+                }
+            }
             return
         }
 
@@ -186,7 +305,202 @@ final class WidgetModel: ObservableObject {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [scriptURL.path]
         process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
-        try? process.run()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] finished in
+            let status = finished.terminationStatus
+            Task { @MainActor in
+                guard let self else {
+                    return
+                }
+                self.launchMessage = nil
+                if status != 0 {
+                    self.errorMessage = "AIRE Monitor launcher exited with status \(status); run scripts/run_macos_app.sh in Terminal for details."
+                }
+            }
+        }
+        do {
+            try process.run()
+            launchMessage = "Launching AIRE Monitor… (building if needed)"
+        } catch {
+            errorMessage = "Could not launch AIRE Monitor: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Snapshot file watching
+
+    private func installDirectoryWatcherIfNeeded() {
+        guard directoryWatcher == nil else {
+            return
+        }
+        let descriptor = open(runtimeDirectory, O_EVTONLY)
+        guard descriptor >= 0 else {
+            return
+        }
+        // Watch the directory, not the file: the main app replaces the
+        // snapshot atomically (write + rename), which shows up as a directory
+        // write event and would orphan a watcher bound to the old file inode.
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .delete, .rename],
+            queue: .main
+        )
+        source.setEventHandler { [weak self, weak source] in
+            // Read the vnode flags synchronously: source.data is only valid
+            // while the handler runs and events could coalesce or be lost
+            // across the async hop below.
+            guard let flags = source?.data else {
+                return
+            }
+            Task { @MainActor in
+                self?.handleRuntimeDirectoryEvent(flags: flags)
+            }
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        source.resume()
+        directoryWatcher = source
+    }
+
+    private func handleRuntimeDirectoryEvent(flags: DispatchSource.FileSystemEvent) {
+        if !flags.isDisjoint(with: [.delete, .rename]) {
+            // The watched inode was unlinked or renamed. Checking the path
+            // here would race with a delete+recreate and leave the source
+            // bound to the dead inode forever, so drop the watcher
+            // unconditionally and let the poll timer re-install one against
+            // the current directory inode.
+            directoryWatcher?.cancel()
+            directoryWatcher = nil
+        }
+        syncWithSnapshotFile()
+    }
+
+    /// Primary data path: reload the snapshot file when it changed, then fall
+    /// back to spawning the collector only when the file is missing or stale,
+    /// so the widget never double-collects while the main app is running.
+    private func syncWithSnapshotFile(forceReload: Bool = false, forceCollect: Bool = false) {
+        let wasFallback = lastDataFromFallback
+        if let modificationDate = fileModificationDate(atPath: snapshotPath) {
+            let isNew = modificationDate != loadedModificationDate
+                && modificationDate != failedModificationDate
+            if forceReload || isNew {
+                loadSnapshotFile(modificationDate: modificationDate)
+            }
+        }
+        recomputeStatus()
+
+        let age = snapshotAge
+        let missingOrStale = age.map { $0 > WidgetLayout.staleThreshold } ?? true
+        let ownFeedDue = lastDataFromFallback
+            && (age.map { $0 > WidgetLayout.refreshInterval } ?? true)
+        if forceCollect {
+            // Manual refresh: bypass the cadence, but only collect when the
+            // widget is feeding itself (or the file is missing/stale) so we
+            // never double-collect while the main app feeds the file.
+            if missingOrStale || wasFallback {
+                collectIfNeeded(bypassCadence: true)
+            }
+        } else if missingOrStale || ownFeedDue {
+            collectIfNeeded(bypassCadence: false)
+        }
+    }
+
+    private var snapshotAge: TimeInterval? {
+        guard snapshot != nil, let snapshotDate else {
+            return nil
+        }
+        return Date().timeIntervalSince(snapshotDate)
+    }
+
+    private func loadSnapshotFile(modificationDate: Date) {
+        guard let data = FileManager.default.contents(atPath: snapshotPath),
+              let decoded = try? JSONDecoder().decode(WidgetSnapshot.self, from: data) else {
+            failedModificationDate = modificationDate
+            return
+        }
+        failedModificationDate = nil
+        loadedModificationDate = modificationDate
+        if modificationDate != ownWriteModificationDate {
+            // Only a write by someone else (the main app) means we are no
+            // longer feeding ourselves; a forced reload of our own write
+            // must keep the 10s self-feed cadence intact.
+            lastDataFromFallback = false
+        }
+        snapshot = decoded
+        snapshotDate = WidgetTimestampParser.date(from: decoded.collectedAt) ?? modificationDate
+        lastUpdate = Date()
+        errorMessage = nil
+    }
+
+    private func recomputeStatus() {
+        guard snapshot != nil else {
+            status = errorMessage == nil ? .connecting : .offline
+            return
+        }
+        if let age = snapshotAge, age <= WidgetLayout.staleThreshold {
+            status = .live
+        } else {
+            status = .cached
+        }
+    }
+
+    // MARK: - Fallback collection
+
+    private func collectIfNeeded(bypassCadence: Bool) {
+        guard !isRefreshing else {
+            return
+        }
+        if !bypassCadence,
+           let lastFallbackAttempt,
+           Date().timeIntervalSince(lastFallbackAttempt) < WidgetLayout.refreshInterval {
+            return
+        }
+        lastFallbackAttempt = Date()
+        isRefreshing = true
+        Task {
+            defer {
+                isRefreshing = false
+            }
+            do {
+                let result = try await SnapshotRunner.collect(projectRoot: projectRoot)
+                apply(result)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            recomputeStatus()
+        }
+    }
+
+    private func apply(_ result: SnapshotResult) {
+        let collectedDate = WidgetTimestampParser.date(from: result.snapshot.collectedAt)
+        if let existing = snapshotDate, let collectedDate, collectedDate < existing {
+            // The main app wrote a newer snapshot while the fallback
+            // collection ran; keep the newer data and only surface the error.
+            errorMessage = result.errorMessage
+            return
+        }
+        snapshot = result.snapshot
+        errorMessage = result.errorMessage
+        lastDataFromFallback = !result.usedCache
+        if result.usedCache {
+            snapshotDate = collectedDate
+                ?? fileModificationDate(atPath: snapshotPath)
+                ?? fileModificationDate(atPath: legacySnapshotPath)
+        } else {
+            snapshotDate = collectedDate ?? Date()
+            // SnapshotRunner just wrote the cache file; remember its
+            // modification date so the watcher does not redundantly reload it
+            // and so a forced reload of it is recognized as our own write.
+            loadedModificationDate = fileModificationDate(atPath: snapshotPath)
+            ownWriteModificationDate = loadedModificationDate
+        }
+        lastUpdate = Date()
+    }
+
+    private func fileModificationDate(atPath path: String) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date
     }
 }
 
@@ -225,6 +539,31 @@ struct DesktopWidgetView: View {
         jobs.filter { $0.state.uppercased().contains("PEND") }
     }
 
+    /// Running jobs first, then pending, then everything else, preserving the
+    /// original (squeue) order within each group.
+    private var featuredJobs: [WidgetJob] {
+        let ranked = jobs.enumerated().sorted { lhs, rhs in
+            let lhsRank = Self.jobRank(lhs.element)
+            let rhsRank = Self.jobRank(rhs.element)
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
+            }
+            return lhs.offset < rhs.offset
+        }
+        return ranked.prefix(2).map(\.element)
+    }
+
+    private static func jobRank(_ job: WidgetJob) -> Int {
+        let state = job.state.uppercased()
+        if state.contains("RUN") {
+            return 0
+        }
+        if state.contains("PEND") {
+            return 1
+        }
+        return 2
+    }
+
     var body: some View {
         ZStack {
             WidgetVisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow)
@@ -239,7 +578,6 @@ struct DesktopWidgetView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(WidgetPalette.highlight, lineWidth: 1)
-                        .blendMode(.screen)
                 )
                 .shadow(color: .black.opacity(0.18), radius: 22, x: 0, y: 10)
 
@@ -266,6 +604,18 @@ struct DesktopWidgetView: View {
         }
         .frame(width: WidgetLayout.width, height: WidgetLayout.height, alignment: .topLeading)
         .ignoresSafeArea()
+        .contextMenu {
+            Button("Refresh") {
+                model.refresh()
+            }
+            Button("Open AIRE Monitor") {
+                model.openMainApp()
+            }
+            Divider()
+            Button("Quit") {
+                NSApp.terminate(nil)
+            }
+        }
         .animation(.easeInOut(duration: 0.28), value: gpuAllocated)
         .animation(.easeInOut(duration: 0.28), value: gpuTotal)
         .animation(.easeInOut(duration: 0.28), value: runningJobs.count)
@@ -286,16 +636,16 @@ struct DesktopWidgetView: View {
                 .contentTransition(.opacity)
 
             StatusChip(
-                title: model.usingCache ? "cached" : "live",
-                value: remoteName,
-                color: model.errorMessage == nil ? WidgetPalette.green : WidgetPalette.orange
+                title: statusPresentation.title,
+                value: statusPresentation.value,
+                color: statusPresentation.color
             )
 
             Spacer()
 
-            Text(lastRefreshText)
+            Text(headerTimestampText)
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(headerTimestampColor)
                 .singleLine()
                 .contentTransition(.opacity)
 
@@ -306,15 +656,22 @@ struct DesktopWidgetView: View {
             }
             .buttonStyle(WidgetIconButtonStyle())
             .help("Open AIRE Monitor")
+            .accessibilityLabel("Open AIRE Monitor")
 
             Button {
                 model.refresh()
             } label: {
-                Image(systemName: model.isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                if model.isRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
             }
             .buttonStyle(WidgetIconButtonStyle())
             .disabled(model.isRefreshing)
             .help("Refresh")
+            .accessibilityLabel("Refresh")
 
             Button {
                 NSApp.terminate(nil)
@@ -323,6 +680,7 @@ struct DesktopWidgetView: View {
             }
             .buttonStyle(WidgetIconButtonStyle())
             .help("Close widget")
+            .accessibilityLabel("Close widget")
         }
         .frame(height: 30)
     }
@@ -331,6 +689,9 @@ struct DesktopWidgetView: View {
         HStack(spacing: 12) {
             RingMeter(value: gpuRatio, color: gpuUseColor, label: "\(gpuPercent)%")
                 .frame(width: 72, height: 72)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("GPU fleet usage")
+                .accessibilityValue("\(gpuAllocated) of \(gpuTotal) GPUs allocated, \(gpuPercent) percent")
 
             VStack(alignment: .leading, spacing: 9) {
                 Text("GPU Fleet")
@@ -394,8 +755,14 @@ struct DesktopWidgetView: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(WidgetPalette.green)
                         .singleLine()
-                } else if let firstJob = jobs.first {
-                    JobRow(job: firstJob)
+                } else if featuredJobs.count == 1 {
+                    JobRow(job: featuredJobs[0])
+                } else {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(featuredJobs) { job in
+                            CompactJobRow(job: job)
+                        }
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -427,8 +794,8 @@ struct DesktopWidgetView: View {
     }
 
     private var footer: some View {
-        let message = statusMessage ?? "Refreshes every 10 seconds"
-        let isWarning = model.errorMessage != nil
+        let message = statusMessage ?? "Refreshes every \(Int(WidgetLayout.refreshInterval)) seconds"
+        let isWarning = model.errorMessage != nil || model.status == .cached
         let color = isWarning ? WidgetPalette.orange : WidgetPalette.green
 
         return HStack(alignment: .top, spacing: 7) {
@@ -449,7 +816,7 @@ struct DesktopWidgetView: View {
                 .truncationMode(.tail)
                 .minimumScaleFactor(0.9)
             Spacer()
-            Text("10s")
+            Text("\(Int(WidgetLayout.refreshInterval))s")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .singleLine()
@@ -471,25 +838,55 @@ struct DesktopWidgetView: View {
         return "waiting"
     }
 
-    private var lastRefreshText: String {
-        guard let lastRefresh else {
+    /// One state drives the chip's title, value, and color consistently.
+    private var statusPresentation: (title: String, value: String, color: Color) {
+        switch model.status {
+        case .connecting:
+            return ("connecting", "waiting", WidgetPalette.neutral)
+        case .live:
+            return ("live", remoteName, WidgetPalette.green)
+        case .cached:
+            return ("cached", remoteName, WidgetPalette.orange)
+        case .offline:
+            return ("offline", "no data", WidgetPalette.red)
+        }
+    }
+
+    private var headerTimestampText: String {
+        switch model.status {
+        case .cached:
+            guard let snapshotDate = model.snapshotDate else {
+                return "data age unknown"
+            }
+            return "data from \(snapshotDate.formatted(date: .omitted, time: .shortened))"
+        case .live:
+            guard let lastUpdate = model.lastUpdate else {
+                return "not updated"
+            }
+            return lastUpdate.formatted(date: .omitted, time: .standard)
+        case .connecting, .offline:
             return "not updated"
         }
-        return lastRefresh.formatted(date: .omitted, time: .standard)
+    }
+
+    private var headerTimestampColor: Color {
+        model.status == .cached ? WidgetPalette.orange : Color.secondary
     }
 
     private var statusMessage: String? {
-        if let error = model.errorMessage, !error.isEmpty {
-            return model.usingCache ? "Using cached data. \(error)" : error
+        if let launchMessage = model.launchMessage {
+            return launchMessage
         }
-        if let lastRefresh {
-            return "Updated \(lastRefresh.formatted(date: .omitted, time: .standard))"
+        if let error = model.errorMessage, !error.isEmpty {
+            return model.status == .cached ? "Using cached data. \(error)" : error
+        }
+        if model.status == .cached, let snapshotDate = model.snapshotDate {
+            return "Showing data from \(snapshotDate.formatted(date: .omitted, time: .shortened)); waiting for a fresh snapshot."
+        }
+        if let lastUpdate = model.lastUpdate {
+            return "Updated \(lastUpdate.formatted(date: .omitted, time: .standard))"
         }
         return nil
-    }
-
-    private var lastRefresh: Date? {
-        model.lastRefresh
     }
 
     private var gpuRatio: Double {
@@ -504,13 +901,7 @@ struct DesktopWidgetView: View {
     }
 
     private var gpuUseColor: Color {
-        if gpuPercent >= 90 {
-            return .red
-        }
-        if gpuPercent >= 70 {
-            return .orange
-        }
-        return .cyan
+        WidgetPalette.gpuColor(allocatedRatio: gpuRatio)
     }
 
     private var unavailableNodes: Int {
@@ -661,27 +1052,6 @@ struct GPUUsageBar: View {
     }
 }
 
-struct MetricLine: View {
-    let title: String
-    let value: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 6, height: 6)
-            Text(title)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-                .fontWeight(.semibold)
-                .monospacedDigit()
-        }
-        .font(.caption2)
-    }
-}
-
 struct JobCountPill: View {
     let title: String
     let value: Int
@@ -736,46 +1106,28 @@ struct JobRow: View {
     }
 
     private var color: Color {
-        if job.state.uppercased().contains("RUN") {
-            return .green
-        }
-        if job.state.uppercased().contains("PEND") {
-            return .orange
-        }
-        return .secondary
+        WidgetPalette.jobStateColor(job.state)
     }
 }
 
-struct GPUHeatmap: View {
-    let nodes: [WidgetNode]
+struct CompactJobRow: View {
+    let job: WidgetJob
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 14, maximum: 18), spacing: 4)], spacing: 4) {
-            ForEach(nodes) { node in
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(color(for: node))
-                    .frame(height: 12)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 3)
-                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                    )
-                    .help("\(node.node): \(node.gpuAllocatedValue)/\(node.gpuTotalValue) GPU, \(node.state)")
-            }
+        HStack(spacing: 5) {
+            Circle()
+                .fill(WidgetPalette.jobStateColor(job.state))
+                .frame(width: 5, height: 5)
+            Text(job.name)
+                .font(.caption2.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+            Text(job.elapsed)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
-    }
-
-    private func color(for node: WidgetNode) -> Color {
-        if !node.isAvailable {
-            return .red.opacity(0.65)
-        }
-        let ratio = Double(node.gpuAllocatedValue) / Double(max(node.gpuTotalValue, 1))
-        if ratio >= 1 {
-            return .cyan.opacity(0.85)
-        }
-        if ratio > 0 {
-            return .orange.opacity(0.85)
-        }
-        return .green.opacity(0.78)
     }
 }
 
@@ -790,7 +1142,7 @@ struct GPUHeatmapStrip: View {
             HStack(spacing: spacing) {
                 ForEach(nodes) { node in
                     RoundedRectangle(cornerRadius: 3)
-                        .fill(color(for: node))
+                        .fill(WidgetPalette.heatmapColor(for: node))
                         .frame(width: width, height: 16)
                         .overlay(
                             RoundedRectangle(cornerRadius: 3)
@@ -802,20 +1154,6 @@ struct GPUHeatmapStrip: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-    }
-
-    private func color(for node: WidgetNode) -> Color {
-        if !node.isAvailable {
-            return WidgetPalette.red.opacity(0.68)
-        }
-        let ratio = Double(node.gpuAllocatedValue) / Double(max(node.gpuTotalValue, 1))
-        if ratio >= 1 {
-            return WidgetPalette.cyan.opacity(0.88)
-        }
-        if ratio > 0 {
-            return WidgetPalette.orange.opacity(0.88)
-        }
-        return WidgetPalette.green.opacity(0.80)
     }
 }
 
@@ -846,65 +1184,270 @@ struct SnapshotResult {
 }
 
 enum SnapshotRunner {
+    /// Per-SSH-command timeout passed to aire_monitor_snapshot.py.
+    static let perCommandTimeout = 8
+    /// aire_monitor_snapshot.py runs six sequential SSH commands (remote,
+    /// jobs, job details, partitions, nodes, storage); the process deadline
+    /// must cover the aggregate worst case plus local startup slack so a slow
+    /// link is not mistaken for a hang.
+    static let remoteCommandCount = 6
+    static var processDeadline: TimeInterval {
+        TimeInterval(remoteCommandCount * perCommandTimeout) + 12
+    }
+    private static let killGracePeriod: TimeInterval = 3
+    private static let maxCapturedOutputBytes = 8 * 1024 * 1024
+
     static func collect(projectRoot: String) async throws -> SnapshotResult {
-        try await Task.detached(priority: .userInitiated) {
-            let script = "\(projectRoot)/scripts/aire_monitor_snapshot.py"
-            let cache = URL(fileURLWithPath: "\(projectRoot)/.runtime/latest_snapshot.json")
-            let legacyCache = URL(fileURLWithPath: "\(projectRoot)/.runtime/last_snapshot.json")
-            guard FileManager.default.fileExists(atPath: script) else {
-                throw WidgetError.message("Missing snapshot script at \(script)")
-            }
+        let script = "\(projectRoot)/scripts/aire_monitor_snapshot.py"
+        let cacheURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/latest_snapshot.json")
+        let legacyCacheURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/last_snapshot.json")
+        guard FileManager.default.fileExists(atPath: script) else {
+            throw WidgetError.message("Missing snapshot script at \(script)")
+        }
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            process.arguments = [script, "--host", "aire", "--timeout", "8"]
-            process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = try WidgetConnectionProfile.snapshotArguments(
+            projectRoot: projectRoot,
+            script: script
+        )
+        process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
 
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
+        let outcome = try await execute(process)
+        let stderrText = String(data: outcome.stderr, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let timeoutText = outcome.timedOut
+            ? "Snapshot collection timed out after \(Int(processDeadline)) seconds."
+            : nil
+        let cachedData = (try? Data(contentsOf: cacheURL)) ?? (try? Data(contentsOf: legacyCacheURL))
 
-            try process.run()
-            let deadline = Date().addingTimeInterval(12)
-            while process.isRunning && Date() < deadline {
-                usleep(50_000)
-            }
-            if process.isRunning {
-                process.terminate()
-            }
-
-            let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-
-            if let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: stdout) {
+        if let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: outcome.stdout) {
+            let scriptErrors = snapshot.errors.joined(separator: "\n")
+            let liveMessage = combinedMessage([timeoutText, scriptErrors.isEmpty ? stderrText : scriptErrors])
+            if outcome.terminationStatus == 0 && scriptErrors.isEmpty && !outcome.timedOut {
                 try? FileManager.default.createDirectory(
-                    at: cache.deletingLastPathComponent(),
+                    at: cacheURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                try? stdout.write(to: cache, options: .atomic)
-                let errors = snapshot.errors.joined(separator: "\n")
+                try? outcome.stdout.write(to: cacheURL, options: .atomic)
                 return SnapshotResult(
                     snapshot: snapshot,
-                    errorMessage: errors.isEmpty ? nil : errors,
+                    errorMessage: nil,
                     usedCache: false
                 )
             }
-
-            let cachedData = (try? Data(contentsOf: cache)) ?? (try? Data(contentsOf: legacyCache))
             if let cached = cachedData,
-               let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: cached) {
-                let message = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+               let cachedSnapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: cached) {
                 return SnapshotResult(
-                    snapshot: snapshot,
-                    errorMessage: message.isEmpty ? "Refresh failed; showing cached data." : message,
+                    snapshot: cachedSnapshot,
+                    errorMessage: liveMessage.isEmpty ? "Refresh failed; showing cached data." : liveMessage,
                     usedCache: true
                 )
             }
+            return SnapshotResult(
+                snapshot: snapshot,
+                errorMessage: liveMessage.isEmpty ? "Refresh failed." : liveMessage,
+                usedCache: false
+            )
+        }
 
-            let message = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw WidgetError.message(message.isEmpty ? "Refresh failed and no cached snapshot is available." : message)
-        }.value
+        let failureMessage = combinedMessage([timeoutText, stderrText])
+        if let cached = cachedData,
+           let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: cached) {
+            return SnapshotResult(
+                snapshot: snapshot,
+                errorMessage: failureMessage.isEmpty ? "Refresh failed; showing cached data." : failureMessage,
+                usedCache: true
+            )
+        }
+        throw WidgetError.message(
+            failureMessage.isEmpty ? "Refresh failed and no cached snapshot is available." : failureMessage
+        )
+    }
+
+    private static func combinedMessage(_ parts: [String?]) -> String {
+        parts
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Runs the process without blocking a cooperative-pool thread: both
+    /// pipes are drained concurrently while the child runs (a full pipe
+    /// buffer can otherwise deadlock the child), termination is observed via
+    /// terminationHandler before the exit status is read, and a watchdog
+    /// escalates SIGTERM to SIGKILL and finally force-completes so the widget
+    /// can never hang on a wedged child or an inherited pipe descriptor.
+    private static func execute(_ process: Process) async throws -> ProcessOutcome {
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let state = RunnerState(outputLimit: maxCapturedOutputBytes)
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            state.drain(handle, stream: .stdout)
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            state.drain(handle, stream: .stderr)
+        }
+        process.terminationHandler = { finished in
+            state.processExited(status: finished.terminationStatus)
+        }
+
+        try process.run()
+        let pid = process.processIdentifier
+
+        let watchdog = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(processDeadline * 1_000_000_000))
+            guard state.markTimedOutIfRunning() else {
+                return
+            }
+            kill(pid, SIGTERM)
+            try? await Task.sleep(nanoseconds: UInt64(killGracePeriod * 1_000_000_000))
+            if !state.hasExited {
+                kill(pid, SIGKILL)
+            }
+            try? await Task.sleep(nanoseconds: UInt64(killGracePeriod * 1_000_000_000))
+            state.forceFinish()
+        }
+
+        let outcome = await withCheckedContinuation { continuation in
+            state.install(continuation)
+        }
+        watchdog.cancel()
+        return outcome
+    }
+}
+
+private struct ProcessOutcome {
+    let terminationStatus: Int32
+    let stdout: Data
+    let stderr: Data
+    let timedOut: Bool
+}
+
+private final class RunnerState: @unchecked Sendable {
+    enum Stream {
+        case stdout
+        case stderr
+    }
+
+    private let lock = NSLock()
+    private let outputLimit: Int
+    private var stdoutData = Data()
+    private var stderrData = Data()
+    private var stdoutClosed = false
+    private var stderrClosed = false
+    private var exitStatus: Int32?
+    private var timedOut = false
+    private var finished = false
+    private var continuation: CheckedContinuation<ProcessOutcome, Never>?
+
+    init(outputLimit: Int) {
+        self.outputLimit = outputLimit
+    }
+
+    var hasExited: Bool {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return exitStatus != nil
+    }
+
+    func drain(_ handle: FileHandle, stream: Stream) {
+        let chunk = handle.availableData
+        lock.lock()
+        var detach = finished
+        if chunk.isEmpty {
+            detach = true
+            switch stream {
+            case .stdout:
+                stdoutClosed = true
+            case .stderr:
+                stderrClosed = true
+            }
+        } else if !finished {
+            switch stream {
+            case .stdout:
+                if stdoutData.count < outputLimit {
+                    stdoutData.append(chunk.prefix(outputLimit - stdoutData.count))
+                }
+            case .stderr:
+                if stderrData.count < outputLimit {
+                    stderrData.append(chunk.prefix(outputLimit - stderrData.count))
+                }
+            }
+        }
+        let resume = completionIfReadyLocked()
+        lock.unlock()
+        if detach {
+            handle.readabilityHandler = nil
+        }
+        resume?()
+    }
+
+    func processExited(status: Int32) {
+        lock.lock()
+        exitStatus = status
+        let resume = completionIfReadyLocked()
+        lock.unlock()
+        resume?()
+    }
+
+    func markTimedOutIfRunning() -> Bool {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        guard !finished, exitStatus == nil else {
+            return false
+        }
+        timedOut = true
+        return true
+    }
+
+    /// Last-resort completion for a child (or an ssh grandchild that
+    /// inherited the pipe) that never closes stdout/stderr even after
+    /// SIGKILL: resume with whatever output was captured.
+    func forceFinish() {
+        lock.lock()
+        let resume = finishLocked()
+        lock.unlock()
+        resume?()
+    }
+
+    func install(_ continuation: CheckedContinuation<ProcessOutcome, Never>) {
+        lock.lock()
+        self.continuation = continuation
+        let resume = completionIfReadyLocked()
+        lock.unlock()
+        resume?()
+    }
+
+    private func completionIfReadyLocked() -> (() -> Void)? {
+        guard stdoutClosed, stderrClosed, exitStatus != nil else {
+            return nil
+        }
+        return finishLocked()
+    }
+
+    private func finishLocked() -> (() -> Void)? {
+        guard !finished, let continuation = self.continuation else {
+            return nil
+        }
+        finished = true
+        self.continuation = nil
+        let outcome = ProcessOutcome(
+            terminationStatus: exitStatus ?? -1,
+            stdout: stdoutData,
+            stderr: stderrData,
+            timedOut: timedOut
+        )
+        return {
+            continuation.resume(returning: outcome)
+        }
     }
 }
 
@@ -936,6 +1479,26 @@ enum ProjectLocator {
     }
 }
 
+enum WidgetTimestampParser {
+    /// Parses the snapshot's collected_at field. The python collector emits
+    /// datetime.isoformat() with microseconds (e.g.
+    /// "2026-07-19T12:34:56.789012+00:00"), which ISO8601DateFormatter cannot
+    /// parse directly, so fractional seconds are stripped before the second
+    /// attempt.
+    static func date(from raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: raw) {
+            return date
+        }
+        guard let dotIndex = raw.firstIndex(of: ".") else {
+            return nil
+        }
+        let tail = raw[raw.index(after: dotIndex)...].drop(while: { $0.isNumber })
+        return formatter.date(from: String(raw[..<dotIndex]) + String(tail))
+    }
+}
+
 enum WidgetError: LocalizedError {
     case message(String)
 
@@ -944,6 +1507,76 @@ enum WidgetError: LocalizedError {
         case .message(let text):
             return text
         }
+    }
+}
+
+struct WidgetConnectionProfile: Codable {
+    let useSSHAlias: Bool
+    let sshAlias: String
+    let username: String
+    let aireHostname: String
+    let useJumpHost: Bool
+    let jumpHostname: String
+    let controlPath: String
+    let jumpControlPath: String
+
+    private static var timeoutArgument: String {
+        String(SnapshotRunner.perCommandTimeout)
+    }
+
+    static func snapshotArguments(projectRoot: String, script: String) throws -> [String] {
+        switch load(projectRoot: projectRoot) {
+        case .missing:
+            return [script, "--host", "aire", "--timeout", timeoutArgument]
+        case .invalid(let message):
+            throw WidgetError.message(message)
+        case .loaded(let profile):
+            return snapshotArguments(script: script, profile: profile)
+        }
+    }
+
+    private static func snapshotArguments(script: String, profile: WidgetConnectionProfile) -> [String] {
+        if profile.useSSHAlias {
+            return [
+                script,
+                "--host", profile.sshAlias.isEmpty ? "aire" : profile.sshAlias,
+                "--timeout", timeoutArgument
+            ]
+        }
+
+        var arguments = [
+            script,
+            "--username", profile.username,
+            "--aire-hostname", profile.aireHostname,
+            "--jump-hostname", profile.jumpHostname,
+            profile.useJumpHost ? "--use-jump-host" : "--no-jump-host",
+            "--control-path", profile.controlPath,
+            "--timeout", timeoutArgument
+        ]
+        if !profile.jumpControlPath.isEmpty {
+            arguments.append(contentsOf: ["--jump-control-path", profile.jumpControlPath])
+        }
+        return arguments
+    }
+
+    private static func load(projectRoot: String) -> ProfileLoadResult {
+        let url = URL(fileURLWithPath: projectRoot)
+            .appendingPathComponent(".runtime")
+            .appendingPathComponent("connection_profile.json")
+        guard let data = try? Data(contentsOf: url) else {
+            return .missing
+        }
+        do {
+            return .loaded(try JSONDecoder().decode(WidgetConnectionProfile.self, from: data))
+        } catch {
+            return .invalid("Connection profile is invalid: \(url.path)\n\(error.localizedDescription)")
+        }
+    }
+
+    private enum ProfileLoadResult {
+        case missing
+        case invalid(String)
+        case loaded(WidgetConnectionProfile)
     }
 }
 
@@ -997,18 +1630,51 @@ struct WidgetJob: Codable, Identifiable {
     }
 }
 
+enum WidgetGresParser {
+    /// Parses GPU counts from Slurm gres strings, tolerating socket/index
+    /// suffixes and comma-joined lists: "gpu:l40s:3(S:0-1)" -> 3,
+    /// "gpu:4(IDX:0-3)" -> 4, "gpu:a100:4,mps:400" -> 4, "gpu" -> 1.
+    static func gpuCount(in gres: String) -> Int {
+        var total = 0
+        for rawEntry in gres.split(separator: ",") {
+            let entry = rawEntry.trimmingCharacters(in: .whitespaces)
+            let base = entry
+                .split(separator: "(", maxSplits: 1, omittingEmptySubsequences: true)
+                .first
+                .map(String.init) ?? entry
+            let pieces = base.split(separator: ":")
+            guard let kind = pieces.first, kind.lowercased() == "gpu" else {
+                continue
+            }
+            if pieces.count == 1 {
+                total += 1
+                continue
+            }
+            guard let last = pieces.last, let value = Int(last.prefix(while: { $0.isNumber })) else {
+                continue
+            }
+            total += value
+        }
+        return total
+    }
+}
+
 struct WidgetNode: Codable, Identifiable {
     let node: String
     let state: String
     let gpuTotal: Int?
     let gpuAllocated: Int?
+    let gres: String?
 
     var id: String {
         node
     }
 
     var gpuTotalValue: Int {
-        gpuTotal ?? 0
+        if let gpuTotal, gpuTotal > 0 {
+            return gpuTotal
+        }
+        return WidgetGresParser.gpuCount(in: gres ?? "")
     }
 
     var gpuAllocatedValue: Int {
@@ -1028,5 +1694,6 @@ struct WidgetNode: Codable, Identifiable {
         case state
         case gpuTotal = "gpu_total"
         case gpuAllocated = "gpu_allocated"
+        case gres
     }
 }
