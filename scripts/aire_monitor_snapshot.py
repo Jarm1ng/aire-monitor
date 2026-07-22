@@ -21,7 +21,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -142,6 +142,10 @@ class ClusterSnapshot:
     nodes: list[NodeSummary]
     storage: list[StorageSummary]
     errors: list[str]
+    # Non-fatal issues (enrichment sections that failed); consumers must
+    # never treat these as a failed refresh. Swift's Codable ignores the
+    # extra key, so older app builds are unaffected.
+    warnings: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1069,9 +1073,14 @@ squeue -u "$USER" -h -o '%i|%P|%j|%u|%T|%M|%l|%D|%R'
 finish jobs $?
 
 section job_details
-job_ids=$(squeue -u "$USER" -h -o '%i' | tr '\n' ' ')
-if [ -n "$job_ids" ]; then scontrol show job -o $job_ids; fi
-finish job_details $?
+# Query per id and tolerate vanished jobs: a job finishing between the
+# squeue above and this scontrol would otherwise fail the WHOLE list with
+# "Invalid job id specified" (exit 1) — a race that fires constantly for
+# short-lived jobs and used to poison every snapshot.
+for job_id in $(squeue -u "$USER" -h -o '%i'); do
+    scontrol show job -o "$job_id" 2>/dev/null || true
+done
+finish job_details 0
 
 section partitions
 sinfo -h -o '%P|%a|%D|%t|%G|%c|%m|%f'
@@ -1095,15 +1104,25 @@ if command -v lfs >/dev/null 2>&1; then lfs quota -h -u "$USER" /mnt/scratch 2>/
 finish storage 0
 """
 
-EXPECTED_SECTIONS = (
+# Core sections make or break a snapshot: their failure means the connection
+# or Slurm itself is unusable, so it surfaces as an error (the app treats any
+# error as a failed refresh). Enrichment sections only add detail on top of a
+# perfectly good snapshot — their failure must never mark the session offline,
+# so it is reported as a warning instead.
+CORE_SECTIONS = (
     "remote",
     "jobs",
-    "job_details",
     "partitions",
     "nodes",
+)
+
+ENRICHMENT_SECTIONS = (
+    "job_details",
     "node_details",
     "storage",
 )
+
+EXPECTED_SECTIONS = CORE_SECTIONS + ENRICHMENT_SECTIONS
 
 
 def split_sections(output: str) -> tuple[dict[str, str], dict[str, int]]:
@@ -1138,6 +1157,7 @@ def empty_remote_info(config: SSHConfig) -> RemoteInfo:
 
 def collect_snapshot(config: SSHConfig) -> ClusterSnapshot:
     errors: list[str] = []
+    warnings: list[str] = []
     collected_at = datetime.now(timezone.utc).isoformat()
 
     probe_error = probe_master(config)
@@ -1159,12 +1179,18 @@ def collect_snapshot(config: SSHConfig) -> ClusterSnapshot:
         errors.append(error)
 
     if sections:
-        for name in EXPECTED_SECTIONS:
+        for name in CORE_SECTIONS:
             code = statuses.get(name)
             if code is None:
                 errors.append(f"Section '{name}' missing from remote output")
             elif code != 0:
                 errors.append(f"Section '{name}' failed with exit {code}")
+        for name in ENRICHMENT_SECTIONS:
+            code = statuses.get(name)
+            if code is None:
+                warnings.append(f"Section '{name}' missing from remote output")
+            elif code != 0:
+                warnings.append(f"Section '{name}' failed with exit {code}")
 
     jobs: list[Job] | None = None
     if statuses.get("jobs_json") == 0 and sections.get("jobs_json"):
@@ -1183,6 +1209,7 @@ def collect_snapshot(config: SSHConfig) -> ClusterSnapshot:
         nodes=parse_nodes(sections.get("nodes", ""), sections.get("node_details", "")),
         storage=parse_storage(sections.get("storage", "")),
         errors=errors,
+        warnings=warnings,
     )
 
 
