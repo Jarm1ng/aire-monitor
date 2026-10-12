@@ -1,42 +1,49 @@
-# AIRE SSH configuration example.
+# Leeds HPC SSH configuration example: AIRE and Calder.
+#
+# For plain terminal use only. Leeds HPC Monitor does NOT read this file: it
+# builds the equivalent ssh options from its own sign-in form and keeps its
+# own sockets (~/.ssh/ctl/<cluster>-<hash>.sock, ~/.ssh/ctl/jump-<hash>.sock),
+# which never collide with the %C-named sockets below.
 #
 # Copy the Host blocks you need into ~/.ssh/config (do NOT commit a
-# personalized copy of this file). Create the control-socket directory first:
+# personalized copy of this file). The jump-host blocks need the `Host rash`
+# block as well. Create the control-socket directory first:
 #
 #   mkdir -m 700 ~/.ssh/ctl
 #
-# ControlPath is home-anchored so `ssh aire` works from any directory; the
-# short path also stays well under the unix-socket path-length limit.
+# Authentication: AIRE and Calder (and the rash jump host) accept only
+# keyboard-interactive login, i.e. your university password followed by a Duo
+# prompt. Public keys are not accepted, so PubkeyAuthentication is off in
+# every block. AIRE and Calder share the same account, password and home
+# directory, but they are separate clusters with separate login hosts: each
+# needs its own login (and its own Duo approval).
+#
+# ControlPath is home-anchored so `ssh aire` / `ssh calder` work from any
+# directory; the short path also stays well under the unix-socket path-length
+# limit.
 #
 # NumberOfPasswordPrompts is 1 on purpose: a mistyped password fails
 # immediately instead of being resent repeatedly, which with the University
 # IdP can otherwise trigger an account lockout.
 #
-# Host-key pinning (recommended): this repository does not ship fingerprints —
-# verify them yourself, e.g. from an official University of Leeds source or
-# with `ssh-keygen -F rash.leeds.ac.uk` after a first connection made from a
-# trusted network. Once verified, you can pin the keys by adding to each Host
-# block below:
+# Host-key pinning (recommended): this repository does not ship fingerprints.
+# Verify them yourself, e.g. against an official University of Leeds source,
+# or after a first connection made from a trusted network show the recorded
+# fingerprint with `ssh-keygen -l -F calder.leeds.ac.uk` (likewise for
+# aire.leeds.ac.uk and rash.leeds.ac.uk).
+# Once verified, you can pin the keys by adding to each Host block below:
 #   UserKnownHostsFile ~/.ssh/known_hosts_leeds
 #   StrictHostKeyChecking yes
 
-# Route 1: direct to AIRE — use while connected to the University VPN (Ivanti).
-Host aire
-    HostName aire.leeds.ac.uk
-    User <your-username>
-    PubkeyAuthentication no
-    PreferredAuthentications password,keyboard-interactive
-    KbdInteractiveAuthentication yes
-    PasswordAuthentication yes
-    NumberOfPasswordPrompts 1
-    ControlMaster auto
-    ControlPersist 24h
-    ControlPath ~/.ssh/ctl/aire-%C
-    ServerAliveInterval 30
-    ServerAliveCountMax 10
-    ConnectTimeout 20
+# ---------------------------------------------------------------------------
+# rash jump host (shared by both clusters' off-VPN routes)
+# ---------------------------------------------------------------------------
 
-# Jump host used by Route 2 (off-VPN).
+# aire-jump and calder-jump reach their login hosts with `ProxyJump rash`,
+# which runs the hop through this block: its User, NumberOfPasswordPrompts 1
+# and ControlMaster apply to the jump leg. The first jump login (or a plain
+# `ssh rash`) authenticates rash once; for the next 24 h both clusters ride
+# that one rash master, as the app does with its own shared jump master.
 Host rash
     HostName rash.leeds.ac.uk
     User <your-username>
@@ -52,12 +59,33 @@ Host rash
     ServerAliveCountMax 10
     ConnectTimeout 20
 
-# Route 2: AIRE via the rash jump host — use when off the VPN
-# (password + Duo twice: once for rash, once for AIRE).
+# ---------------------------------------------------------------------------
+# AIRE
+# ---------------------------------------------------------------------------
+
+# Route 1: direct to AIRE. Use while connected to the University VPN (Ivanti).
+Host aire
+    HostName aire.leeds.ac.uk
+    User <your-username>
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/aire-%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 10
+    ConnectTimeout 20
+
+# Route 2: AIRE via the rash jump host. Use when off the VPN.
+# Password + Duo for rash (only if no rash master is open yet), then
+# password + Duo for AIRE.
 Host aire-jump
     HostName aire.leeds.ac.uk
     User <your-username>
-    ProxyJump %r@rash.leeds.ac.uk
+    ProxyJump rash
     PubkeyAuthentication no
     PreferredAuthentications password,keyboard-interactive
     KbdInteractiveAuthentication yes
@@ -66,6 +94,49 @@ Host aire-jump
     ControlMaster auto
     ControlPersist 24h
     ControlPath ~/.ssh/ctl/aire-jump-%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 10
+    ConnectTimeout 20
+
+# ---------------------------------------------------------------------------
+# Calder
+# ---------------------------------------------------------------------------
+
+# Route 1: direct to Calder. Use while connected to the University VPN (Ivanti).
+# calder.leeds.ac.uk is round-robin DNS over several login nodes; one of them
+# occasionally closes the connection before authentication or prints
+# "Not allowed at this time". That is a server-side refusal, not a wrong
+# password: wait a minute and try again.
+Host calder
+    HostName calder.leeds.ac.uk
+    User <your-username>
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/calder-%C
+    ServerAliveInterval 30
+    ServerAliveCountMax 10
+    ConnectTimeout 20
+
+# Route 2: Calder via the rash jump host. Use when off the VPN.
+# Password + Duo for rash (only if no rash master is open yet, e.g. one left
+# by aire-jump), then password + Duo for Calder.
+Host calder-jump
+    HostName calder.leeds.ac.uk
+    User <your-username>
+    ProxyJump rash
+    PubkeyAuthentication no
+    PreferredAuthentications password,keyboard-interactive
+    KbdInteractiveAuthentication yes
+    PasswordAuthentication yes
+    NumberOfPasswordPrompts 1
+    ControlMaster auto
+    ControlPersist 24h
+    ControlPath ~/.ssh/ctl/calder-jump-%C
     ServerAliveInterval 30
     ServerAliveCountMax 10
     ConnectTimeout 20
