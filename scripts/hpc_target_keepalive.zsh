@@ -1,26 +1,36 @@
 #!/usr/bin/env zsh
-# Periodically exercise the AIRE ControlMaster so it stays warm.
+# Periodically exercise one cluster's ControlMaster so it stays warm.
+#
+# One keepalive runs per cluster; its first positional argument is that
+# cluster's control path, which is also how hpc_start_target_master.zsh
+# recognises (and only ever kills) the keepalive belonging to the cluster it
+# is replacing.
 #
 # Exits 0 (cleanly) as soon as the master is gone or unresponsive: nothing
 # supervises or restarts this script, so a dead master must never turn into a
 # reconnect loop that hammers the cluster with connection attempts.
+#
+# Environment:
+#   HPC_KEEPALIVE_INTERVAL      seconds between probes (default 5)
+#   HPC_KEEPALIVE_MAX_FAILURES  consecutive failures before giving up (default 3)
+#   HPC_KEEPALIVE_PID_FILE      optional file to record this script's pid
 set -euo pipefail
 umask 077
 
 if [[ $# -lt 6 ]]; then
-  print -u2 "Usage: aire_target_keepalive.zsh <control-path> <username> <aire-hostname> <use-jump-host> <jump-hostname> <jump-control-path>"
+  print -u2 "Usage: hpc_target_keepalive.zsh <control-path> <username> <hostname> <use-jump-host> <jump-hostname> <jump-control-path>"
   exit 2
 fi
 
 CONTROL_PATH="$1"
 REMOTE_USERNAME="$2"
-AIRE_HOSTNAME="$3"
+TARGET_HOSTNAME="$3"
 USE_JUMP_HOST="$4"
 JUMP_HOSTNAME="$5"
 JUMP_CONTROL_PATH="$6"
-INTERVAL="${AIRE_KEEPALIVE_INTERVAL:-5}"
-MAX_FAILURES="${AIRE_KEEPALIVE_MAX_FAILURES:-3}"
-PID_FILE="${AIRE_KEEPALIVE_PID_FILE:-}"
+INTERVAL="${HPC_KEEPALIVE_INTERVAL:-5}"
+MAX_FAILURES="${HPC_KEEPALIVE_MAX_FAILURES:-3}"
+PID_FILE="${HPC_KEEPALIVE_PID_FILE:-}"
 
 if [[ -n "$PID_FILE" ]]; then
   mkdir -p -- "$(dirname -- "$PID_FILE")"
@@ -45,7 +55,7 @@ check_command=(
   -n
   -o ControlPath="$CONTROL_PATH"
   -O check
-  "$AIRE_HOSTNAME"
+  "$TARGET_HOSTNAME"
 )
 
 command=(
@@ -64,7 +74,7 @@ command=(
   -o ControlMaster=auto
   -o User="$REMOTE_USERNAME"
   "${proxy_args[@]}"
-  "$AIRE_HOSTNAME"
+  "$TARGET_HOSTNAME"
   true
 )
 

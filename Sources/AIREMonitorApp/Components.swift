@@ -112,9 +112,9 @@ struct InfoChip: View {
         .clipShape(Capsule())
         .overlay(
             Capsule()
-                .stroke(AIRETheme.chipStroke(for: colorScheme), lineWidth: 1)
+                .stroke(AppTheme.chipStroke(for: colorScheme), lineWidth: 1)
         )
-        .animation(AIRETheme.smoothEase, value: value)
+        .animation(AppTheme.smoothEase, value: value)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .accessibilityValue(value)
@@ -169,7 +169,7 @@ struct StatusBadge: View {
                 .stroke(color.opacity(0.18), lineWidth: 1)
         }
         .clipShape(Capsule())
-        .animation(AIRETheme.softSpring, value: label)
+        .animation(AppTheme.softSpring, value: label)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Connection status")
         .accessibilityValue(label)
@@ -191,7 +191,7 @@ struct StalenessBadge: View {
 
     @MainActor
     private func badge(reference: Date) -> some View {
-        let text = AIRETimestamp.relativeText(collectedAt, reference: reference)
+        let text = SlurmTimestamp.relativeText(collectedAt, reference: reference)
         let color = ageColor(reference: reference)
         return HStack(spacing: 5) {
             Image(systemName: "clock")
@@ -216,8 +216,8 @@ struct StalenessBadge: View {
         )
         .clipShape(Capsule())
         .foregroundStyle(color)
-        .animation(AIRETheme.smoothEase, value: text)
-        .help("Snapshot collected \(AIRETimestamp.absoluteText(collectedAt))")
+        .animation(AppTheme.smoothEase, value: text)
+        .help("Snapshot collected \(SlurmTimestamp.absoluteText(collectedAt))")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Snapshot age")
         .accessibilityValue(text)
@@ -225,7 +225,7 @@ struct StalenessBadge: View {
 
     @MainActor
     private func ageColor(reference: Date) -> Color {
-        guard let collected = AIRETimestamp.parse(collectedAt) else {
+        guard let collected = SlurmTimestamp.parse(collectedAt) else {
             return .secondary
         }
         let age = reference.timeIntervalSince(collected)
@@ -265,7 +265,7 @@ struct StatePill: View {
                     .stroke(slurmState.color.opacity(0.20), lineWidth: 1)
             )
             .clipShape(Capsule())
-            .animation(AIRETheme.smoothEase, value: state)
+            .animation(AppTheme.smoothEase, value: state)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("State")
             .accessibilityValue(state)
@@ -306,7 +306,7 @@ struct MetricView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .dashboardCard(accent: accent)
-        .animation(AIRETheme.softSpring, value: value)
+        .animation(AppTheme.softSpring, value: value)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
         .accessibilityValue(subtitle.map { "\(value), \($0)" } ?? value)
@@ -374,7 +374,7 @@ struct SegmentedMeter: View {
             let visible = visibleSegments
             if total == 0 || visible.isEmpty {
                 RoundedRectangle(cornerRadius: height / 2)
-                    .fill(AIRETheme.mutedFill)
+                    .fill(AppTheme.mutedFill)
             } else {
                 let widths = segmentWidths(for: visible, in: proxy.size.width)
                 HStack(spacing: SegmentedMeter.segmentSpacing) {
@@ -389,7 +389,7 @@ struct SegmentedMeter: View {
             }
         }
         .frame(height: height)
-        .animation(AIRETheme.softSpring, value: total)
+        .animation(AppTheme.softSpring, value: total)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Distribution")
         .accessibilityValue(
@@ -434,7 +434,7 @@ struct RingMeter: View {
                 .trim(from: 0, to: min(max(value, 0), 1))
                 .stroke(color, style: StrokeStyle(lineWidth: 9, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-                .animation(AIRETheme.softSpring, value: value)
+                .animation(AppTheme.softSpring, value: value)
             VStack(spacing: 2) {
                 Text("\(Int((value * 100).rounded()))%")
                     .font(.headline.monospacedDigit())

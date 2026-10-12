@@ -1,18 +1,46 @@
 import AppKit
+import Combine
 import SwiftUI
 
+/// Geometry and cadences. The width is fixed; the height grows by one
+/// cluster row per monitored cluster, so every cluster gets its own row of
+/// numbers instead of being merged into one misleading fleet total (AIRE's
+/// L40S and Calder's H200 pools are different hardware on different
+/// schedulers).
 private enum WidgetLayout {
     static let width: CGFloat = 548
-    static let height: CGFloat = 246
-    /// Minimum spacing between fallback snapshot collections, and the cadence
-    /// the widget advertises in the footer.
+    static let horizontalPadding: CGFloat = 14
+    static let verticalPadding: CGFloat = 12
+    static let headerHeight: CGFloat = 30
+    static let footerHeight: CGFloat = 26
+    static let sectionSpacing: CGFloat = 10
+    static let clusterRowHeight: CGFloat = 108
+    static let clusterRowSpacing: CGFloat = 8
+    /// Rows beyond this are summarised in the footer so the window can never
+    /// outgrow a laptop screen if more clusters appear.
+    static let maxVisibleClusters = 4
+    /// Minimum spacing between fallback snapshot collections per cluster, and
+    /// the cadence the widget advertises in the footer (it matches the app's
+    /// own refresh interval).
     static let refreshInterval: TimeInterval = 10
-    /// How often the widget polls the snapshot file for changes (belt and
-    /// braces alongside the directory watcher).
+    /// How often the widget polls the cluster directories for changes (belt
+    /// and braces alongside the directory watchers).
     static let filePollInterval: TimeInterval = 2
     /// A snapshot older than this is considered stale: the main app is not
-    /// feeding the file, so the widget collects its own snapshot.
+    /// feeding that cluster's file, so the widget may collect it itself.
     static let staleThreshold: TimeInterval = 30
+
+    /// Header, one row per cluster (at least one, for the empty state) and
+    /// the footer: about 116 pt per cluster on top of 90 pt of chrome.
+    static func height(forClusterRows rows: Int) -> CGFloat {
+        let rows = max(rows, 1)
+        return verticalPadding * 2
+            + headerHeight
+            + sectionSpacing * 2
+            + footerHeight
+            + CGFloat(rows) * clusterRowHeight
+            + CGFloat(rows - 1) * clusterRowSpacing
+    }
 }
 
 private enum WidgetPalette {
@@ -66,6 +94,65 @@ private enum WidgetPalette {
     }
 }
 
+/// Display identity of a cluster directory. The widget shares no code with
+/// the app, so it cannot read the app's ClusterCatalog; it mirrors only the
+/// facts it needs (name casing, accent colour, display order) for the
+/// clusters it knows, and derives something reasonable for any other
+/// directory so a future cluster shows up without a widget release.
+enum ClusterStyle {
+    /// Directory id -> display name, for names that plain capitalisation
+    /// would get wrong. The snapshot's own `cluster.name` wins when present.
+    private static let knownNames = ["aire": "AIRE", "calder": "Calder"]
+    /// Display order: the original cluster first, then Calder, then any
+    /// other cluster alphabetically.
+    private static let preferredOrder = ["aire", "calder"]
+
+    static func fallbackName(for id: String) -> String {
+        if let known = knownNames[id] {
+            return known
+        }
+        // Plain capitalisation ("bessemer" -> "Bessemer"). Guessing acronyms
+        // from the id would be wrong as often as right, and this name only
+        // shows until the cluster's first snapshot brings its real one.
+        return id.prefix(1).uppercased() + id.dropFirst()
+    }
+
+    /// Same colours as the app's ClusterAccent, so a cluster looks the same
+    /// in the widget, the dashboard and the menu bar.
+    static func accent(for id: String) -> Color {
+        switch id {
+        case "aire":
+            return Color(red: 0.16, green: 0.74, blue: 0.48)
+        case "calder":
+            return Color(red: 0.56, green: 0.45, blue: 0.96)
+        default:
+            return Color.gray
+        }
+    }
+
+    static func precedes(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsRank = preferredOrder.firstIndex(of: lhs) ?? preferredOrder.count
+        let rhsRank = preferredOrder.firstIndex(of: rhs) ?? preferredOrder.count
+        if lhsRank != rhsRank {
+            return lhsRank < rhsRank
+        }
+        return lhs < rhs
+    }
+
+    /// Directory names become file paths and UI text; accept only the plain
+    /// lowercase ids the app writes (`aire`, `calder`, ...), never dot files,
+    /// quarantine leftovers or anything path-like.
+    static func isValidID(_ name: String) -> Bool {
+        guard let first = name.unicodeScalars.first, name.count <= 32 else {
+            return false
+        }
+        let isPlain: (Unicode.Scalar) -> Bool = { scalar in
+            ("a"..."z").contains(scalar) || ("0"..."9").contains(scalar) || scalar == "-" || scalar == "_"
+        }
+        return ("a"..."z").contains(first) && name.unicodeScalars.allSatisfy(isPlain)
+    }
+}
+
 struct WidgetLogoMark: View {
     var cornerRadius: CGFloat = 7
 
@@ -92,25 +179,46 @@ struct WidgetLogoMark: View {
         )
     }
 
+    /// The neutral Leeds HPC mark: the widget covers every cluster, so it
+    /// must not wear one cluster's logo.
     private static func loadLogoImage() -> NSImage? {
-        if let url = Bundle.main.url(forResource: "AIRELogo", withExtension: "png"),
+        if let url = Bundle.main.url(forResource: "LeedsHPCMark", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
-        let fallback = ProjectLocator.findProjectRoot() + "/assets/AIRELogo.png"
+        let fallback = ProjectLocator.findProjectRoot() + "/assets/LeedsHPCMark.png"
         return NSImage(contentsOfFile: fallback)
     }
 }
 
+/// Circular cluster monogram in the cluster's accent colour, mirroring the
+/// app's ClusterBadge.
+struct ClusterMonogram: View {
+    let clusterID: String
+    let name: String
+    var size: CGFloat = 20
+
+    var body: some View {
+        Text(name.prefix(1).uppercased())
+            .font(.system(size: size * 0.5, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(ClusterStyle.accent(for: clusterID).gradient, in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 1))
+            // The cluster name is always printed right next to the badge.
+            .accessibilityHidden(true)
+    }
+}
+
 @main
-struct AIREDesktopWidgetApp: App {
+struct DesktopWidgetApp: App {
     @NSApplicationDelegateAdaptor(WidgetAppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup {
+            // The view sizes itself (its height depends on how many clusters
+            // are monitored) and drives the window through its configurator.
             DesktopWidgetView()
-                .frame(width: WidgetLayout.width, height: WidgetLayout.height)
-                .background(DesktopWindowConfigurator())
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -127,28 +235,50 @@ final class WidgetAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct DesktopWindowConfigurator: NSViewRepresentable {
+    /// Current widget size; changes when a cluster appears or disappears.
+    let contentSize: NSSize
+
+    /// The frame this configurator last left the window in. SwiftUI may
+    /// grow the window to fit a new cluster row before configure() runs,
+    /// and it does not promise to keep the top edge; comparing against this
+    /// frame tells such a resize apart from the user dragging the widget
+    /// (a drag never changes the size).
+    @MainActor
+    final class Coordinator {
+        var lastFrame: NSRect?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
+        let size = contentSize
+        let coordinator = context.coordinator
         DispatchQueue.main.async {
-            configure(window: view.window)
+            Self.configure(window: view.window, contentSize: size, coordinator: coordinator)
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        let size = contentSize
+        let coordinator = context.coordinator
         DispatchQueue.main.async {
-            configure(window: nsView.window)
+            Self.configure(window: nsView.window, contentSize: size, coordinator: coordinator)
         }
     }
 
     /// Idempotent: runs on every SwiftUI update, so every assignment is
     /// guarded to avoid needless AppKit relayout/flicker.
-    private func configure(window: NSWindow?) {
+    @MainActor
+    private static func configure(window: NSWindow?, contentSize: NSSize, coordinator: Coordinator) {
         guard let window else {
             return
         }
-        if window.title != "AIRE Desktop Widget" {
-            window.title = "AIRE Desktop Widget"
+        if window.title != "Leeds HPC Widget" {
+            window.title = "Leeds HPC Widget"
         }
         if window.titleVisibility != .hidden {
             window.titleVisibility = .hidden
@@ -180,15 +310,24 @@ struct DesktopWindowConfigurator: NSViewRepresentable {
         if window.level != level {
             window.level = level
         }
+        // Kept from the single-cluster widget so the user's chosen position
+        // survives the upgrade; only the height changes.
         if window.frameAutosaveName != "AIREDesktopWidget" {
             window.setFrameAutosaveName("AIREDesktopWidget")
         }
-        let contentSize = NSSize(width: WidgetLayout.width, height: WidgetLayout.height)
-        if window.frame.size != contentSize {
-            let frame = window.frame
+        // Keep the top edge where the user put it, so adding a cluster grows
+        // the widget downwards instead of shifting it up the desktop. If the
+        // window was resized behind our back since the last pass (size and
+        // top edge both changed), restore the top edge from that pass.
+        let frame = window.frame
+        var top = frame.maxY
+        if let last = coordinator.lastFrame, last.size != frame.size, last.maxY != frame.maxY {
+            top = last.maxY
+        }
+        if frame.size != contentSize || top != frame.maxY {
             let nextFrame = NSRect(
                 x: frame.minX,
-                y: frame.maxY - contentSize.height,
+                y: top - contentSize.height,
                 width: contentSize.width,
                 height: contentSize.height
             )
@@ -206,80 +345,207 @@ struct DesktopWindowConfigurator: NSViewRepresentable {
         if window.contentMaxSize != contentSize {
             window.contentMaxSize = contentSize
         }
+        coordinator.lastFrame = window.frame
     }
 }
 
-enum WidgetDataStatus {
+enum WidgetDataStatus: Equatable {
     case connecting
     case live
     case cached
     case offline
+
+    var title: String {
+        switch self {
+        case .connecting: return "connecting"
+        case .live: return "live"
+        case .cached: return "cached"
+        case .offline: return "offline"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .connecting: return WidgetPalette.neutral
+        case .live: return WidgetPalette.green
+        case .cached: return WidgetPalette.orange
+        case .offline: return WidgetPalette.red
+        }
+    }
 }
 
+// MARK: - Directory watching
+
+/// Watches one directory's vnode on the main queue. Directories are watched
+/// rather than files because the app replaces snapshots atomically (write +
+/// rename), which shows up as a directory write event and would orphan a
+/// watcher bound to the old file inode.
+final class DirectoryWatcher {
+    private let source: DispatchSourceFileSystemObject
+
+    init?(path: String, onEvent: @escaping @MainActor @Sendable (DispatchSource.FileSystemEvent) -> Void) {
+        let descriptor = open(path, O_EVTONLY)
+        guard descriptor >= 0 else {
+            return nil
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .delete, .rename],
+            queue: .main
+        )
+        source.setEventHandler { [weak source] in
+            // Read the vnode flags synchronously: source.data is only valid
+            // while the handler runs and events could coalesce or be lost
+            // across the async hop below.
+            guard let flags = source?.data else {
+                return
+            }
+            Task { @MainActor in
+                onEvent(flags)
+            }
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        source.resume()
+        self.source = source
+    }
+
+    func cancel() {
+        source.cancel()
+    }
+
+    deinit {
+        source.cancel()
+    }
+
+    /// The watched inode itself was unlinked or renamed. Checking the path
+    /// at that moment would race with a delete+recreate and leave the source
+    /// bound to the dead inode forever, so callers drop the watcher
+    /// unconditionally and let the poll timer install a fresh one.
+    static func invalidatesWatcher(_ flags: DispatchSource.FileSystemEvent) -> Bool {
+        !flags.isDisjoint(with: [.delete, .rename])
+    }
+}
+
+// MARK: - App preferences
+
+/// Reads only the per-cluster `enabled` flags from the app's password-free
+/// `.runtime/preferences.json`, so a cluster the user switched off in the app
+/// disappears from the widget (and is never collected by its fallback)
+/// instead of lingering as a stale row. Every other key is ignored, and an
+/// unreadable file hides nothing.
+struct WidgetPreferencesReader {
+    private struct PreferencesFile: Decodable {
+        struct Cluster: Decodable {
+            let enabled: Bool?
+        }
+
+        let clusters: [String: Cluster]?
+    }
+
+    let path: String
+    private(set) var disabledClusterIDs: Set<String> = []
+    private var loadedModificationDate: Date?
+    private var hasLoaded = false
+
+    init(path: String) {
+        self.path = path
+    }
+
+    mutating func reloadIfChanged() {
+        let modificationDate = fileModificationDate(atPath: path)
+        guard !hasLoaded || modificationDate != loadedModificationDate else {
+            return
+        }
+        hasLoaded = true
+        loadedModificationDate = modificationDate
+        guard let data = FileManager.default.contents(atPath: path),
+              let decoded = try? JSONDecoder().decode(PreferencesFile.self, from: data) else {
+            disabledClusterIDs = []
+            return
+        }
+        disabledClusterIDs = Set(
+            (decoded.clusters ?? [:]).compactMap { id, cluster in
+                cluster.enabled == false ? id : nil
+            }
+        )
+    }
+}
+
+private func fileModificationDate(atPath path: String) -> Date? {
+    let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+    return attributes?[.modificationDate] as? Date
+}
+
+// MARK: - Model
+
+/// Discovers the clusters the app writes under `.runtime/clusters/<id>/` and
+/// owns one independent ClusterFeed per cluster. Nothing here aggregates
+/// numbers across clusters; it only answers "how are the feeds doing".
 @MainActor
 final class WidgetModel: ObservableObject {
-    @Published var snapshot: WidgetSnapshot?
+    /// Discovered clusters in display order (AIRE, Calder, then the rest).
+    @Published private(set) var feeds: [ClusterFeed] = []
+    /// Widget-level problems (launching the app); per-cluster problems live
+    /// on each feed.
     @Published var errorMessage: String?
-    @Published var isRefreshing = false
-    /// When the displayed data last changed (file reload or collection).
-    @Published var lastUpdate: Date?
-    /// When the displayed snapshot was collected on the cluster.
-    @Published var snapshotDate: Date?
-    @Published var status: WidgetDataStatus = .connecting
     @Published var launchMessage: String?
 
-    let projectRoot = ProjectLocator.findProjectRoot()
+    let projectRoot: String
 
     private var pollTimer: Timer?
-    private var directoryWatcher: DispatchSourceFileSystemObject?
-    private var loadedModificationDate: Date?
-    private var failedModificationDate: Date?
-    private var lastFallbackAttempt: Date?
-    /// True when the displayed snapshot came from this widget's own fallback
-    /// collection (rather than the main app writing the snapshot file).
-    private var lastDataFromFallback = false
-    /// Modification date of the snapshot file as last written by this
-    /// widget's own fallback collection; reloading that same write must not
-    /// be mistaken for the main app feeding the file.
-    private var ownWriteModificationDate: Date?
+    private var clustersWatcher: DirectoryWatcher?
+    private var preferences: WidgetPreferencesReader
+    private var feedSubscriptions: [String: AnyCancellable] = [:]
 
-    private var runtimeDirectory: String {
-        "\(projectRoot)/.runtime"
+    init() {
+        let root = ProjectLocator.findProjectRoot()
+        projectRoot = root
+        preferences = WidgetPreferencesReader(path: "\(root)/.runtime/preferences.json")
     }
 
-    private var snapshotPath: String {
-        "\(runtimeDirectory)/latest_snapshot.json"
+    private var clustersRoot: String {
+        "\(projectRoot)/.runtime/clusters"
     }
 
-    private var legacySnapshotPath: String {
-        "\(runtimeDirectory)/last_snapshot.json"
+    var isAnyRefreshing: Bool {
+        feeds.contains { $0.isRefreshing }
     }
 
     func start() {
         guard pollTimer == nil else {
             return
         }
-        installDirectoryWatcherIfNeeded()
-        syncWithSnapshotFile(forceReload: true)
+        tick()
         pollTimer = Timer.scheduledTimer(withTimeInterval: WidgetLayout.filePollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else {
-                    return
-                }
-                self.installDirectoryWatcherIfNeeded()
-                self.syncWithSnapshotFile()
+                self?.tick()
             }
         }
     }
 
+    /// Manual refresh of every cluster: reloads each snapshot file and
+    /// collects where the widget is allowed to (see ClusterFeed.sync), so
+    /// it never double-collects while the app is feeding a cluster.
     func refresh() {
-        syncWithSnapshotFile(forceReload: true, forceCollect: true)
+        errorMessage = nil
+        reconcileClusters()
+        for feed in feeds {
+            feed.installWatcherIfNeeded()
+            feed.sync(forceReload: true, forceCollect: true)
+        }
+    }
+
+    func refresh(clusterID: String) {
+        feeds.first { $0.id == clusterID }?.sync(forceReload: true, forceCollect: true)
     }
 
     func openMainApp() {
+        errorMessage = nil
         let appURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/AIREMonitorApp.app")
         if FileManager.default.fileExists(atPath: appURL.path) {
-            launchMessage = "Launching AIRE Monitor…"
+            launchMessage = "Launching Leeds HPC Monitor…"
             let configuration = NSWorkspace.OpenConfiguration()
             NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { [weak self] _, error in
                 Task { @MainActor in
@@ -288,7 +554,7 @@ final class WidgetModel: ObservableObject {
                     }
                     self.launchMessage = nil
                     if let error {
-                        self.errorMessage = "Could not open AIRE Monitor: \(error.localizedDescription)"
+                        self.errorMessage = "Could not open Leeds HPC Monitor: \(error.localizedDescription)"
                     }
                 }
             }
@@ -297,7 +563,7 @@ final class WidgetModel: ObservableObject {
 
         let scriptURL = URL(fileURLWithPath: "\(projectRoot)/scripts/run_macos_app.sh")
         guard FileManager.default.fileExists(atPath: scriptURL.path) else {
-            errorMessage = "Cannot find main app launcher at \(scriptURL.path)"
+            errorMessage = "Cannot find the Leeds HPC Monitor launcher at \(scriptURL.path)"
             return
         }
 
@@ -315,94 +581,237 @@ final class WidgetModel: ObservableObject {
                 }
                 self.launchMessage = nil
                 if status != 0 {
-                    self.errorMessage = "AIRE Monitor launcher exited with status \(status); run scripts/run_macos_app.sh in Terminal for details."
+                    self.errorMessage = "Leeds HPC Monitor launcher exited with status \(status); run scripts/run_macos_app.sh in Terminal for details."
                 }
             }
         }
         do {
             try process.run()
-            launchMessage = "Launching AIRE Monitor… (building if needed)"
+            launchMessage = "Launching Leeds HPC Monitor… (building if needed)"
         } catch {
-            errorMessage = "Could not launch AIRE Monitor: \(error.localizedDescription)"
+            errorMessage = "Could not launch Leeds HPC Monitor: \(error.localizedDescription)"
         }
     }
 
-    // MARK: - Snapshot file watching
+    // MARK: Discovery
 
-    private func installDirectoryWatcherIfNeeded() {
-        guard directoryWatcher == nil else {
-            return
+    /// One poll: re-arm watchers that were dropped, pick up added or removed
+    /// cluster directories, and let every feed check its snapshot.
+    private func tick() {
+        installClustersWatcherIfNeeded()
+        reconcileClusters()
+        for feed in feeds {
+            feed.installWatcherIfNeeded()
+            feed.sync()
         }
-        let descriptor = open(runtimeDirectory, O_EVTONLY)
-        guard descriptor >= 0 else {
-            return
-        }
-        // Watch the directory, not the file: the main app replaces the
-        // snapshot atomically (write + rename), which shows up as a directory
-        // write event and would orphan a watcher bound to the old file inode.
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
-            eventMask: [.write, .extend, .delete, .rename],
-            queue: .main
-        )
-        source.setEventHandler { [weak self, weak source] in
-            // Read the vnode flags synchronously: source.data is only valid
-            // while the handler runs and events could coalesce or be lost
-            // across the async hop below.
-            guard let flags = source?.data else {
-                return
-            }
-            Task { @MainActor in
-                self?.handleRuntimeDirectoryEvent(flags: flags)
-            }
-        }
-        source.setCancelHandler {
-            close(descriptor)
-        }
-        source.resume()
-        directoryWatcher = source
     }
 
-    private func handleRuntimeDirectoryEvent(flags: DispatchSource.FileSystemEvent) {
-        if !flags.isDisjoint(with: [.delete, .rename]) {
-            // The watched inode was unlinked or renamed. Checking the path
-            // here would race with a delete+recreate and leave the source
-            // bound to the dead inode forever, so drop the watcher
-            // unconditionally and let the poll timer re-install one against
-            // the current directory inode.
-            directoryWatcher?.cancel()
-            directoryWatcher = nil
+    private func installClustersWatcherIfNeeded() {
+        guard clustersWatcher == nil else {
+            return
         }
-        syncWithSnapshotFile()
+        // Fails quietly until the app creates `.runtime/clusters`; the poll
+        // timer retries every couple of seconds.
+        clustersWatcher = DirectoryWatcher(path: clustersRoot) { [weak self] flags in
+            self?.handleClustersDirectoryEvent(flags: flags)
+        }
+    }
+
+    private func handleClustersDirectoryEvent(flags: DispatchSource.FileSystemEvent) {
+        if DirectoryWatcher.invalidatesWatcher(flags) {
+            clustersWatcher?.cancel()
+            clustersWatcher = nil
+        }
+        reconcileClusters()
+        for feed in feeds {
+            feed.installWatcherIfNeeded()
+            feed.sync()
+        }
+    }
+
+    /// Keeps existing feeds (and their state) for clusters that are still
+    /// present, adds feeds for new cluster directories and stops feeds whose
+    /// directory vanished or whose cluster was disabled in the app.
+    private func reconcileClusters() {
+        let ids = discoverClusterIDs()
+        guard ids != feeds.map(\.id) else {
+            return
+        }
+        var existing = Dictionary(uniqueKeysWithValues: feeds.map { ($0.id, $0) })
+        var next: [ClusterFeed] = []
+        for id in ids {
+            if let feed = existing.removeValue(forKey: id) {
+                next.append(feed)
+                continue
+            }
+            let feed = ClusterFeed(id: id, directory: "\(clustersRoot)/\(id)", projectRoot: projectRoot)
+            // Forward feed changes so the header, footer and window height
+            // (which depend on every feed) repaint too.
+            feedSubscriptions[id] = feed.objectWillChange
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+            next.append(feed)
+        }
+        for (id, feed) in existing {
+            feed.stop()
+            feedSubscriptions[id] = nil
+        }
+        feeds = next
+    }
+
+    private func discoverClusterIDs() -> [String] {
+        preferences.reloadIfChanged()
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: clustersRoot) else {
+            return []
+        }
+        return names
+            .filter { name in
+                var isDirectory: ObjCBool = false
+                return ClusterStyle.isValidID(name)
+                    && FileManager.default.fileExists(atPath: "\(clustersRoot)/\(name)", isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+                    && !preferences.disabledClusterIDs.contains(name)
+            }
+            .sorted(by: ClusterStyle.precedes)
+    }
+}
+
+/// Fallback-collection bookkeeping, keyed by cluster id instead of stored on
+/// a ClusterFeed. A feed is dropped and recreated when its cluster is
+/// disabled and re-enabled in the app, or its directory briefly disappears;
+/// the replacement must still see a collection the old feed started (its
+/// process keeps running until it finishes or the watchdog kills it) and
+/// that collection's place in the 10 s cadence, otherwise one cluster could
+/// end up with two collectors racing through the same ControlMaster.
+@MainActor
+enum CollectionLedger {
+    /// Clusters with a collector process running right now.
+    static var inFlight: Set<String> = []
+    /// When each cluster's last collection (or rejected attempt) started.
+    static var lastAttempt: [String: Date] = [:]
+}
+
+/// One cluster's data path: follows `.runtime/clusters/<id>/latest_snapshot.json`
+/// as written by the app and, only when that file is stale and the app left
+/// a `collector.json` behind, runs the collector itself. Staleness, cadence,
+/// in-flight state and errors are all per cluster, so a stale Calder file
+/// never triggers an AIRE collection and the reverse.
+@MainActor
+final class ClusterFeed: ObservableObject, Identifiable {
+    /// Directory name, e.g. "aire" or "calder". Job ids and node names are
+    /// only unique within one cluster, so it qualifies both (see
+    /// WidgetSnapshot.qualified(by:)).
+    let id: String
+    let directory: String
+    private let projectRoot: String
+
+    @Published private(set) var snapshot: WidgetSnapshot?
+    /// When the displayed snapshot was collected on the cluster.
+    @Published private(set) var snapshotDate: Date?
+    /// When the displayed data last changed (file reload or collection).
+    @Published private(set) var lastUpdate: Date?
+    @Published private(set) var status: WidgetDataStatus = .connecting
+    @Published private(set) var errorMessage: String?
+    /// Informational: why no fresh data is coming (the app is not feeding
+    /// this cluster and there is nothing the widget can run on its own).
+    @Published private(set) var notice: String?
+    @Published private(set) var isRefreshing = false
+
+    private var watcher: DirectoryWatcher?
+    private var isActive = true
+    private var loadedModificationDate: Date?
+    private var failedModificationDate: Date?
+    /// True when the displayed snapshot came from this widget's own fallback
+    /// collection (rather than the main app writing the snapshot file).
+    private var lastDataFromFallback = false
+    /// Modification date of the snapshot file as last written by this
+    /// widget's own fallback collection; reloading that same write must not
+    /// be mistaken for the main app feeding the file.
+    private var ownWriteModificationDate: Date?
+
+    init(id: String, directory: String, projectRoot: String) {
+        self.id = id
+        self.directory = directory
+        self.projectRoot = projectRoot
+    }
+
+    /// The collector echoes the cluster's display name into every snapshot;
+    /// until one arrives (or if it names a different cluster) fall back to a
+    /// name derived from the directory.
+    var displayName: String {
+        if let info = snapshot?.cluster, info.id == id {
+            let name = info.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty {
+                return String(name.prefix(24))
+            }
+        }
+        return ClusterStyle.fallbackName(for: id)
+    }
+
+    /// Login node that produced the snapshot, shown in the status chip.
+    var remoteName: String? {
+        guard let remote = snapshot?.remote else {
+            return nil
+        }
+        let name = remote.hostname.isEmpty ? remote.host : remote.hostname
+        return name.isEmpty ? nil : name
+    }
+
+    private var snapshotPath: String {
+        "\(directory)/latest_snapshot.json"
+    }
+
+    func stop() {
+        isActive = false
+        watcher?.cancel()
+        watcher = nil
+    }
+
+    func installWatcherIfNeeded() {
+        guard isActive, watcher == nil else {
+            return
+        }
+        watcher = DirectoryWatcher(path: directory) { [weak self] flags in
+            self?.handleDirectoryEvent(flags: flags)
+        }
+    }
+
+    private func handleDirectoryEvent(flags: DispatchSource.FileSystemEvent) {
+        if DirectoryWatcher.invalidatesWatcher(flags) {
+            watcher?.cancel()
+            watcher = nil
+        }
+        sync()
     }
 
     /// Primary data path: reload the snapshot file when it changed, then fall
-    /// back to spawning the collector only when the file is missing or stale,
-    /// so the widget never double-collects while the main app is running.
-    private func syncWithSnapshotFile(forceReload: Bool = false, forceCollect: Bool = false) {
-        let wasFallback = lastDataFromFallback
-        if let modificationDate = fileModificationDate(atPath: snapshotPath) {
-            let isNew = modificationDate != loadedModificationDate
-                && modificationDate != failedModificationDate
-            if forceReload || isNew {
-                loadSnapshotFile(modificationDate: modificationDate)
-            }
+    /// back to spawning the collector only when the file is missing or stale
+    /// (or the widget is already the one feeding it), so the widget never
+    /// double-collects while the main app is running.
+    func sync(forceReload: Bool = false, forceCollect: Bool = false) {
+        guard isActive else {
+            return
         }
+        let wasFallback = lastDataFromFallback
+        reloadIfChanged(force: forceReload)
         recomputeStatus()
 
         let age = snapshotAge
         let missingOrStale = age.map { $0 > WidgetLayout.staleThreshold } ?? true
+        // Once the widget feeds itself it keeps the app's 10 s cadence
+        // instead of letting the data go stale between collections.
         let ownFeedDue = lastDataFromFallback
             && (age.map { $0 > WidgetLayout.refreshInterval } ?? true)
         if forceCollect {
-            // Manual refresh: bypass the cadence, but only collect when the
-            // widget is feeding itself (or the file is missing/stale) so we
-            // never double-collect while the main app feeds the file.
+            // Manual refresh: collect only when the widget is feeding itself
+            // (or the file is missing/stale) so we never double-collect while
+            // the main app feeds the file. The 10 s cadence still applies.
             if missingOrStale || wasFallback {
-                collectIfNeeded(bypassCadence: true)
+                collectIfNeeded()
             }
         } else if missingOrStale || ownFeedDue {
-            collectIfNeeded(bypassCadence: false)
+            collectIfNeeded()
+        } else {
+            setNotice(nil)
         }
     }
 
@@ -411,6 +820,17 @@ final class WidgetModel: ObservableObject {
             return nil
         }
         return Date().timeIntervalSince(snapshotDate)
+    }
+
+    private func reloadIfChanged(force: Bool) {
+        guard let modificationDate = fileModificationDate(atPath: snapshotPath) else {
+            return
+        }
+        let isNew = modificationDate != loadedModificationDate
+            && modificationDate != failedModificationDate
+        if force || isNew {
+            loadSnapshotFile(modificationDate: modificationDate)
+        }
     }
 
     private func loadSnapshotFile(modificationDate: Date) {
@@ -424,46 +844,91 @@ final class WidgetModel: ObservableObject {
         if modificationDate != ownWriteModificationDate {
             // Only a write by someone else (the main app) means we are no
             // longer feeding ourselves; a forced reload of our own write
-            // must keep the 10s self-feed cadence intact.
+            // must keep the 10 s self-feed cadence intact.
             lastDataFromFallback = false
         }
-        snapshot = decoded
+        snapshot = decoded.qualified(by: id)
         snapshotDate = WidgetTimestampParser.date(from: decoded.collectedAt) ?? modificationDate
         lastUpdate = Date()
         errorMessage = nil
+        setNotice(nil)
     }
 
     private func recomputeStatus() {
-        guard snapshot != nil else {
-            status = errorMessage == nil ? .connecting : .offline
-            return
-        }
-        if let age = snapshotAge, age <= WidgetLayout.staleThreshold {
-            status = .live
+        let next: WidgetDataStatus
+        if snapshot == nil {
+            next = (errorMessage == nil && notice == nil) ? .connecting : .offline
+        } else if let age = snapshotAge, age <= WidgetLayout.staleThreshold {
+            next = .live
         } else {
-            status = .cached
+            next = .cached
+        }
+        // Guarded: this runs on every 2 s poll and an unconditional
+        // assignment would repaint the whole widget each time.
+        if status != next {
+            status = next
         }
     }
 
-    // MARK: - Fallback collection
+    private func setNotice(_ value: String?) {
+        if notice != value {
+            notice = value
+        }
+    }
 
-    private func collectIfNeeded(bypassCadence: Bool) {
-        guard !isRefreshing else {
+    // MARK: Fallback collection
+
+    /// At most one collection per 10 s per cluster, even for a manual
+    /// refresh, and never two at once for the same cluster: every attempt
+    /// is an SSH round-trip through the user's ControlMaster. Both rules are
+    /// kept in CollectionLedger (keyed by cluster id) rather than on this
+    /// feed, so they survive the feed being replaced mid-collection.
+    private func collectIfNeeded() {
+        guard !isRefreshing, !CollectionLedger.inFlight.contains(id) else {
             return
         }
-        if !bypassCadence,
-           let lastFallbackAttempt,
-           Date().timeIntervalSince(lastFallbackAttempt) < WidgetLayout.refreshInterval {
+        if let lastAttempt = CollectionLedger.lastAttempt[id],
+           Date().timeIntervalSince(lastAttempt) < WidgetLayout.refreshInterval {
             return
         }
-        lastFallbackAttempt = Date()
+
+        let collector: ValidatedCollector
+        switch CollectorLoader.load(clusterID: id, directory: directory, projectRoot: projectRoot) {
+        case .missing:
+            // The app has never connected to this cluster (or has not since
+            // the upgrade), so there is no password-free invocation to reuse.
+            setNotice(
+                snapshot == nil
+                    ? "Connect to \(displayName) in Leeds HPC Monitor to start monitoring it."
+                    : "Leeds HPC Monitor is not updating \(displayName); reconnect it in the app."
+            )
+            recomputeStatus()
+            return
+        case .invalid(let message):
+            // Throttled like a real attempt so a broken record is not
+            // re-validated (and re-reported) on every 2 s poll.
+            CollectionLedger.lastAttempt[id] = Date()
+            if errorMessage != message {
+                errorMessage = message
+            }
+            recomputeStatus()
+            return
+        case .ready(let validated):
+            collector = validated
+        }
+
+        setNotice(nil)
+        let clusterID = id
+        CollectionLedger.lastAttempt[clusterID] = Date()
+        CollectionLedger.inFlight.insert(clusterID)
         isRefreshing = true
         Task {
             defer {
                 isRefreshing = false
+                CollectionLedger.inFlight.remove(clusterID)
             }
             do {
-                let result = try await SnapshotRunner.collect(projectRoot: projectRoot)
+                let result = try await SnapshotRunner.collect(projectRoot: projectRoot, collector: collector)
                 apply(result)
             } catch {
                 errorMessage = error.localizedDescription
@@ -472,96 +937,161 @@ final class WidgetModel: ObservableObject {
         }
     }
 
-    private func apply(_ result: SnapshotResult) {
-        let collectedDate = WidgetTimestampParser.date(from: result.snapshot.collectedAt)
-        if let existing = snapshotDate, let collectedDate, collectedDate < existing {
-            // The main app wrote a newer snapshot while the fallback
-            // collection ran; keep the newer data and only surface the error.
-            errorMessage = result.errorMessage
+    private func apply(_ result: CollectionResult) {
+        guard isActive else {
+            // The cluster was disabled or its directory removed while the
+            // collector ran; do not resurrect its snapshot file.
             return
         }
-        snapshot = result.snapshot
-        errorMessage = result.errorMessage
-        lastDataFromFallback = !result.usedCache
-        if result.usedCache {
-            snapshotDate = collectedDate
-                ?? fileModificationDate(atPath: snapshotPath)
-                ?? fileModificationDate(atPath: legacySnapshotPath)
-        } else {
-            snapshotDate = collectedDate ?? Date()
-            // SnapshotRunner just wrote the cache file; remember its
-            // modification date so the watcher does not redundantly reload it
-            // and so a forced reload of it is recognized as our own write.
-            loadedModificationDate = fileModificationDate(atPath: snapshotPath)
-            ownWriteModificationDate = loadedModificationDate
+        // Pick up anything the main app wrote while the collector ran, so
+        // the comparison below sees the newest data on disk.
+        reloadIfChanged(force: false)
+
+        guard result.isClean, let collected = result.snapshot else {
+            errorMessage = result.failureMessage ?? "Refresh failed."
+            return
         }
+        if let info = collected.cluster, info.id != id {
+            errorMessage = "The collector answered for cluster '\(info.id)', not '\(id)'; check \(directory)/collector.json."
+            return
+        }
+        let collectedDate = WidgetTimestampParser.date(from: collected.collectedAt)
+        if let existing = snapshotDate, let collectedDate, collectedDate <= existing {
+            // The main app wrote a newer snapshot while the fallback
+            // collection ran; keep the newer data.
+            errorMessage = nil
+            return
+        }
+
+        do {
+            // Atomic replace: the app (and the directory watchers) only ever
+            // see a complete file.
+            try result.output.write(to: URL(fileURLWithPath: snapshotPath), options: .atomic)
+            errorMessage = nil
+        } catch {
+            errorMessage = "Collected a snapshot but could not save it: \(error.localizedDescription)"
+        }
+        snapshot = collected.qualified(by: id)
+        snapshotDate = collectedDate ?? Date()
+        lastDataFromFallback = true
+        // Remember our own write so the watcher does not redundantly reload
+        // it and so a forced reload of it is recognized as our own write.
+        loadedModificationDate = fileModificationDate(atPath: snapshotPath)
+        ownWriteModificationDate = loadedModificationDate
         lastUpdate = Date()
     }
+}
 
-    private func fileModificationDate(atPath path: String) -> Date? {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-        return attributes?[.modificationDate] as? Date
+// MARK: - Per-cluster digest
+
+/// Everything one cluster row shows, derived from that cluster's snapshot
+/// alone. GPU numbers follow the app's gpuAvailability: "free" counts idle
+/// GPUs on nodes that can actually run jobs.
+struct ClusterDigest {
+    let gpuNodes: [WidgetNode]
+    let gpuTotal: Int
+    let gpuAllocated: Int
+    let gpuIdle: Int
+    /// "H200", "L40S", or "L40S + A100" for a mixed pool; nil when the gres
+    /// strings carry no model.
+    let gpuModel: String?
+    let unavailableGPUNodes: Int
+    let running: [WidgetJob]
+    let pending: [WidgetJob]
+
+    init(snapshot: WidgetSnapshot?) {
+        let nodes = snapshot?.nodes ?? []
+        let gpuNodes = nodes.filter { $0.gpuTotalValue > 0 }
+        self.gpuNodes = gpuNodes
+        gpuTotal = gpuNodes.reduce(0) { $0 + $1.gpuTotalValue }
+        gpuAllocated = gpuNodes.reduce(0) { $0 + min($1.gpuAllocatedValue, $1.gpuTotalValue) }
+        gpuIdle = gpuNodes.filter(\.isAvailable).reduce(0) { $0 + $1.gpuIdleValue }
+        unavailableGPUNodes = gpuNodes.filter { !$0.isAvailable }.count
+        gpuModel = Self.modelSummary(gpuNodes)
+
+        let jobs = snapshot?.jobs ?? []
+        running = jobs.filter { $0.state.uppercased().contains("RUN") }
+        pending = jobs.filter { $0.state.uppercased().contains("PEND") }
+    }
+
+    /// The first running job in squeue order, else the first pending one.
+    var topJob: WidgetJob? {
+        running.first ?? pending.first
+    }
+
+    /// Idle GPUs on drained/down nodes: neither allocated nor usable.
+    var unavailableGPUs: Int {
+        max(gpuTotal - gpuAllocated - gpuIdle, 0)
+    }
+
+    var gpuRatio: Double {
+        guard gpuTotal > 0 else {
+            return 0
+        }
+        return min(Double(gpuAllocated) / Double(gpuTotal), 1)
+    }
+
+    var gpuPercent: Int {
+        Int((gpuRatio * 100).rounded())
+    }
+
+    var gpuColor: Color {
+        WidgetPalette.gpuColor(allocatedRatio: gpuRatio)
+    }
+
+    var fullyFreeNodes: Int {
+        gpuNodes.filter { $0.isAvailable && $0.gpuAllocatedValue == 0 }.count
+    }
+
+    var fullyAllocatedNodes: Int {
+        gpuNodes.filter { $0.isAvailable && $0.gpuAllocatedValue >= $0.gpuTotalValue }.count
+    }
+
+    /// Models ranked by GPU count, at most two, so a mixed pool is labelled
+    /// honestly instead of by whichever node happened to come first.
+    private static func modelSummary(_ nodes: [WidgetNode]) -> String? {
+        var counts: [String: Int] = [:]
+        var firstSeen: [String] = []
+        for node in nodes {
+            guard let raw = WidgetGresParser.gpuModel(in: node.gres ?? "") else {
+                continue
+            }
+            let name = WidgetGresParser.displayName(forModel: raw)
+            if counts[name] == nil {
+                firstSeen.append(name)
+            }
+            counts[name, default: 0] += node.gpuTotalValue
+        }
+        let ranked = firstSeen.enumerated().sorted { lhs, rhs in
+            let lhsCount = counts[lhs.element] ?? 0
+            let rhsCount = counts[rhs.element] ?? 0
+            if lhsCount != rhsCount {
+                return lhsCount > rhsCount
+            }
+            return lhs.offset < rhs.offset
+        }
+        guard !ranked.isEmpty else {
+            return nil
+        }
+        return ranked.prefix(2).map(\.element).joined(separator: " + ")
     }
 }
+
+// MARK: - Views
 
 struct DesktopWidgetView: View {
     @StateObject private var model = WidgetModel()
 
-    private var jobs: [WidgetJob] {
-        model.snapshot?.jobs ?? []
+    private var visibleFeeds: [ClusterFeed] {
+        Array(model.feeds.prefix(WidgetLayout.maxVisibleClusters))
     }
 
-    private var nodes: [WidgetNode] {
-        model.snapshot?.nodes ?? []
+    private var hiddenFeedCount: Int {
+        max(model.feeds.count - WidgetLayout.maxVisibleClusters, 0)
     }
 
-    private var gpuNodes: [WidgetNode] {
-        nodes.filter { $0.gpuTotalValue > 0 }
-    }
-
-    private var gpuTotal: Int {
-        gpuNodes.reduce(0) { $0 + $1.gpuTotalValue }
-    }
-
-    private var gpuAllocated: Int {
-        gpuNodes.reduce(0) { $0 + $1.gpuAllocatedValue }
-    }
-
-    private var gpuIdle: Int {
-        max(gpuTotal - gpuAllocated, 0)
-    }
-
-    private var runningJobs: [WidgetJob] {
-        jobs.filter { $0.state.uppercased().contains("RUN") }
-    }
-
-    private var pendingJobs: [WidgetJob] {
-        jobs.filter { $0.state.uppercased().contains("PEND") }
-    }
-
-    /// Running jobs first, then pending, then everything else, preserving the
-    /// original (squeue) order within each group.
-    private var featuredJobs: [WidgetJob] {
-        let ranked = jobs.enumerated().sorted { lhs, rhs in
-            let lhsRank = Self.jobRank(lhs.element)
-            let rhsRank = Self.jobRank(rhs.element)
-            if lhsRank != rhsRank {
-                return lhsRank < rhsRank
-            }
-            return lhs.offset < rhs.offset
-        }
-        return ranked.prefix(2).map(\.element)
-    }
-
-    private static func jobRank(_ job: WidgetJob) -> Int {
-        let state = job.state.uppercased()
-        if state.contains("RUN") {
-            return 0
-        }
-        if state.contains("PEND") {
-            return 1
-        }
-        return 2
+    private var windowHeight: CGFloat {
+        WidgetLayout.height(forClusterRows: visibleFeeds.count)
     }
 
     var body: some View {
@@ -581,34 +1111,48 @@ struct DesktopWidgetView: View {
                 )
                 .shadow(color: .black.opacity(0.18), radius: 22, x: 0, y: 10)
 
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: WidgetLayout.sectionSpacing) {
                 header
+                    .frame(height: WidgetLayout.headerHeight)
 
-                HStack(alignment: .top, spacing: 10) {
-                    gpuBlock
-                        .frame(width: 190, height: 102)
-                    healthBlock
-                        .frame(width: 132, height: 102)
-                    jobsBlock
-                        .frame(maxWidth: .infinity, minHeight: 102, maxHeight: 102)
+                if visibleFeeds.isEmpty {
+                    EmptyClustersCard {
+                        model.openMainApp()
+                    }
+                    .frame(height: WidgetLayout.clusterRowHeight)
+                } else {
+                    VStack(spacing: WidgetLayout.clusterRowSpacing) {
+                        ForEach(visibleFeeds) { feed in
+                            ClusterRow(feed: feed)
+                                .frame(height: WidgetLayout.clusterRowHeight)
+                                .transition(.opacity)
+                        }
+                    }
                 }
 
-                heatmapStrip
-                    .frame(height: 36)
-
                 footer
-                    .frame(height: 14)
+                    .frame(height: WidgetLayout.footerHeight)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .padding(.horizontal, WidgetLayout.horizontalPadding)
+            .padding(.vertical, WidgetLayout.verticalPadding)
         }
-        .frame(width: WidgetLayout.width, height: WidgetLayout.height, alignment: .topLeading)
+        .frame(width: WidgetLayout.width, height: windowHeight, alignment: .topLeading)
+        .background(
+            DesktopWindowConfigurator(contentSize: NSSize(width: WidgetLayout.width, height: windowHeight))
+        )
         .ignoresSafeArea()
         .contextMenu {
-            Button("Refresh") {
+            Button(model.feeds.count > 1 ? "Refresh All" : "Refresh") {
                 model.refresh()
             }
-            Button("Open AIRE Monitor") {
+            if model.feeds.count > 1 {
+                ForEach(model.feeds) { feed in
+                    Button("Refresh \(feed.displayName)") {
+                        model.refresh(clusterID: feed.id)
+                    }
+                }
+            }
+            Button("Open Leeds HPC Monitor") {
                 model.openMainApp()
             }
             Divider()
@@ -616,10 +1160,7 @@ struct DesktopWidgetView: View {
                 NSApp.terminate(nil)
             }
         }
-        .animation(.easeInOut(duration: 0.28), value: gpuAllocated)
-        .animation(.easeInOut(duration: 0.28), value: gpuTotal)
-        .animation(.easeInOut(duration: 0.28), value: runningJobs.count)
-        .animation(.easeInOut(duration: 0.28), value: pendingJobs.count)
+        .animation(.easeInOut(duration: 0.28), value: visibleFeeds.map(\.id))
         .task {
             model.start()
         }
@@ -628,26 +1169,23 @@ struct DesktopWidgetView: View {
     private var header: some View {
         HStack(spacing: 9) {
             WidgetLogoMark()
-            .frame(width: 30, height: 30)
+                .frame(width: 30, height: 30)
+                .accessibilityHidden(true)
 
-            Text("AIRE")
+            Text("Leeds HPC")
                 .font(.title3.weight(.semibold))
                 .singleLine()
-                .contentTransition(.opacity)
 
             StatusChip(
-                title: statusPresentation.title,
-                value: statusPresentation.value,
-                color: statusPresentation.color
+                title: overallStatus.title,
+                value: overallStatus.value,
+                color: overallStatus.color
             )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Overall status")
+            .accessibilityValue("\(overallStatus.title), \(overallStatus.value)")
 
             Spacer()
-
-            Text(headerTimestampText)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(headerTimestampColor)
-                .singleLine()
-                .contentTransition(.opacity)
 
             Button {
                 model.openMainApp()
@@ -655,13 +1193,13 @@ struct DesktopWidgetView: View {
                 Image(systemName: "macwindow")
             }
             .buttonStyle(WidgetIconButtonStyle())
-            .help("Open AIRE Monitor")
-            .accessibilityLabel("Open AIRE Monitor")
+            .help("Open Leeds HPC Monitor")
+            .accessibilityLabel("Open Leeds HPC Monitor")
 
             Button {
                 model.refresh()
             } label: {
-                if model.isRefreshing {
+                if model.isAnyRefreshing {
                     ProgressView()
                         .controlSize(.mini)
                 } else {
@@ -669,9 +1207,9 @@ struct DesktopWidgetView: View {
                 }
             }
             .buttonStyle(WidgetIconButtonStyle())
-            .disabled(model.isRefreshing)
-            .help("Refresh")
-            .accessibilityLabel("Refresh")
+            .disabled(model.feeds.isEmpty)
+            .help(model.feeds.count > 1 ? "Refresh all clusters" : "Refresh")
+            .accessibilityLabel(model.feeds.count > 1 ? "Refresh all clusters" : "Refresh")
 
             Button {
                 NSApp.terminate(nil)
@@ -682,137 +1220,46 @@ struct DesktopWidgetView: View {
             .help("Close widget")
             .accessibilityLabel("Close widget")
         }
-        .frame(height: 30)
     }
 
-    private var gpuBlock: some View {
-        HStack(spacing: 12) {
-            RingMeter(value: gpuRatio, color: gpuUseColor, label: "\(gpuPercent)%")
-                .frame(width: 72, height: 72)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("GPU fleet usage")
-                .accessibilityValue("\(gpuAllocated) of \(gpuTotal) GPUs allocated, \(gpuPercent) percent")
-
-            VStack(alignment: .leading, spacing: 9) {
-                Text("GPU Fleet")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .singleLine()
-
-                Text("\(gpuAllocated)/\(gpuTotal)")
-                    .font(.system(size: 26, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(gpuUseColor)
-                    .singleLine()
-                    .contentTransition(.opacity)
-
-                GPUUsageBar(allocated: gpuAllocated, total: gpuTotal, color: gpuUseColor)
-
-                Text("\(gpuIdle) free GPUs")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .singleLine()
-            }
+    /// How the feeds are doing as a whole. Deliberately a count of clusters,
+    /// never a sum of their numbers.
+    private var overallStatus: (title: String, value: String, color: Color) {
+        let feeds = model.feeds
+        guard !feeds.isEmpty else {
+            return ("waiting", "no clusters yet", WidgetPalette.neutral)
         }
-        .widgetSurface()
-    }
-
-    private var healthBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Nodes")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .singleLine()
-
-            MiniStat(title: "GPU", value: "\(gpuNodes.count)", color: WidgetPalette.cyan)
-            MiniStat(title: "Free", value: "\(gpuIdle)", color: WidgetPalette.green)
-            MiniStat(title: "Issues", value: "\(unavailableNodes)", color: WidgetPalette.red)
+        let live = feeds.filter { $0.status == .live }.count
+        let cached = feeds.filter { $0.status == .cached }.count
+        let offline = feeds.filter { $0.status == .offline }.count
+        if live == feeds.count {
+            return ("live", feeds.count == 1 ? feeds[0].displayName : "all \(feeds.count) clusters", WidgetPalette.green)
         }
-        .widgetSurface()
-    }
-
-    private var jobsBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("My Jobs")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .singleLine()
-                Spacer()
-                Text("\(jobs.count)")
-                    .font(.system(size: 24, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(WidgetPalette.purple)
-                    .singleLine()
-            }
-
-            HStack(spacing: 6) {
-                JobCountPill(title: "Run", value: runningJobs.count, color: WidgetPalette.green)
-                JobCountPill(title: "Wait", value: pendingJobs.count, color: WidgetPalette.orange)
-            }
-
-            Group {
-                if jobs.isEmpty {
-                    Label("No active jobs", systemImage: "checkmark.circle.fill")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(WidgetPalette.green)
-                        .singleLine()
-                } else if featuredJobs.count == 1 {
-                    JobRow(job: featuredJobs[0])
-                } else {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(featuredJobs) { job in
-                            CompactJobRow(job: job)
-                        }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        if live > 0 {
+            return ("partial", "\(live) of \(feeds.count) live", WidgetPalette.orange)
         }
-        .widgetSurface()
-    }
-
-    private var heatmapStrip: some View {
-        HStack(spacing: 10) {
-            Text("GPU nodes")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .singleLine()
-                .frame(width: 62, alignment: .leading)
-            GPUHeatmapStrip(nodes: gpuNodes)
-            Text("\(gpuNodes.count)")
-                .font(.caption2.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.secondary)
-                .singleLine()
-                .frame(width: 24, alignment: .trailing)
+        if cached > 0 {
+            return ("cached", "\(cached) of \(feeds.count) cached", WidgetPalette.orange)
         }
-        .padding(.horizontal, 10)
-        .background(WidgetPalette.fill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(WidgetPalette.border, lineWidth: 1)
-        )
+        if offline == feeds.count {
+            return ("offline", "no data", WidgetPalette.red)
+        }
+        return ("connecting", "waiting", WidgetPalette.neutral)
     }
 
     private var footer: some View {
-        let message = statusMessage ?? "Refreshes every \(Int(WidgetLayout.refreshInterval)) seconds"
-        let isWarning = model.errorMessage != nil || model.status == .cached
-        let color = isWarning ? WidgetPalette.orange : WidgetPalette.green
+        let presentation = footerPresentation
+        let color = presentation.isWarning ? WidgetPalette.orange : WidgetPalette.green
 
-        return HStack(alignment: .top, spacing: 7) {
+        return HStack(alignment: .center, spacing: 7) {
             Circle()
                 .fill(color)
                 .frame(width: 6, height: 6)
-                .padding(.top, 4)
-                .shadow(
-                    color: color.opacity(0.28),
-                    radius: 3,
-                    x: 0,
-                    y: 0
-                )
-            Text(message)
+                .shadow(color: color.opacity(0.28), radius: 3, x: 0, y: 0)
+            Text(presentation.message)
                 .font(.caption2)
-                .foregroundColor(isWarning ? .primary : .secondary)
-                .lineLimit(isWarning ? 2 : 1)
+                .foregroundColor(presentation.isWarning ? .primary : .secondary)
+                .lineLimit(2)
                 .truncationMode(.tail)
                 .minimumScaleFactor(0.9)
             Spacer()
@@ -822,90 +1269,322 @@ struct DesktopWidgetView: View {
                 .singleLine()
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background((isWarning ? WidgetPalette.orange.opacity(0.12) : WidgetPalette.fill), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .frame(maxHeight: .infinity)
+        .background(
+            presentation.isWarning ? WidgetPalette.orange.opacity(0.12) : WidgetPalette.fill,
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(isWarning ? WidgetPalette.orange.opacity(0.18) : WidgetPalette.border, lineWidth: 1)
+                .stroke(presentation.isWarning ? WidgetPalette.orange.opacity(0.18) : WidgetPalette.border, lineWidth: 1)
         )
-        .help(message)
+        .help(presentation.message)
+        .accessibilityElement(children: .combine)
     }
 
-    private var remoteName: String {
-        if let snapshot = model.snapshot {
-            return snapshot.remote.hostname.isEmpty ? snapshot.remote.host : snapshot.remote.hostname
+    /// Most important message first: launching, widget errors, per-cluster
+    /// errors (always prefixed with the cluster name), then notices.
+    private var footerPresentation: (message: String, isWarning: Bool) {
+        var message: String
+        var isWarning = true
+        let feeds = model.feeds
+        let problems = feeds.compactMap { feed in
+            feed.errorMessage.map { "\(feed.displayName): \($0)" }
         }
-        return "waiting"
-    }
+        let notices = feeds.compactMap(\.notice)
+        let cachedNames = feeds.filter { $0.status == .cached }.map(\.displayName)
 
-    /// One state drives the chip's title, value, and color consistently.
-    private var statusPresentation: (title: String, value: String, color: Color) {
-        switch model.status {
-        case .connecting:
-            return ("connecting", "waiting", WidgetPalette.neutral)
-        case .live:
-            return ("live", remoteName, WidgetPalette.green)
-        case .cached:
-            return ("cached", remoteName, WidgetPalette.orange)
-        case .offline:
-            return ("offline", "no data", WidgetPalette.red)
-        }
-    }
-
-    private var headerTimestampText: String {
-        switch model.status {
-        case .cached:
-            guard let snapshotDate = model.snapshotDate else {
-                return "data age unknown"
-            }
-            return "data from \(snapshotDate.formatted(date: .omitted, time: .shortened))"
-        case .live:
-            guard let lastUpdate = model.lastUpdate else {
-                return "not updated"
-            }
-            return lastUpdate.formatted(date: .omitted, time: .standard)
-        case .connecting, .offline:
-            return "not updated"
-        }
-    }
-
-    private var headerTimestampColor: Color {
-        model.status == .cached ? WidgetPalette.orange : Color.secondary
-    }
-
-    private var statusMessage: String? {
         if let launchMessage = model.launchMessage {
-            return launchMessage
+            message = launchMessage
+            isWarning = false
+        } else if let error = model.errorMessage, !error.isEmpty {
+            message = error
+        } else if !problems.isEmpty {
+            message = problems.joined(separator: " · ")
+        } else if !notices.isEmpty {
+            message = notices.joined(separator: " ")
+        } else if !cachedNames.isEmpty {
+            message = "\(cachedNames.joined(separator: " and ")): showing cached data; waiting for a fresh snapshot."
+        } else if feeds.isEmpty {
+            message = "Waiting for Leeds HPC Monitor to write a cluster snapshot."
+            isWarning = false
+        } else if let lastUpdate = feeds.compactMap(\.lastUpdate).max() {
+            message = "Updated \(lastUpdate.formatted(date: .omitted, time: .standard)) · refreshes every \(Int(WidgetLayout.refreshInterval)) seconds"
+            isWarning = false
+        } else {
+            message = "Refreshes every \(Int(WidgetLayout.refreshInterval)) seconds"
+            isWarning = false
         }
-        if let error = model.errorMessage, !error.isEmpty {
-            return model.status == .cached ? "Using cached data. \(error)" : error
+        if hiddenFeedCount > 0 {
+            message += " (+\(hiddenFeedCount) more \(hiddenFeedCount == 1 ? "cluster" : "clusters") not shown)"
         }
-        if model.status == .cached, let snapshotDate = model.snapshotDate {
-            return "Showing data from \(snapshotDate.formatted(date: .omitted, time: .shortened)); waiting for a fresh snapshot."
+        return (message, isWarning)
+    }
+}
+
+/// One cluster: identity and status on top, then its GPU pool, its jobs and
+/// its GPU-node heatmap. Every number in the row belongs to this cluster.
+struct ClusterRow: View {
+    @ObservedObject var feed: ClusterFeed
+
+    var body: some View {
+        let digest = ClusterDigest(snapshot: feed.snapshot)
+        VStack(alignment: .leading, spacing: 6) {
+            titleLine
+                .frame(height: 20)
+
+            HStack(alignment: .center, spacing: 12) {
+                gpuGauge(digest)
+                Rectangle()
+                    .fill(WidgetPalette.border)
+                    .frame(width: 1)
+                    .padding(.vertical, 4)
+                activity(digest)
+            }
+            .frame(maxHeight: .infinity)
         }
-        if let lastUpdate = model.lastUpdate {
-            return "Updated \(lastUpdate.formatted(date: .omitted, time: .standard))"
-        }
-        return nil
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .widgetSurface()
+        .animation(.easeInOut(duration: 0.28), value: digest.gpuAllocated)
+        .animation(.easeInOut(duration: 0.28), value: digest.gpuTotal)
+        .animation(.easeInOut(duration: 0.28), value: digest.running.count)
+        .animation(.easeInOut(duration: 0.28), value: digest.pending.count)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(feed.displayName)
     }
 
-    private var gpuRatio: Double {
-        guard gpuTotal > 0 else {
-            return 0
+    private var titleLine: some View {
+        HStack(spacing: 7) {
+            ClusterMonogram(clusterID: feed.id, name: feed.displayName)
+
+            Text(feed.displayName)
+                .font(.system(size: 14, weight: .semibold))
+                .singleLine()
+                .contentTransition(.opacity)
+
+            StatusChip(title: feed.status.title, value: chipValue, color: feed.status.color)
+                .help(chipHelp)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(feed.displayName) status")
+                .accessibilityValue("\(feed.status.title), \(chipValue)")
+
+            Spacer(minLength: 6)
+
+            if feed.isRefreshing {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel("Collecting \(feed.displayName) snapshot")
+            }
+
+            Text(timestampText)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(feed.status == .cached ? WidgetPalette.orange : Color.secondary)
+                .singleLine()
+                .contentTransition(.opacity)
+                .accessibilityLabel("\(feed.displayName) snapshot time")
+                .accessibilityValue(timestampText)
         }
-        return min(Double(gpuAllocated) / Double(gpuTotal), 1)
     }
 
-    private var gpuPercent: Int {
-        Int((gpuRatio * 100).rounded())
+    private var chipValue: String {
+        switch feed.status {
+        case .live, .cached:
+            return feed.remoteName ?? "login node"
+        case .connecting:
+            return "waiting"
+        case .offline:
+            return "no data"
+        }
     }
 
-    private var gpuUseColor: Color {
-        WidgetPalette.gpuColor(allocatedRatio: gpuRatio)
+    /// Errors and notices first; otherwise the collector's warnings (an
+    /// enrichment step such as storage or job details that failed while the
+    /// core data is fine). Tooltip only: the row has no room for them, and
+    /// they never make the snapshot less trustworthy for what the row shows.
+    private var chipHelp: String {
+        if let message = feed.errorMessage ?? feed.notice {
+            return message
+        }
+        let warnings = feed.snapshot?.warnings ?? []
+        guard !warnings.isEmpty else {
+            return chipValue
+        }
+        let shown = warnings.prefix(3).joined(separator: "\n")
+        let more = warnings.count > 3 ? "\n(+\(warnings.count - 3) more)" : ""
+        return "\(chipValue)\n\(shown)\(more)"
     }
 
-    private var unavailableNodes: Int {
-        gpuNodes.filter { !$0.isAvailable }.count
+    private var timestampText: String {
+        guard let snapshotDate = feed.snapshotDate else {
+            return feed.status == .connecting ? "waiting" : "not updated"
+        }
+        let isToday = Calendar.current.isDateInToday(snapshotDate)
+        switch feed.status {
+        case .cached:
+            return "data from \(snapshotDate.formatted(date: isToday ? .omitted : .abbreviated, time: .shortened))"
+        case .live, .connecting, .offline:
+            return snapshotDate.formatted(date: .omitted, time: .standard)
+        }
+    }
+
+    private func gpuGauge(_ digest: ClusterDigest) -> some View {
+        let hasGPUs = digest.gpuTotal > 0
+        let model = digest.gpuModel ?? "GPU"
+        return HStack(spacing: 10) {
+            RingMeter(
+                value: digest.gpuRatio,
+                color: digest.gpuColor,
+                label: hasGPUs ? "\(digest.gpuPercent)%" : "–",
+                lineWidth: 6
+            )
+            .frame(width: 52, height: 52)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(feed.displayName) \(model) GPU usage")
+            .accessibilityValue(
+                hasGPUs
+                    ? "\(digest.gpuAllocated) of \(digest.gpuTotal) GPUs allocated, \(digest.gpuPercent) percent"
+                    : "No GPU data"
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(model)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(ClusterStyle.accent(for: feed.id))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(ClusterStyle.accent(for: feed.id).opacity(0.14), in: Capsule())
+                        .singleLine()
+                    Text("free")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .singleLine()
+                }
+
+                HStack(alignment: .firstTextBaseline, spacing: 1) {
+                    Text(hasGPUs ? "\(digest.gpuIdle)" : "–")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded).monospacedDigit())
+                        .foregroundStyle(idleColor(digest))
+                        .contentTransition(.opacity)
+                    if hasGPUs {
+                        Text("/\(digest.gpuTotal)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .singleLine()
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(feed.displayName) free \(model) GPUs")
+                .accessibilityValue(hasGPUs ? "\(digest.gpuIdle) of \(digest.gpuTotal)" : "No GPU data")
+
+                GPUUsageBar(
+                    allocated: digest.gpuAllocated,
+                    unavailable: digest.unavailableGPUs,
+                    total: digest.gpuTotal,
+                    color: digest.gpuColor
+                )
+                .accessibilityHidden(true)
+            }
+            .frame(width: 112, alignment: .leading)
+        }
+    }
+
+    private func idleColor(_ digest: ClusterDigest) -> Color {
+        guard digest.gpuTotal > 0 else {
+            return .secondary
+        }
+        return digest.gpuIdle > 0 ? WidgetPalette.green : WidgetPalette.orange
+    }
+
+    private func activity(_ digest: ClusterDigest) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                // Unknown is not zero: without a snapshot the pills show a dash.
+                let hasData = feed.snapshot != nil
+                JobCountPill(title: "Run", value: hasData ? digest.running.count : nil, color: WidgetPalette.green)
+                    .accessibilityLabel("\(feed.displayName) running jobs")
+                JobCountPill(title: "Wait", value: hasData ? digest.pending.count : nil, color: WidgetPalette.orange)
+                    .accessibilityLabel("\(feed.displayName) pending jobs")
+                Spacer(minLength: 4)
+                if digest.unavailableGPUNodes > 0 {
+                    Label("\(digest.unavailableGPUNodes) down", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(WidgetPalette.red)
+                        .singleLine()
+                        .help("\(digest.unavailableGPUNodes) GPU node(s) drained, down or in maintenance")
+                        .accessibilityLabel("\(digest.unavailableGPUNodes) GPU nodes unavailable on \(feed.displayName)")
+                }
+            }
+
+            jobLine(digest)
+                .frame(height: 16)
+
+            HStack(spacing: 8) {
+                GPUHeatmapStrip(nodes: digest.gpuNodes, clusterName: feed.displayName)
+                Text("\(digest.gpuNodes.count) \(digest.gpuNodes.count == 1 ? "node" : "nodes")")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            }
+            .frame(height: 12)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(feed.displayName) GPU nodes")
+            .accessibilityValue(
+                "\(digest.gpuNodes.count) nodes: \(digest.fullyFreeNodes) fully free, "
+                    + "\(digest.fullyAllocatedNodes) fully allocated, \(digest.unavailableGPUNodes) unavailable"
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func jobLine(_ digest: ClusterDigest) -> some View {
+        if feed.snapshot == nil {
+            Label(
+                feed.status == .connecting ? "Waiting for the first snapshot" : "No snapshot yet",
+                systemImage: "hourglass"
+            )
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .singleLine()
+        } else if let job = digest.topJob {
+            TopJobRow(job: job, clusterName: feed.displayName)
+        } else {
+            Label("No active jobs", systemImage: "checkmark.circle.fill")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(WidgetPalette.green)
+                .singleLine()
+        }
+    }
+}
+
+/// Shown until the app has written at least one cluster directory.
+struct EmptyClustersCard: View {
+    let onOpenApp: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("No clusters yet")
+                    .font(.callout.weight(.semibold))
+                Text("Open Leeds HPC Monitor and connect; each cluster appears here after its first snapshot.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button("Open Monitor", action: onOpenApp)
+                .controlSize(.small)
+                .help("Open Leeds HPC Monitor")
+                .accessibilityLabel("Open Leeds HPC Monitor")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .widgetSurface()
     }
 }
 
@@ -949,37 +1628,14 @@ struct StatusChip: View {
         .lineLimit(1)
         .minimumScaleFactor(0.82)
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .frame(maxWidth: 190, alignment: .leading)
+        .padding(.vertical, 4)
+        .frame(maxWidth: 200, alignment: .leading)
         .background(color.opacity(0.10), in: Capsule())
         .background(.thinMaterial, in: Capsule())
         .overlay(
             Capsule()
                 .stroke(color.opacity(0.15), lineWidth: 1)
         )
-    }
-}
-
-struct MiniStat: View {
-    let title: String
-    let value: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 7) {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(color)
-                .frame(width: 5, height: 18)
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .singleLine()
-            Spacer(minLength: 4)
-            Text(value)
-                .font(.callout.monospacedDigit().weight(.semibold))
-                .foregroundStyle(color)
-                .singleLine()
-        }
     }
 }
 
@@ -1007,60 +1663,75 @@ struct RingMeter: View {
     let value: Double
     let color: Color
     let label: String
+    var lineWidth: CGFloat = 8
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(WidgetPalette.fillStrong, lineWidth: 8)
+                .stroke(WidgetPalette.fillStrong, lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: min(max(value, 0), 1))
-                .stroke(color, style: StrokeStyle(lineWidth: 8, lineCap: .round))
+                .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
                 .animation(.easeInOut(duration: 0.32), value: value)
             Text(label)
                 .font(.caption.monospacedDigit().weight(.bold))
                 .singleLine()
         }
+        .padding(lineWidth / 2)
     }
 }
 
+/// Allocated GPUs in the usage colour, idle GPUs on unavailable nodes in red,
+/// and the free remainder as the green track.
 struct GPUUsageBar: View {
     let allocated: Int
+    let unavailable: Int
     let total: Int
     let color: Color
 
-    private var ratio: Double {
+    private func fraction(_ value: Int) -> Double {
         guard total > 0 else {
             return 0
         }
-        return min(Double(allocated) / Double(total), 1)
+        return min(max(Double(value) / Double(total), 0), 1)
     }
 
     var body: some View {
         GeometryReader { proxy in
             let width = max(proxy.size.width, 1)
+            let allocatedWidth = width * fraction(allocated)
+            let unavailableWidth = min(width * fraction(unavailable), width - allocatedWidth)
             ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 5)
+                RoundedRectangle(cornerRadius: 4)
                     .fill(WidgetPalette.green.opacity(0.16))
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(color.opacity(0.88))
-                    .frame(width: width * ratio)
-                    .animation(.easeInOut(duration: 0.32), value: ratio)
+                HStack(spacing: 0) {
+                    Rectangle()
+                        .fill(color.opacity(0.88))
+                        .frame(width: allocatedWidth)
+                    Rectangle()
+                        .fill(WidgetPalette.red.opacity(0.62))
+                        .frame(width: max(unavailableWidth, 0))
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .animation(.easeInOut(duration: 0.32), value: allocated)
+                .animation(.easeInOut(duration: 0.32), value: unavailable)
             }
         }
-        .frame(height: 10)
+        .frame(height: 8)
     }
 }
 
 struct JobCountPill: View {
     let title: String
-    let value: Int
+    /// nil while the cluster has no snapshot yet.
+    let value: Int?
     let color: Color
 
     var body: some View {
         HStack(spacing: 4) {
             Text(title)
-            Text("\(value)")
+            Text(value.map(String.init) ?? "–")
                 .monospacedDigit()
                 .fontWeight(.semibold)
         }
@@ -1068,7 +1739,7 @@ struct JobCountPill: View {
         .lineLimit(1)
         .minimumScaleFactor(0.82)
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.vertical, 3)
         .background(color.opacity(0.12), in: Capsule())
         .background(.thinMaterial, in: Capsule())
         .foregroundStyle(color)
@@ -1076,50 +1747,31 @@ struct JobCountPill: View {
             Capsule()
                 .stroke(color.opacity(0.14), lineWidth: 1)
         )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(value.map(String.init) ?? "unknown")
     }
 }
 
-struct JobRow: View {
+/// The cluster's headline job: name first (it is what the user recognises),
+/// then partition and elapsed time.
+struct TopJobRow: View {
     let job: WidgetJob
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(job.name)
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Text("\(job.partition) • \(job.elapsed)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            Spacer(minLength: 6)
-            Text(job.state.prefix(1))
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(color)
-        }
-    }
-
-    private var color: Color {
-        WidgetPalette.jobStateColor(job.state)
-    }
-}
-
-struct CompactJobRow: View {
-    let job: WidgetJob
+    let clusterName: String
 
     var body: some View {
         HStack(spacing: 5) {
             Circle()
                 .fill(WidgetPalette.jobStateColor(job.state))
-                .frame(width: 5, height: 5)
-            Text(job.name)
-                .font(.caption2.weight(.medium))
+                .frame(width: 6, height: 6)
+            Text(job.name.isEmpty ? "Job \(job.jobId)" : job.name)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+            Text(job.partition)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 4)
@@ -1127,32 +1779,46 @@ struct CompactJobRow: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .fixedSize()
         }
+        .help("\(clusterName) job \(job.jobId) · \(job.state) · \(job.partition) · \(job.elapsed)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(clusterName) top job \(job.name)")
+        .accessibilityValue("\(job.state.lowercased()), partition \(job.partition), elapsed \(job.elapsed)")
     }
 }
 
 struct GPUHeatmapStrip: View {
     let nodes: [WidgetNode]
+    let clusterName: String
 
     var body: some View {
         GeometryReader { proxy in
             let count = max(nodes.count, 1)
-            let spacing: CGFloat = 3
-            let width = max((proxy.size.width - spacing * CGFloat(count - 1)) / CGFloat(count), 4)
-            HStack(spacing: spacing) {
-                ForEach(nodes) { node in
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(WidgetPalette.heatmapColor(for: node))
-                        .frame(width: width, height: 16)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 3)
-                                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                        )
-                        .help("\(node.node): \(node.gpuAllocatedValue)/\(node.gpuTotalValue) GPU, \(node.state)")
-                        .transition(.opacity)
+            // Tighter gaps for large pools so every node keeps a visible cell.
+            let spacing: CGFloat = count > 24 ? 1.5 : 3
+            let width = max((proxy.size.width - spacing * CGFloat(count - 1)) / CGFloat(count), 2)
+            if nodes.isEmpty {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(WidgetPalette.fillStrong)
+                    .frame(height: proxy.size.height)
+            } else {
+                HStack(spacing: spacing) {
+                    ForEach(nodes) { node in
+                        RoundedRectangle(cornerRadius: 2.5)
+                            .fill(WidgetPalette.heatmapColor(for: node))
+                            .frame(width: width, height: proxy.size.height)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 2.5)
+                                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                            )
+                            .help("\(clusterName) \(node.node): \(node.gpuAllocatedValue)/\(node.gpuTotalValue) GPU, \(node.state)")
+                            .transition(.opacity)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -1177,99 +1843,185 @@ private struct WidgetVisualEffectBackground: NSViewRepresentable {
     }
 }
 
-struct SnapshotResult {
-    let snapshot: WidgetSnapshot
-    let errorMessage: String?
-    let usedCache: Bool
+// MARK: - Fallback collector
+
+/// The app's password-free record of how it runs the collector for one
+/// cluster: `.runtime/clusters/<id>/collector.json`.
+private struct CollectorInvocation: Decodable {
+    let updatedAt: String?
+    let script: String
+    let arguments: [String]
+}
+
+/// A collector invocation that passed validation and is safe to execute.
+struct ValidatedCollector {
+    let scriptPath: String
+    let arguments: [String]
+    let deadline: TimeInterval
+}
+
+enum CollectorLoadResult {
+    case missing
+    case invalid(String)
+    case ready(ValidatedCollector)
+}
+
+enum CollectorLoader {
+    static func load(clusterID: String, directory: String, projectRoot: String) -> CollectorLoadResult {
+        let path = "\(directory)/collector.json"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return .missing
+        }
+        let invocation: CollectorInvocation
+        do {
+            invocation = try JSONDecoder().decode(CollectorInvocation.self, from: data)
+        } catch {
+            return .invalid("Unreadable collector record \(path): \(error.localizedDescription)")
+        }
+        // The file sits in this cluster's directory, so it must describe this
+        // cluster; anything else would write one cluster's data into
+        // another's snapshot.
+        if let recorded = argumentValue("--cluster-id", in: invocation.arguments), recorded != clusterID {
+            return .invalid("\(path) is for cluster '\(recorded)', not '\(clusterID)'; reconnect in Leeds HPC Monitor.")
+        }
+        do {
+            let scriptPath = try validatedScriptPath(invocation.script, projectRoot: projectRoot)
+            return .ready(
+                ValidatedCollector(
+                    scriptPath: scriptPath,
+                    arguments: invocation.arguments,
+                    deadline: SnapshotRunner.processDeadline(arguments: invocation.arguments)
+                )
+            )
+        } catch {
+            return .invalid(error.localizedDescription)
+        }
+    }
+
+    /// The recorded script must be a relative path inside the project root
+    /// (no absolute path, no `..`, and not a symlink escaping the checkout)
+    /// and must exist: `.runtime` is a plain directory, and this is the only
+    /// thing the widget ever executes from it.
+    static func validatedScriptPath(_ script: String, projectRoot: String) throws -> String {
+        let trimmed = script.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("/"),
+              !trimmed.hasPrefix("~"),
+              !trimmed.split(separator: "/", omittingEmptySubsequences: false).contains("..") else {
+            throw WidgetError.message("Refusing collector script '\(script)': it must be a relative path inside the project.")
+        }
+        let root = URL(fileURLWithPath: projectRoot).standardizedFileURL.resolvingSymlinksInPath().path
+        let candidate = URL(fileURLWithPath: root)
+            .appendingPathComponent(trimmed)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        guard candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/") else {
+            throw WidgetError.message("Refusing collector script '\(script)': it resolves outside \(root).")
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw WidgetError.message("Missing collector script at \(candidate).")
+        }
+        return candidate
+    }
+
+    /// Value of `--flag value` or `--flag=value`.
+    static func argumentValue(_ flag: String, in arguments: [String]) -> String? {
+        for (index, argument) in arguments.enumerated() {
+            if argument == flag {
+                return index + 1 < arguments.count ? arguments[index + 1] : nil
+            }
+            if argument.hasPrefix(flag + "=") {
+                return String(argument.dropFirst(flag.count + 1))
+            }
+        }
+        return nil
+    }
+}
+
+struct CollectionResult {
+    /// Collector stdout byte for byte; this is what gets written to disk.
+    let output: Data
+    let snapshot: WidgetSnapshot?
+    /// Exit 0, decoded, no collector errors and no watchdog timeout: the
+    /// only outcome that may replace the cluster's snapshot file.
+    let isClean: Bool
+    let failureMessage: String?
 }
 
 enum SnapshotRunner {
-    /// Per-SSH-command timeout passed to aire_monitor_snapshot.py.
-    static let perCommandTimeout = 8
-    /// aire_monitor_snapshot.py runs six sequential SSH commands (remote,
-    /// jobs, job details, partitions, nodes, storage); the process deadline
-    /// must cover the aggregate worst case plus local startup slack so a slow
-    /// link is not mistaken for a hang.
-    static let remoteCommandCount = 6
-    static var processDeadline: TimeInterval {
-        TimeInterval(remoteCommandCount * perCommandTimeout) + 12
-    }
+    /// hpc_snapshot.py's own default for --timeout (its DEFAULT_TIMEOUT),
+    /// used when the recorded arguments carry none.
+    static let defaultCollectorTimeout = 30
+    /// Watchdog headroom above the collector's own budget: interpreter
+    /// start-up, the collector reaping its timed-out ssh child, and JSON
+    /// assembly. Twice the app's 10 s on purpose (see processDeadline).
+    private static let deadlineHeadroom: TimeInterval = 20
     private static let killGracePeriod: TimeInterval = 3
     private static let maxCapturedOutputBytes = 8 * 1024 * 1024
+    private static let maxMessageLength = 400
 
-    static func collect(projectRoot: String) async throws -> SnapshotResult {
-        let script = "\(projectRoot)/scripts/aire_monitor_snapshot.py"
-        let cacheURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/latest_snapshot.json")
-        let legacyCacheURL = URL(fileURLWithPath: "\(projectRoot)/.runtime/last_snapshot.json")
-        guard FileManager.default.fileExists(atPath: script) else {
-            throw WidgetError.message("Missing snapshot script at \(script)")
-        }
+    /// hpc_snapshot.py collects everything (jobs, job details, partitions,
+    /// nodes, storage) in ONE batched SSH round trip, and its --timeout is
+    /// the budget for the WHOLE run, socket probe included: it prints its
+    /// JSON (partial, with a warning, if storage stalled) before that budget
+    /// runs out. So the watchdog only has to sit comfortably above the
+    /// budget. The app allows budget + 10 s; the widget allows more, because
+    /// killing a slow but healthy collection throws away a good snapshot
+    /// and the next attempt cannot start for another 10 s anyway, while a
+    /// wedged child still gets killed. With the app's --timeout 30 the
+    /// deadline is 50 s.
+    static func processDeadline(arguments: [String]) -> TimeInterval {
+        let recorded = CollectorLoader.argumentValue("--timeout", in: arguments).flatMap { Int($0) }
+        let budget = min(max(recorded ?? defaultCollectorTimeout, 1), 300)
+        return TimeInterval(budget) + deadlineHeadroom
+    }
 
+    static func collect(projectRoot: String, collector: ValidatedCollector) async throws -> CollectionResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = try WidgetConnectionProfile.snapshotArguments(
-            projectRoot: projectRoot,
-            script: script
-        )
+        process.arguments = [collector.scriptPath] + collector.arguments
         process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
 
-        let outcome = try await execute(process)
+        let outcome = try await execute(process, deadline: collector.deadline)
         let stderrText = String(data: outcome.stderr, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let timeoutText = outcome.timedOut
-            ? "Snapshot collection timed out after \(Int(processDeadline)) seconds."
+            ? "Snapshot collection timed out after \(Int(collector.deadline)) seconds."
             : nil
-        let cachedData = (try? Data(contentsOf: cacheURL)) ?? (try? Data(contentsOf: legacyCacheURL))
 
-        if let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: outcome.stdout) {
-            let scriptErrors = snapshot.errors.joined(separator: "\n")
-            let liveMessage = combinedMessage([timeoutText, scriptErrors.isEmpty ? stderrText : scriptErrors])
-            if outcome.terminationStatus == 0 && scriptErrors.isEmpty && !outcome.timedOut {
-                try? FileManager.default.createDirectory(
-                    at: cacheURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try? outcome.stdout.write(to: cacheURL, options: .atomic)
-                return SnapshotResult(
-                    snapshot: snapshot,
-                    errorMessage: nil,
-                    usedCache: false
-                )
-            }
-            if let cached = cachedData,
-               let cachedSnapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: cached) {
-                return SnapshotResult(
-                    snapshot: cachedSnapshot,
-                    errorMessage: liveMessage.isEmpty ? "Refresh failed; showing cached data." : liveMessage,
-                    usedCache: true
-                )
-            }
-            return SnapshotResult(
-                snapshot: snapshot,
-                errorMessage: liveMessage.isEmpty ? "Refresh failed." : liveMessage,
-                usedCache: false
+        guard let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: outcome.stdout) else {
+            let message = combinedMessage([timeoutText, stderrText])
+            return CollectionResult(
+                output: outcome.stdout,
+                snapshot: nil,
+                isClean: false,
+                failureMessage: message.isEmpty
+                    ? "Refresh failed (collector exited with status \(outcome.terminationStatus))."
+                    : message
             )
         }
-
-        let failureMessage = combinedMessage([timeoutText, stderrText])
-        if let cached = cachedData,
-           let snapshot = try? JSONDecoder().decode(WidgetSnapshot.self, from: cached) {
-            return SnapshotResult(
-                snapshot: snapshot,
-                errorMessage: failureMessage.isEmpty ? "Refresh failed; showing cached data." : failureMessage,
-                usedCache: true
-            )
-        }
-        throw WidgetError.message(
-            failureMessage.isEmpty ? "Refresh failed and no cached snapshot is available." : failureMessage
+        let scriptErrors = snapshot.errors.joined(separator: "\n")
+        let isClean = outcome.terminationStatus == 0 && scriptErrors.isEmpty && !outcome.timedOut
+        let message = combinedMessage([timeoutText, scriptErrors.isEmpty ? stderrText : scriptErrors])
+        return CollectionResult(
+            output: outcome.stdout,
+            snapshot: snapshot,
+            isClean: isClean,
+            failureMessage: isClean ? nil : (message.isEmpty ? "Refresh failed." : message)
         )
     }
 
     private static func combinedMessage(_ parts: [String?]) -> String {
-        parts
+        let joined = parts
             .compactMap { $0 }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+        guard joined.count > maxMessageLength else {
+            return joined
+        }
+        return String(joined.prefix(maxMessageLength)) + "…"
     }
 
     /// Runs the process without blocking a cooperative-pool thread: both
@@ -1278,7 +2030,7 @@ enum SnapshotRunner {
     /// terminationHandler before the exit status is read, and a watchdog
     /// escalates SIGTERM to SIGKILL and finally force-completes so the widget
     /// can never hang on a wedged child or an inherited pipe descriptor.
-    private static func execute(_ process: Process) async throws -> ProcessOutcome {
+    private static func execute(_ process: Process, deadline: TimeInterval) async throws -> ProcessOutcome {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
@@ -1299,7 +2051,7 @@ enum SnapshotRunner {
         let pid = process.processIdentifier
 
         let watchdog = Task.detached(priority: .utility) {
-            try? await Task.sleep(nanoseconds: UInt64(processDeadline * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
             guard state.markTimedOutIfRunning() else {
                 return
             }
@@ -1452,30 +2204,39 @@ private final class RunnerState: @unchecked Sendable {
 }
 
 enum ProjectLocator {
+    /// Present in every checkout of this repository; also what the app uses
+    /// to recognise a project root.
+    static let markerScript = "scripts/hpc_snapshot.py"
+
     static func findProjectRoot() -> String {
         let environment = ProcessInfo.processInfo.environment
-        if let value = environment["AIRE_PROJECT_ROOT"], hasSnapshotScript(value) {
-            return value
+        // HPC_PROJECT_ROOT is the current name; AIRE_PROJECT_ROOT is the
+        // pre-multi-cluster one, still honoured.
+        for key in ["HPC_PROJECT_ROOT", "AIRE_PROJECT_ROOT"] {
+            if let value = environment[key], hasMarker(value) {
+                return value
+            }
         }
 
         let current = FileManager.default.currentDirectoryPath
-        if hasSnapshotScript(current) {
+        if hasMarker(current) {
             return current
         }
 
+        // <root>/.runtime/AIREDesktopWidget.app -> <root>
         let bundleRoot = Bundle.main.bundleURL
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .path
-        if hasSnapshotScript(bundleRoot) {
+        if hasMarker(bundleRoot) {
             return bundleRoot
         }
 
         return current
     }
 
-    private static func hasSnapshotScript(_ root: String) -> Bool {
-        FileManager.default.fileExists(atPath: "\(root)/scripts/aire_monitor_snapshot.py")
+    private static func hasMarker(_ root: String) -> Bool {
+        FileManager.default.fileExists(atPath: "\(root)/\(markerScript)")
     }
 }
 
@@ -1510,93 +2271,67 @@ enum WidgetError: LocalizedError {
     }
 }
 
-struct WidgetConnectionProfile: Codable {
-    let useSSHAlias: Bool
-    let sshAlias: String
-    let username: String
-    let aireHostname: String
-    let useJumpHost: Bool
-    let jumpHostname: String
-    let controlPath: String
-    let jumpControlPath: String
+// MARK: - Snapshot decoding (re-declared: the widget shares no code with the app)
 
-    private static var timeoutArgument: String {
-        String(SnapshotRunner.perCommandTimeout)
-    }
-
-    static func snapshotArguments(projectRoot: String, script: String) throws -> [String] {
-        switch load(projectRoot: projectRoot) {
-        case .missing:
-            return [script, "--host", "aire", "--timeout", timeoutArgument]
-        case .invalid(let message):
-            throw WidgetError.message(message)
-        case .loaded(let profile):
-            return snapshotArguments(script: script, profile: profile)
-        }
-    }
-
-    private static func snapshotArguments(script: String, profile: WidgetConnectionProfile) -> [String] {
-        if profile.useSSHAlias {
-            return [
-                script,
-                "--host", profile.sshAlias.isEmpty ? "aire" : profile.sshAlias,
-                "--timeout", timeoutArgument
-            ]
-        }
-
-        var arguments = [
-            script,
-            "--username", profile.username,
-            "--aire-hostname", profile.aireHostname,
-            "--jump-hostname", profile.jumpHostname,
-            profile.useJumpHost ? "--use-jump-host" : "--no-jump-host",
-            "--control-path", profile.controlPath,
-            "--timeout", timeoutArgument
-        ]
-        if !profile.jumpControlPath.isEmpty {
-            arguments.append(contentsOf: ["--jump-control-path", profile.jumpControlPath])
-        }
-        return arguments
-    }
-
-    private static func load(projectRoot: String) -> ProfileLoadResult {
-        let url = URL(fileURLWithPath: projectRoot)
-            .appendingPathComponent(".runtime")
-            .appendingPathComponent("connection_profile.json")
-        guard let data = try? Data(contentsOf: url) else {
-            return .missing
-        }
-        do {
-            return .loaded(try JSONDecoder().decode(WidgetConnectionProfile.self, from: data))
-        } catch {
-            return .invalid("Connection profile is invalid: \(url.path)\n\(error.localizedDescription)")
-        }
-    }
-
-    private enum ProfileLoadResult {
-        case missing
-        case invalid(String)
-        case loaded(WidgetConnectionProfile)
-    }
+/// Which cluster a snapshot came from, as echoed by the collector.
+struct WidgetClusterInfo: Decodable {
+    let id: String
+    let name: String
 }
 
-struct WidgetSnapshot: Codable {
+/// The subset of the collector/app snapshot JSON the widget shows. Decoding
+/// is lenient like the app's: a missing peripheral key must not discard a
+/// whole cluster's snapshot.
+struct WidgetSnapshot: Decodable {
     let collectedAt: String
+    let cluster: WidgetClusterInfo?
     let remote: WidgetRemote
-    let jobs: [WidgetJob]
-    let nodes: [WidgetNode]
+    private(set) var jobs: [WidgetJob]
+    private(set) var nodes: [WidgetNode]
     let errors: [String]
+    let warnings: [String]
 
     enum CodingKeys: String, CodingKey {
         case collectedAt = "collected_at"
+        case cluster
         case remote
         case jobs
         case nodes
         case errors
+        case warnings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        collectedAt = try container.decodeIfPresent(String.self, forKey: .collectedAt) ?? ""
+        cluster = try? container.decodeIfPresent(WidgetClusterInfo.self, forKey: .cluster)
+        remote = (try? container.decodeIfPresent(WidgetRemote.self, forKey: .remote)) ?? WidgetRemote()
+        jobs = try container.decodeIfPresent([WidgetJob].self, forKey: .jobs) ?? []
+        nodes = try container.decodeIfPresent([WidgetNode].self, forKey: .nodes) ?? []
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+        warnings = (try? container.decodeIfPresent([String].self, forKey: .warnings)) ?? []
+    }
+
+    /// Stamps every job and node with its cluster: Slurm job ids and node
+    /// names are only unique within one cluster, so SwiftUI identities must
+    /// carry the cluster too.
+    func qualified(by clusterID: String) -> WidgetSnapshot {
+        var copy = self
+        copy.jobs = jobs.map { job in
+            var job = job
+            job.clusterID = clusterID
+            return job
+        }
+        copy.nodes = nodes.map { node in
+            var node = node
+            node.clusterID = clusterID
+            return node
+        }
+        return copy
     }
 }
 
-struct WidgetRemote: Codable {
+struct WidgetRemote: Decodable {
     let host: String
     let hostname: String
     let user: String
@@ -1608,17 +2343,35 @@ struct WidgetRemote: Codable {
         case user
         case remoteTime = "remote_time"
     }
+
+    init() {
+        host = ""
+        hostname = ""
+        user = ""
+        remoteTime = ""
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? ""
+        hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? ""
+        user = try container.decodeIfPresent(String.self, forKey: .user) ?? ""
+        remoteTime = try container.decodeIfPresent(String.self, forKey: .remoteTime) ?? ""
+    }
 }
 
-struct WidgetJob: Codable, Identifiable {
+struct WidgetJob: Decodable, Identifiable {
     let jobId: String
     let partition: String
     let name: String
     let state: String
     let elapsed: String
+    /// Set by WidgetSnapshot.qualified(by:); not part of the JSON.
+    fileprivate(set) var clusterID = ""
 
+    /// "<cluster>/<job id>": job 1234 on two clusters is two different jobs.
     var id: String {
-        jobId
+        "\(clusterID)/\(jobId)"
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1628,21 +2381,25 @@ struct WidgetJob: Codable, Identifiable {
         case state
         case elapsed
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        jobId = try container.decodeIfPresent(String.self, forKey: .jobId) ?? ""
+        partition = try container.decodeIfPresent(String.self, forKey: .partition) ?? ""
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? ""
+        elapsed = try container.decodeIfPresent(String.self, forKey: .elapsed) ?? ""
+    }
 }
 
 enum WidgetGresParser {
     /// Parses GPU counts from Slurm gres strings, tolerating socket/index
-    /// suffixes and comma-joined lists: "gpu:l40s:3(S:0-1)" -> 3,
-    /// "gpu:4(IDX:0-3)" -> 4, "gpu:a100:4,mps:400" -> 4, "gpu" -> 1.
+    /// suffixes and comma-joined lists: "gpu:nvidia_h200:8(S:0-1)" -> 8,
+    /// "gpu:4(IDX:0-3)" -> 4, "gpu:l40s:3,mps:400" -> 3, "gpu" -> 1.
     static func gpuCount(in gres: String) -> Int {
         var total = 0
-        for rawEntry in gres.split(separator: ",") {
-            let entry = rawEntry.trimmingCharacters(in: .whitespaces)
-            let base = entry
-                .split(separator: "(", maxSplits: 1, omittingEmptySubsequences: true)
-                .first
-                .map(String.init) ?? entry
-            let pieces = base.split(separator: ":")
+        for entry in entries(in: gres) {
+            let pieces = entry.split(separator: ":")
             guard let kind = pieces.first, kind.lowercased() == "gpu" else {
                 continue
             }
@@ -1657,17 +2414,73 @@ enum WidgetGresParser {
         }
         return total
     }
+
+    /// Raw model of the first typed GPU entry: "gpu:nvidia_h200:8" ->
+    /// "nvidia_h200", "gpu:l40s:3(S:0-1)" -> "l40s"; untyped "gpu:4" -> nil.
+    static func gpuModel(in gres: String) -> String? {
+        for entry in entries(in: gres) {
+            let pieces = entry.split(separator: ":")
+            guard pieces.count >= 3, pieces[0].lowercased() == "gpu" else {
+                continue
+            }
+            return String(pieces[1])
+        }
+        return nil
+    }
+
+    /// Same rule as the app's gpuModelDisplayName: "nvidia_h200" -> "H200",
+    /// "l40s" -> "L40S".
+    static func displayName(forModel rawModel: String) -> String {
+        var model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["nvidia_", "nvidia-", "amd_", "amd-"] where model.lowercased().hasPrefix(prefix) {
+            model = String(model.dropFirst(prefix.count))
+        }
+        return model
+            .replacingOccurrences(of: "_", with: " ")
+            .uppercased()
+    }
+
+    /// Comma-separated entries with any "(...)" suffix removed; commas
+    /// inside parentheses ("gpu:4(IDX:0,2-3)") do not split entries.
+    private static func entries(in gres: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var depth = 0
+        for character in gres {
+            switch character {
+            case "(":
+                depth += 1
+            case ")":
+                depth = max(depth - 1, 0)
+            case "," where depth == 0:
+                result.append(current)
+                current = ""
+            default:
+                if depth == 0 {
+                    current.append(character)
+                }
+            }
+        }
+        result.append(current)
+        return result
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
 }
 
-struct WidgetNode: Codable, Identifiable {
+struct WidgetNode: Decodable, Identifiable {
     let node: String
     let state: String
     let gpuTotal: Int?
     let gpuAllocated: Int?
+    let gpuIdle: Int?
     let gres: String?
+    /// Set by WidgetSnapshot.qualified(by:); not part of the JSON.
+    fileprivate(set) var clusterID = ""
 
+    /// "<cluster>/<node>": node names are only unique within one cluster.
     var id: String {
-        node
+        "\(clusterID)/\(node)"
     }
 
     var gpuTotalValue: Int {
@@ -1681,12 +2494,27 @@ struct WidgetNode: Codable, Identifiable {
         gpuAllocated ?? 0
     }
 
+    var gpuIdleValue: Int {
+        if let gpuIdle {
+            return max(gpuIdle, 0)
+        }
+        return max(gpuTotalValue - gpuAllocatedValue, 0)
+    }
+
+    /// Same rule as the app's SlurmState.isAvailable (SlurmFormatting.swift;
+    /// this target cannot import it, so keep the two lists in step): a
+    /// trailing "*" means not responding, and draining ("drng"), rebooting
+    /// ("boot") or invalid nodes cannot start new work either.
     var isAvailable: Bool {
         let value = state.lowercased()
-        return !value.contains("maint")
-            && !value.contains("down")
-            && !value.contains("drain")
-            && !value.contains("fail")
+        if value.hasSuffix("*") {
+            return false
+        }
+        let unavailableMarkers = [
+            "maint", "down", "drain", "drng", "fail", "not_responding",
+            "inval", "boot", "cancel", "timeout", "out_of_me"
+        ]
+        return !unavailableMarkers.contains { value.contains($0) }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1694,6 +2522,17 @@ struct WidgetNode: Codable, Identifiable {
         case state
         case gpuTotal = "gpu_total"
         case gpuAllocated = "gpu_allocated"
+        case gpuIdle = "gpu_idle"
         case gres
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        node = try container.decodeIfPresent(String.self, forKey: .node) ?? ""
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? ""
+        gpuTotal = try? container.decodeIfPresent(Int.self, forKey: .gpuTotal)
+        gpuAllocated = try? container.decodeIfPresent(Int.self, forKey: .gpuAllocated)
+        gpuIdle = try? container.decodeIfPresent(Int.self, forKey: .gpuIdle)
+        gres = try? container.decodeIfPresent(String.self, forKey: .gres)
     }
 }

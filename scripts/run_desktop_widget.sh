@@ -24,7 +24,9 @@ BUILD_LOG="$ROOT_DIR/.runtime/swift-widget-build.log"
 # reuse the same build products (mode-700 Darwin per-user temp, never a
 # shared world-writable path).
 USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime/")"
-BUILD_DIR="${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}"
+# HPC_SWIFTPM_BUILD_DIR overrides; the pre-rename AIRE_SWIFTPM_BUILD_DIR is
+# still honoured. Keep this line identical to run_macos_app.sh.
+BUILD_DIR="${HPC_SWIFTPM_BUILD_DIR:-${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}}"
 WIDGET_EXECUTABLE="$BUILD_DIR/debug/AIREDesktopWidget"
 mkdir -p "$ROOT_DIR/.runtime"
 
@@ -53,12 +55,13 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$WIDGET_EXECUTABLE" "$MACOS_DIR/AIREDesktopWidget"
-if [[ -f "$ROOT_DIR/assets/AIRELogo.png" ]]; then
-    cp "$ROOT_DIR/assets/AIRELogo.png" "$RESOURCES_DIR/AIRELogo.png"
-fi
-if [[ -f "$ROOT_DIR/assets/AIREMonitor.icns" ]]; then
-    cp "$ROOT_DIR/assets/AIREMonitor.icns" "$RESOURCES_DIR/AIREMonitor.icns"
-fi
+# The widget covers every cluster, so it carries the neutral Leeds HPC mark
+# (header logo) and app icon rather than one cluster's branding.
+for asset in LeedsHPCMark.png LeedsHPCMonitor.icns; do
+    if [[ -f "$ROOT_DIR/assets/$asset" ]]; then
+        cp "$ROOT_DIR/assets/$asset" "$RESOURCES_DIR/$asset"
+    fi
+done
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,17 +73,17 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>local.aire.desktop-widget</string>
     <key>CFBundleName</key>
-    <string>AIRE Desktop Widget</string>
+    <string>Leeds HPC Widget</string>
     <key>CFBundleDisplayName</key>
-    <string>AIRE Desktop Widget</string>
+    <string>Leeds HPC Widget</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
-    <string>AIREMonitor</string>
+    <string>LeedsHPCMonitor</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

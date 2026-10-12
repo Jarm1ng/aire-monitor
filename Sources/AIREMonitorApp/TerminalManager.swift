@@ -4,17 +4,24 @@ import SwiftTerm
 
 // MARK: - SSH argument building
 
-/// Builds `/usr/bin/ssh` invocations that reuse the app's 24h ControlMaster
-/// session. Nothing here ever handles a password: BatchMode suppresses every
-/// prompt. Note that a dead or missing master does NOT make ssh fail fast —
-/// OpenSSH silently falls back to a direct, un-jumped connection — which is
-/// why explicit-mode sessions pre-flight the master with `ssh -O check`
-/// (`masterIsRunning`) before launching.
+/// Builds `/usr/bin/ssh` invocations that reuse one cluster's 24h
+/// ControlMaster session. Nothing here ever handles a password: BatchMode
+/// suppresses every prompt. Note that a dead or missing master does NOT make
+/// ssh fail fast — OpenSSH silently falls back to a direct, un-jumped
+/// connection — which is why every session pre-flights its cluster's master
+/// with `ssh -O check` (`masterIsRunning`) before launching.
 enum SSHTerminalCommand {
-    /// The explicit-mode ControlMaster socket to verify before launching ssh.
-    struct MasterCheck {
+    /// A cluster's ControlMaster socket to verify before launching ssh.
+    struct MasterCheck: Equatable {
         let controlPath: String
         let host: String
+    }
+
+    /// The master a session for `settings` must find alive. Each cluster has
+    /// its own socket (keyed by cluster, user, host and route), so an AIRE
+    /// shell can never ride on Calder's session or vice versa.
+    static func masterCheck(for settings: ConnectionSettings) -> MasterCheck {
+        MasterCheck(controlPath: settings.controlPath, host: settings.hostname)
     }
 
     /// Wraps a value in single quotes for safe interpolation into a remote
@@ -23,26 +30,37 @@ enum SSHTerminalCommand {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// Arguments for an interactive PTY session (`ssh -tt …`), optionally
-    /// running a remote command instead of a login shell.
-    static func terminalArguments(settings: ServerSettings, remoteCommand: String? = nil) -> [String] {
-        var arguments = ["-tt"]
-        if settings.useSSHAlias {
-            arguments.append(settings.sshAlias)
-        } else {
-            arguments.append(contentsOf: [
-                "-S", settings.controlPath,
-                "-o", "User=\(settings.username)",
-                "-o", "BatchMode=yes",
-                "-o", "PasswordAuthentication=no",
-                "-o", "KbdInteractiveAuthentication=no",
-                // A dead master silently falls back to a direct connection;
-                // bound that connect attempt instead of hanging until the
-                // kernel TCP timeout (~75s) on an unreachable login node.
-                "-o", "ConnectTimeout=5",
-                settings.aireHostname
-            ])
+    /// Like `shellQuote`, but leaves a plain ASCII word (letters, digits and
+    /// `-_./:=@+,`) bare. Used for profile-supplied tokens such as partition
+    /// names, so a command typed into the user's shell (and shown as a
+    /// tooltip) reads `sinfo -N -p calder-gpu-hopper`, not a quoted string —
+    /// while anything unexpected is still quoted safely.
+    static func shellWord(_ value: String) -> String {
+        let isPlainWord = !value.isEmpty && value.unicodeScalars.allSatisfy { scalar in
+            scalar.isASCII && (
+                CharacterSet.alphanumerics.contains(scalar) || "-_./:=@+,".unicodeScalars.contains(scalar)
+            )
         }
+        return isPlainWord ? value : shellQuote(value)
+    }
+
+    /// Arguments for an interactive PTY session (`ssh -tt …`) on the cluster
+    /// `settings` describes, optionally running a remote command instead of
+    /// a login shell.
+    static func terminalArguments(settings: ConnectionSettings, remoteCommand: String? = nil) -> [String] {
+        var arguments = [
+            "-tt",
+            "-S", settings.controlPath,
+            "-o", "User=\(settings.username)",
+            "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            // A dead master silently falls back to a direct connection;
+            // bound that connect attempt instead of hanging until the
+            // kernel TCP timeout (~75s) on an unreachable login node.
+            "-o", "ConnectTimeout=5",
+            settings.hostname
+        ]
         if let remoteCommand, !remoteCommand.isEmpty {
             arguments.append(remoteCommand)
         }
@@ -83,16 +101,64 @@ enum SSHTerminalCommand {
     }
 }
 
+// MARK: - Quick commands
+
+/// One quick-command chip. Built per cluster from its `ClusterProfile`, so
+/// partition names and quota tooling always match the cluster the command
+/// runs on: AIRE's `gpu` partition does not exist on Calder, and Calder's
+/// scratch and flash use Lustre project quotas rather than per-user ones.
+struct TerminalQuickCommand: Identifiable, Equatable {
+    let title: String
+    let command: String
+    let systemImage: String
+    /// Full-screen programs must never be typed into an existing shell:
+    /// a later chip's text would land in them as raw keystrokes.
+    var opensDedicatedSession = false
+
+    var id: String { title }
+
+    static func items(for profile: ClusterProfile) -> [TerminalQuickCommand] {
+        var items = [
+            TerminalQuickCommand(title: "My jobs", command: "squeue --me", systemImage: "list.bullet.rectangle"),
+            TerminalQuickCommand(title: "Cluster", command: "sinfo", systemImage: "square.grid.2x2"),
+            TerminalQuickCommand(title: "Quota", command: profile.quotaCommand, systemImage: "internaldrive")
+        ]
+        // A cluster without a GPU partition simply has no GPU chip, rather
+        // than one that always fails with "invalid partition".
+        let gpuPartition = profile.gpuPartition?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !gpuPartition.isEmpty {
+            items.append(
+                TerminalQuickCommand(
+                    title: "GPU nodes",
+                    command: "sinfo -N -p \(SSHTerminalCommand.shellWord(gpuPartition))",
+                    systemImage: "memorychip"
+                )
+            )
+        }
+        items.append(
+            TerminalQuickCommand(
+                title: "htop",
+                command: "htop || top",
+                systemImage: "gauge",
+                opensDedicatedSession: true
+            )
+        )
+        return items
+    }
+}
+
 // MARK: - Terminal appearance
 
 /// Dark, cyan-tinted terminal styling matching the app's glass language.
-/// Terminals stay dark in both app appearances by convention.
+/// Terminals stay dark in both app appearances by convention; which cluster
+/// a terminal belongs to is shown by the surrounding chrome (pills, card
+/// accent), never by recoloring the text surface itself.
 @MainActor
 enum TerminalTheme {
     static let defaultFontSize: CGFloat = 13
     static let fontSizeRange: ClosedRange<CGFloat> = 9...22
 
-    /// Near-black with a cold blue-cyan cast, close to AIRETheme glass in dark mode.
+    /// Near-black with a cold blue-cyan cast, close to AppTheme glass in dark mode.
     static let background = NSColor(srgbRed: 0.043, green: 0.058, blue: 0.078, alpha: 1)
     static let foreground = NSColor(srgbRed: 0.85, green: 0.91, blue: 0.94, alpha: 1)
     static let caret = NSColor(srgbRed: 0.36, green: 0.82, blue: 0.94, alpha: 1)
@@ -186,9 +252,10 @@ enum TerminalExitStatus: Equatable {
     }
 }
 
-/// One SSH terminal session: a live `LocalProcessTerminalView` plus the
-/// arguments needed to restart it after exit. Owned by `TerminalManager`;
-/// the view survives tab switches because the session object does.
+/// One SSH terminal session on one cluster: a live `LocalProcessTerminalView`
+/// plus what is needed to restart it after exit. Owned by that cluster's
+/// `TerminalManager`; the view survives tab and cluster switches because the
+/// session object does.
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable {
     enum Kind: Equatable {
@@ -200,18 +267,36 @@ final class TerminalSession: ObservableObject, Identifiable {
     enum Status: Equatable {
         case running
         case exited(TerminalExitStatus?)
+        /// The pre-flight found no live ControlMaster for this cluster, so
+        /// ssh was never launched. Distinct from `.exited` so the UI can say
+        /// "not connected" and offer a retry instead of a bare exit code.
+        case sessionUnavailable
     }
 
     let id = UUID()
     let kind: Kind
+    /// The cluster this session runs on. A session never moves between
+    /// clusters: a Calder job's log or a /scratch-calder directory does not
+    /// exist on AIRE, and Slurm job ids repeat across clusters.
+    let clusterID: ClusterID
+    /// Display name used in text printed into the terminal itself.
+    let clusterName: String
     @Published var title: String
     @Published private(set) var status: Status = .running
 
     let terminalView: LocalProcessTerminalView
-    private let arguments: [String]
+    /// The remote command (nil for a login shell). Kept apart from the ssh
+    /// arguments so a restart can rebuild the connection half from the
+    /// cluster's current settings (e.g. after a route change) while
+    /// re-running exactly the same command.
+    private let remoteCommand: String?
+    private var arguments: [String]
+    private var masterCheck: SSHTerminalCommand.MasterCheck
     private let environment: [String]
-    private let masterCheck: SSHTerminalCommand.MasterCheck?
     private var delegateAdapter: TerminalProcessDelegateAdapter?
+    /// Set once the session is closed, so a pre-flight still in flight can
+    /// never launch an ssh child into a session nobody can see or close.
+    private var isClosed = false
 
     /// A shell that can receive typed quick commands right now.
     var isLiveShell: Bool {
@@ -221,15 +306,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     init(
         kind: Kind,
         title: String,
-        arguments: [String],
-        fontSize: CGFloat,
-        masterCheck: SSHTerminalCommand.MasterCheck? = nil
+        remoteCommand: String?,
+        settings: ConnectionSettings,
+        fontSize: CGFloat
     ) {
         self.kind = kind
         self.title = title
-        self.arguments = arguments
+        self.clusterID = settings.clusterID
+        self.clusterName = settings.clusterName
+        self.remoteCommand = remoteCommand
+        self.arguments = SSHTerminalCommand.terminalArguments(settings: settings, remoteCommand: remoteCommand)
+        self.masterCheck = SSHTerminalCommand.masterCheck(for: settings)
         self.environment = SSHTerminalCommand.environment()
-        self.masterCheck = masterCheck
         self.terminalView = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         TerminalTheme.apply(to: terminalView, fontSize: fontSize)
 
@@ -242,27 +330,29 @@ final class TerminalSession: ObservableObject, Identifiable {
         terminalView.processDelegate = adapter
     }
 
-    /// Pre-flights the ControlMaster in explicit mode (a dead master would
+    /// Pre-flights this cluster's ControlMaster (a dead master would
     /// otherwise make ssh silently dial the host directly, bypassing the
-    /// jump host), then launches ssh.
+    /// jump host and prompting nobody), then launches ssh.
     func start() {
-        status = .running
-        guard let masterCheck else {
-            launch()
+        guard !isClosed else {
             return
         }
+        status = .running
+        let check = masterCheck
         Task { [weak self] in
-            let alive = await SSHTerminalCommand.masterIsRunning(masterCheck)
-            guard let self else {
+            let alive = await SSHTerminalCommand.masterIsRunning(check)
+            guard let self, !self.isClosed else {
                 return
             }
             if alive {
                 self.launch()
             } else {
+                let name = self.clusterName
                 self.terminalView.feed(
-                    text: "\u{1b}[31mSSH master is not running — reconnect from the app first.\u{1b}[0m\r\n"
+                    text: "\u{1b}[31m\(name) SSH session is not running — "
+                        + "use Connect for \(name) in the sidebar first.\u{1b}[0m\r\n"
                 )
-                self.status = .exited(nil)
+                self.status = .sessionUnavailable
             }
         }
     }
@@ -275,13 +365,27 @@ final class TerminalSession: ObservableObject, Identifiable {
         )
     }
 
-    /// Re-runs the exact same ssh invocation in the same view.
-    func restart() {
-        guard case .exited = status else {
+    /// Re-runs the same command in the same view. With `settings` for this
+    /// session's cluster, the ssh connection is rebuilt from them first, so
+    /// a restart after a route or host change targets the master that is
+    /// live now instead of the socket the session was first opened on.
+    /// Settings for another cluster are ignored rather than trusted.
+    func restart(using settings: ConnectionSettings? = nil) {
+        guard status != .running, !isClosed else {
             return
         }
-        terminalView.feed(text: "\r\n\u{1b}[2m[restarting ssh session]\u{1b}[0m\r\n")
+        if let settings, settings.clusterID == clusterID {
+            arguments = SSHTerminalCommand.terminalArguments(settings: settings, remoteCommand: remoteCommand)
+            masterCheck = SSHTerminalCommand.masterCheck(for: settings)
+        }
+        terminalView.feed(text: "\r\n\u{1b}[2m[restarting ssh session on \(clusterName)]\u{1b}[0m\r\n")
         start()
+    }
+
+    /// Marks the session closed and stops its ssh child.
+    func close() {
+        isClosed = true
+        terminateIfRunning()
     }
 
     /// Terminates the child ssh so closing a session never leaves a zombie.
@@ -311,15 +415,27 @@ final class TerminalSession: ObservableObject, Identifiable {
 
 // MARK: - Manager
 
-/// Owns every terminal session for the app. Held as a `@StateObject` in
-/// `ContentView`, so sessions and their ssh processes survive tab switches.
+/// Owns one cluster's terminal sessions. Every `ClusterSession` holds its
+/// own manager (`session.terminals`), so AIRE and Calder shells are kept
+/// apart and survive both tab switches and switching clusters in the
+/// sidebar. Every entry point takes that cluster's `ConnectionSettings`.
 @MainActor
 final class TerminalManager: ObservableObject {
     @Published private(set) var sessions: [TerminalSession] = []
     @Published var activeSessionID: UUID?
-    @Published private(set) var fontSize: CGFloat = TerminalTheme.defaultFontSize
+    @Published private(set) var fontSize: CGFloat
+
+    /// Text size is a reading preference of the person, not of a cluster:
+    /// zooming in on Calder and then switching to AIRE should not snap the
+    /// text back. Every manager adopts this when shown or when it opens a
+    /// session. In memory only, like the per-manager size it replaces.
+    private static var sharedFontSize = TerminalTheme.defaultFontSize
 
     private var shellCounter = 0
+
+    init() {
+        fontSize = Self.sharedFontSize
+    }
 
     var activeSession: TerminalSession? {
         sessions.first { $0.id == activeSessionID } ?? sessions.last
@@ -331,7 +447,7 @@ final class TerminalManager: ObservableObject {
     /// command replaces itself with a login shell, making the session
     /// indistinguishable from a plain shell (quick-command chips still work).
     @discardableResult
-    func openShell(settings: ServerSettings, startDirectory: String? = nil) -> TerminalSession {
+    func openShell(settings: ConnectionSettings, startDirectory: String? = nil) -> TerminalSession {
         shellCounter += 1
         let title = shellCounter == 1 ? "shell" : "shell \(shellCounter)"
         let remoteCommand = startDirectory.map { directory in
@@ -340,7 +456,11 @@ final class TerminalManager: ObservableObject {
         return open(kind: .shell, title: title, remoteCommand: remoteCommand, settings: settings)
     }
 
-    func openTail(job: Job, settings: ServerSettings) {
+    /// Follows a job's stdout. The path only exists on the job's own cluster
+    /// (a Calder job writes under /scratch-calder), so callers pass that
+    /// cluster's settings; the title needs no cluster prefix because this
+    /// manager only ever holds one cluster's sessions.
+    func openTail(job: Job, settings: ConnectionSettings) {
         guard let path = job.stdoutPath, !path.isEmpty else {
             return
         }
@@ -357,35 +477,39 @@ final class TerminalManager: ObservableObject {
     }
 
     @discardableResult
-    func open(command: String, title: String, settings: ServerSettings) -> TerminalSession {
+    func open(command: String, title: String, settings: ConnectionSettings) -> TerminalSession {
         open(kind: .command(command), title: title, remoteCommand: command, settings: settings)
     }
 
-    /// Activates an existing live shell, opening one only when none exists.
+    /// Activates an existing live shell on this cluster, opening one only
+    /// when none exists.
     @discardableResult
-    func focusOrOpenShell(settings: ServerSettings) -> TerminalSession {
-        if let shell = sessions.last(where: { $0.isLiveShell }) {
+    func focusOrOpenShell(settings: ConnectionSettings) -> TerminalSession {
+        if let shell = sessions.last(where: { $0.isLiveShell && $0.clusterID == settings.clusterID }) {
             activeSessionID = shell.id
             return shell
         }
         return openShell(settings: settings)
     }
 
-    /// Quick-command chips: type into the active live shell when it can
-    /// actually accept keystrokes, otherwise run the command in a fresh
-    /// dedicated session. Full-screen programs (htop) always get their own
-    /// session — typing a later chip into them would land as raw keystrokes.
-    /// The `process.running` gate also covers the window where the ssh child
-    /// has died but the `.exited` status has not landed yet, in which case
-    /// SwiftTerm would silently drop the sent bytes.
+    /// Quick-command chips: type into the active live shell when it is on
+    /// the same cluster and can actually accept keystrokes, otherwise run
+    /// the command in a fresh dedicated session. Full-screen programs (htop)
+    /// always get their own session — typing a later chip into them would
+    /// land as raw keystrokes. The `process.running` gate also covers the
+    /// window where the ssh child has died (or the master pre-flight is
+    /// still running) but the status has not caught up, in which case
+    /// SwiftTerm would silently drop the sent bytes. The cluster gate means
+    /// a Calder `squeue` can never be typed into an AIRE shell.
     func runQuickCommand(
         _ command: String,
         title: String,
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         prefersDedicatedSession: Bool = false
     ) {
         if !prefersDedicatedSession,
            let active = activeSession,
+           active.clusterID == settings.clusterID,
            active.isLiveShell,
            active.terminalView.process.running {
             activeSessionID = active.id
@@ -396,28 +520,43 @@ final class TerminalManager: ObservableObject {
     }
 
     func close(_ session: TerminalSession) {
-        session.terminateIfRunning()
+        session.close()
         sessions.removeAll { $0.id == session.id }
         if activeSessionID == session.id {
             activeSessionID = sessions.last?.id
         }
     }
 
-    func restart(_ session: TerminalSession) {
-        session.restart()
+    /// Restarts an exited session; pass the cluster's current settings so
+    /// the restart follows a route or host change made since it opened.
+    func restart(_ session: TerminalSession, settings: ConnectionSettings? = nil) {
+        session.restart(using: settings)
     }
 
+    /// Steps from the shared size (not this manager's copy), so a step is
+    /// always relative to what the person last chose, on any cluster.
     func adjustFontSize(by delta: CGFloat) {
         let next = min(
-            max(fontSize + delta, TerminalTheme.fontSizeRange.lowerBound),
+            max(Self.sharedFontSize + delta, TerminalTheme.fontSizeRange.lowerBound),
             TerminalTheme.fontSizeRange.upperBound
         )
-        guard next != fontSize else {
+        Self.sharedFontSize = next
+        applyFontSize(next)
+    }
+
+    /// Catches up with a text size chosen while another cluster's terminal
+    /// was on screen. Cheap no-op when already in sync.
+    func adoptSharedFontSize() {
+        applyFontSize(Self.sharedFontSize)
+    }
+
+    private func applyFontSize(_ size: CGFloat) {
+        guard size != fontSize else {
             return
         }
-        fontSize = next
+        fontSize = size
         for session in sessions {
-            session.terminalView.font = TerminalTheme.font(size: next)
+            session.terminalView.font = TerminalTheme.font(size: size)
         }
     }
 
@@ -426,23 +565,15 @@ final class TerminalManager: ObservableObject {
         kind: TerminalSession.Kind,
         title: String,
         remoteCommand: String?,
-        settings: ServerSettings
+        settings: ConnectionSettings
     ) -> TerminalSession {
-        let arguments = SSHTerminalCommand.terminalArguments(
-            settings: settings,
-            remoteCommand: remoteCommand
-        )
+        adoptSharedFontSize()
         let session = TerminalSession(
             kind: kind,
             title: title,
-            arguments: arguments,
-            fontSize: fontSize,
-            masterCheck: settings.useSSHAlias
-                ? nil
-                : SSHTerminalCommand.MasterCheck(
-                    controlPath: settings.controlPath,
-                    host: settings.aireHostname
-                )
+            remoteCommand: remoteCommand,
+            settings: settings,
+            fontSize: fontSize
         )
         sessions.append(session)
         activeSessionID = session.id

@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// Shared design tokens for the AIRE Monitor surfaces.
+/// Shared design tokens for the Leeds HPC Monitor surfaces.
 /// Internal so the menu bar and future surfaces can reuse the same language.
-enum AIRETheme {
+enum AppTheme {
     static let pageBackground = Color(nsColor: .windowBackgroundColor)
     static let panelBackground = Color(nsColor: .controlBackgroundColor)
     static let border = Color.primary.opacity(0.08)
@@ -37,11 +37,11 @@ enum AIRETheme {
 struct DashboardBackdrop: View {
     var body: some View {
         ZStack {
-            AIRETheme.pageBackground
+            AppTheme.pageBackground
             LinearGradient(
                 colors: [
                     Color.primary.opacity(0.035),
-                    AIRETheme.gpu.opacity(0.035),
+                    AppTheme.gpu.opacity(0.035),
                     Color.clear
                 ],
                 startPoint: .topLeading,
@@ -76,8 +76,8 @@ struct GlassCardModifier: ViewModifier {
                     .overlay(alignment: .top) {
                         LinearGradient(
                             colors: [
-                                AIRETheme.glassSheen(for: colorScheme).opacity(isHovered ? 1 : 0.72),
-                                AIRETheme.glassSheen(for: colorScheme).opacity(0.04)
+                                AppTheme.glassSheen(for: colorScheme).opacity(isHovered ? 1 : 0.72),
+                                AppTheme.glassSheen(for: colorScheme).opacity(0.04)
                             ],
                             startPoint: .top,
                             endPoint: .bottom
@@ -90,8 +90,8 @@ struct GlassCardModifier: ViewModifier {
                     .strokeBorder(
                         LinearGradient(
                             colors: [
-                                AIRETheme.glassEdge(for: colorScheme, emphasized: isHovered),
-                                AIRETheme.border,
+                                AppTheme.glassEdge(for: colorScheme, emphasized: isHovered),
+                                AppTheme.border,
                                 accent.opacity(isHovered ? 0.24 : 0.10)
                             ],
                             startPoint: .topLeading,
@@ -102,13 +102,13 @@ struct GlassCardModifier: ViewModifier {
             }
             .clipShape(shape)
             .contentShape(shape)
-            .shadow(color: AIRETheme.cardShadow.opacity(isHovered ? 1 : 0.68), radius: isHovered ? 14 : 9, x: 0, y: isHovered ? 7 : 4)
+            .shadow(color: AppTheme.cardShadow.opacity(isHovered ? 1 : 0.68), radius: isHovered ? 14 : 9, x: 0, y: isHovered ? 7 : 4)
             .scaleEffect(isInteractive && isHovered ? 1.012 : 1)
             .onHover { hovering in
                 guard isInteractive else { return }
                 isHovered = hovering
             }
-            .animation(AIRETheme.softSpring, value: isHovered)
+            .animation(AppTheme.softSpring, value: isHovered)
     }
 }
 
@@ -125,20 +125,28 @@ extension View {
     }
 }
 
-struct AIRELogoMark: View {
+struct AppLogoMark: View {
     var cornerRadius: CGFloat = 8
 
     @Environment(\.colorScheme) private var colorScheme
 
-    /// Loaded once; body no longer performs disk I/O on every render.
+    /// Loaded once; body no longer performs disk I/O on every render. The
+    /// cluster-neutral emblem is preferred; the original AIRE artwork is the
+    /// fallback for bundles assembled by older build scripts.
     @MainActor private static let cachedLogo: NSImage? = {
-        if let url = Bundle.main.url(forResource: "AIRELogo", withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
-            return image
+        for name in ["LeedsHPCMark", "AIRELogo"] {
+            if let url = Bundle.main.url(forResource: name, withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                return image
+            }
         }
         // Fallback that does not depend on the current working directory.
-        if let root = ProcessInfo.processInfo.environment["AIRE_PROJECT_ROOT"] {
-            return NSImage(contentsOfFile: "\(root)/assets/AIRELogo.png")
+        let environment = ProcessInfo.processInfo.environment
+        for key in ["HPC_PROJECT_ROOT", "AIRE_PROJECT_ROOT"] {
+            if let root = environment[key],
+               let image = NSImage(contentsOfFile: "\(root)/assets/LeedsHPCMark.png") {
+                return image
+            }
         }
         return nil
     }()
@@ -152,17 +160,17 @@ struct AIRELogoMark: View {
             } else {
                 Image(systemName: "server.rack")
                     .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(AIRETheme.gpu)
+                    .foregroundStyle(AppTheme.gpu)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(AIRETheme.gpu.opacity(0.12))
+                    .background(AppTheme.gpu.opacity(0.12))
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .stroke(AIRETheme.chipStroke(for: colorScheme), lineWidth: 1)
+                .stroke(AppTheme.chipStroke(for: colorScheme), lineWidth: 1)
         )
         .shadow(color: Color.black.opacity(0.10), radius: 8, x: 0, y: 3)
-        .accessibilityLabel("AIRE logo")
+        .accessibilityLabel("Leeds HPC Monitor logo")
     }
 }

@@ -2,19 +2,24 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Files tab: a Finder-like browser over the app's live SSH session.
+/// Files tab: a Finder-like browser over ONE cluster's live SSH session.
 /// Rendered outside the shared dashboard ScrollView (like the terminal)
 /// because the table manages its own scrolling. All state that must survive
-/// tab switches lives in `FileBrowserModel` up in `ContentView`; the @State
-/// here is transient dialog plumbing only.
+/// tab and sidebar switches lives in the session's `FileBrowserModel`; the
+/// @State here is transient dialog plumbing only.
+///
+/// Every place a path is acted on (dialogs, drop target, preview, banners)
+/// names the cluster: home is the same /users directory on every cluster,
+/// but scratch and flash are not, and an upload or delete aimed at the wrong
+/// cluster is exactly the mistake a multi-cluster browser must prevent.
 struct FilesDashboard: View {
-    @ObservedObject var model: AppModel
+    @ObservedObject var session: ClusterSession
     @ObservedObject var files: FileBrowserModel
-    /// Wired by DashboardView: switches to the terminal tab and opens a
-    /// shell landing in the given remote directory.
+    /// Wired by ClusterDashboardView: switches this cluster's dashboard to
+    /// the terminal tab and opens a shell landing in the given directory.
     var onOpenShellAt: (@MainActor (String) -> Void)? = nil
-    /// Wired by DashboardView: switches to the terminal tab and opens vim
-    /// on the given remote file.
+    /// Wired by ClusterDashboardView: switches to the terminal tab and opens
+    /// vim on the given file over this cluster's session.
     var onOpenVim: (@MainActor (String) -> Void)? = nil
 
     @State private var showNewFolderSheet = false
@@ -31,7 +36,7 @@ struct FilesDashboard: View {
         VStack(alignment: .leading, spacing: 12) {
             PageHeader(
                 title: "Files",
-                subtitle: "Browse and manage files on the AIRE login node over the live SSH session",
+                subtitle: "Browse and manage your \(clusterName) files over its live SSH session",
                 systemImage: "folder",
                 accent: .orange
             ) {
@@ -48,19 +53,27 @@ struct FilesDashboard: View {
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .animation(AIRETheme.smoothEase, value: files.errorBanner)
-        .animation(AIRETheme.smoothEase, value: files.infoBanner)
-        .animation(AIRETheme.smoothEase, value: files.transfers.isEmpty)
+        .animation(AppTheme.smoothEase, value: files.errorBanner)
+        .animation(AppTheme.smoothEase, value: files.infoBanner)
+        .animation(AppTheme.smoothEase, value: files.transfers.isEmpty)
+        // ContentView keys each cluster's dashboard by cluster id, so this
+        // also runs on every sidebar switch to this cluster.
         .onAppear {
-            files.attach(appModel: model)
-            if !files.hasLoadedOnce, !files.isLoading, model.isLoggedIn {
-                files.openHome()
-            }
+            files.reconcileConnectionIdentity()
+            openHomeIfFirstVisit()
+        }
+        .onChange(of: session.isLoggedIn) { _ in
+            // A sign-in may be under a new account or host: drop the old
+            // identity's folder first. Connecting while the tab is open then
+            // lands in Home without an extra click, exactly as opening the
+            // tab on a live session does.
+            files.reconcileConnectionIdentity()
+            openHomeIfFirstVisit()
         }
         .sheet(isPresented: $showNewFolderSheet) {
             NameEntrySheet(
                 title: "New Folder",
-                prompt: "Create a folder in \(files.currentPath)",
+                prompt: "Create a folder in \(files.currentPath) on \(clusterName)",
                 confirmLabel: "Create",
                 initialName: ""
             ) { name in
@@ -78,7 +91,12 @@ struct FilesDashboard: View {
             }
         }
         .sheet(item: $files.activePreview) { preview in
-            FilePreviewSheet(files: files, entry: preview.entry, onOpenVim: onOpenVim)
+            FilePreviewSheet(
+                files: files,
+                profile: session.profile,
+                entry: preview.entry,
+                onOpenVim: onOpenVim
+            )
         }
         .fileImporter(
             isPresented: $showUploadImporter,
@@ -102,7 +120,7 @@ struct FilesDashboard: View {
             Text(trashDialogMessage)
         }
         .confirmationDialog(
-            "Copy items into your home quota?",
+            "Copy \(clusterName) items into your shared home quota?",
             isPresented: quotaTrashDialogBinding,
             titleVisibility: .visible,
             presenting: files.pendingQuotaTrash
@@ -121,7 +139,7 @@ struct FilesDashboard: View {
             Text(quotaTrashMessage(pending))
         }
         .confirmationDialog(
-            "Permanently delete \(deleteCandidates.count) item\(deleteCandidates.count == 1 ? "" : "s")?",
+            "Permanently delete \(deleteCandidates.count) item\(deleteCandidates.count == 1 ? "" : "s") on \(clusterName)?",
             isPresented: $showDeleteStepOne,
             titleVisibility: .visible
         ) {
@@ -130,7 +148,10 @@ struct FilesDashboard: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This skips the server-side trash. You will be asked to confirm once more.")
+            Text(
+                "This skips the server-side trash (\(RemoteFileService.trashDirectoryName)). "
+                    + "You will be asked to confirm once more."
+            )
         }
         .confirmationDialog(
             "This cannot be undone",
@@ -145,7 +166,17 @@ struct FilesDashboard: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(deleteCandidates.map(\.name).prefix(5).joined(separator: ", "))
+            Text(deleteStepTwoMessage)
+        }
+    }
+
+    private var clusterName: String {
+        session.displayName
+    }
+
+    private func openHomeIfFirstVisit() {
+        if !files.hasLoadedOnce, !files.isLoading, session.isLoggedIn {
+            files.openHome()
         }
     }
 
@@ -165,7 +196,7 @@ struct FilesDashboard: View {
             }
             .buttonStyle(.bordered)
             .disabled(files.currentPath.isEmpty)
-            .help("Create a folder in the current directory")
+            .help("Create a folder in the current \(clusterName) directory")
 
             Button {
                 showUploadImporter = true
@@ -174,7 +205,7 @@ struct FilesDashboard: View {
             }
             .buttonStyle(.bordered)
             .disabled(files.currentPath.isEmpty)
-            .help("Upload local files to the current directory")
+            .help("Upload local files to the current \(clusterName) directory")
         }
     }
 
@@ -253,7 +284,7 @@ struct FilesDashboard: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(.thinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .accessibilityLabel("Filter listing")
     }
 
@@ -271,12 +302,13 @@ struct FilesDashboard: View {
                         ) {
                             files.navigate(to: shortcut.path)
                         }
-                        .help(shortcut.path)
+                        .help(shortcut.detail)
+                        .accessibilityHint(shortcut.detail)
                     }
                 }
                 .padding(.vertical, 1)
             }
-            .accessibilityLabel("Location shortcuts")
+            .accessibilityLabel("\(clusterName) location shortcuts")
         }
     }
 
@@ -298,7 +330,12 @@ struct FilesDashboard: View {
     @ViewBuilder
     private var content: some View {
         if !files.hasLoadedOnce && !files.isLoading {
-            FilesHero(isLoggedIn: model.isLoggedIn) {
+            FilesHero(
+                profile: session.profile,
+                state: session.connectionState,
+                isLoggedIn: session.isLoggedIn,
+                spacesSummary: spacesSummary
+            ) {
                 files.openHome()
             }
         } else {
@@ -378,7 +415,7 @@ struct FilesDashboard: View {
         HStack(spacing: 10) {
             ProgressView()
                 .controlSize(.small)
-            Text("Listing \(files.currentPath)")
+            Text("Listing \(files.currentPath) on \(clusterName)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -387,9 +424,9 @@ struct FilesDashboard: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .transition(.opacity)
-        .accessibilityLabel("Loading directory listing")
+        .accessibilityLabel("Loading \(clusterName) directory listing")
     }
 
     private var emptyListingOverlay: some View {
@@ -422,7 +459,7 @@ struct FilesDashboard: View {
                 VStack(spacing: 6) {
                     Image(systemName: "square.and.arrow.down.on.square")
                         .font(.system(size: 30, weight: .medium))
-                    Text("Drop to upload to \(files.currentPath)")
+                    Text("Drop to upload to \(files.currentPath) on \(clusterName)")
                         .font(.callout.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -523,7 +560,7 @@ struct FilesDashboard: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(.thinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .help(usage.path)
         .transition(.opacity)
     }
@@ -545,6 +582,12 @@ struct FilesDashboard: View {
             }
             Button("New Folder…") {
                 showNewFolderSheet = true
+            }
+            if !files.currentPath.isEmpty {
+                Button("Open Shell Here") {
+                    onOpenShellAt?(files.currentPath)
+                }
+                .disabled(onOpenShellAt == nil)
             }
         } else {
             Button("Open") {
@@ -609,7 +652,7 @@ struct FilesDashboard: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(entry.path, forType: .string)
-        files.showInfo("Copied path to clipboard")
+        files.showInfo("Copied the \(clusterName) path \(entry.path) to the clipboard")
     }
 
     private func beginTrash(_ entries: [RemoteFileEntry]) {
@@ -639,7 +682,7 @@ struct FilesDashboard: View {
     /// include rows scrolled away or (before pruning) filtered out, so the
     /// count alone is not enough to know what is being trashed.
     private var trashDialogMessage: String {
-        let note = "Items are moved to a .aire-trash folder on AIRE and can be restored from a shell."
+        let note = trashLocationNote
         guard trashCandidates.count > 1 else {
             return note
         }
@@ -648,6 +691,41 @@ struct FilesDashboard: View {
             names += ", …"
         }
         return "\(names)\n\(note)"
+    }
+
+    /// Where trashed items go, and what they keep costing. Home is one NFS
+    /// export shared by every cluster, so the home trash is the same folder
+    /// everywhere; everything else is trashed beside itself on its own
+    /// filesystem (a rename, never a copy), which keeps counting toward that
+    /// filesystem's quota. Clusters whose snapshot reports Lustre PROJECT
+    /// quotas (Calder scratch and flash) get that called out by name: the
+    /// project quota follows the data, not the folder it sits in.
+    private var trashLocationNote: String {
+        let trash = RemoteFileService.trashDirectoryName
+        var note = "Items move to a \(trash) folder and can be restored with mv from a shell. "
+            + "Home items go to \(RemoteFileService.homeTrashDisplayPath) — one folder seen from "
+            + "\(FileBrowserModel.sharedHomeClusterList), because home is shared. "
+            + "Items elsewhere are moved, never copied, into a \(trash) folder beside them "
+            + "and keep using that filesystem's quota until you empty it."
+        let projectQuotaSpaces = (session.snapshot?.sortedStorage ?? [])
+            .filter { $0.quotaType == "lustre-project" }
+            .map(\.label)
+        if !projectQuotaSpaces.isEmpty {
+            let spaces = ListFormatter.localizedString(byJoining: projectQuotaSpaces)
+            let quota = projectQuotaSpaces.count == 1
+                ? "has a Lustre project quota, which counts"
+                : "have Lustre project quotas, which count"
+            note += " On \(clusterName), \(spaces) \(quota) trashed data too."
+        }
+        return note
+    }
+
+    private var deleteStepTwoMessage: String {
+        var names = deleteCandidates.prefix(5).map(\.name).joined(separator: ", ")
+        if deleteCandidates.count > 5 {
+            names += ", …"
+        }
+        return "On \(clusterName): \(names)"
     }
 
     /// Presents the quota-copy confirmation whenever the model parks a trash
@@ -668,10 +746,28 @@ struct FilesDashboard: View {
     private func quotaTrashMessage(_ pending: FileBrowserModel.PendingQuotaTrash) -> String {
         let count = pending.affectedPaths.count
         let items = "\(count) item\(count == 1 ? "" : "s")"
-        return "No trash folder could be created on the filesystem of \(items). "
-            + "Moving to trash will copy that data into ~/.aire-trash, which counts "
-            + "against your home quota. You can copy anyway, or skip the trash and "
-            + "delete permanently."
+        var paths = pending.affectedPaths.prefix(3).joined(separator: "\n")
+        if count > 3 {
+            paths += "\n…"
+        }
+        return "No \(RemoteFileService.trashDirectoryName) folder could be created beside "
+            + "\(items) on \(clusterName). Moving to trash will copy that data into "
+            + "\(RemoteFileService.homeTrashDisplayPath), which counts against your home quota — "
+            + "one quota shared by \(FileBrowserModel.sharedHomeClusterList). You can copy anyway, "
+            + "or skip the trash and delete permanently.\n\(paths)"
+    }
+
+    /// "home, scratch, and flash" for the first-visit hero: the spaces this
+    /// cluster actually reported (its location shortcuts), falling back to
+    /// the volumes its profile always collects. An optional space, such as
+    /// a flash area with no personal directory yet, is named only once the
+    /// snapshot shows it exists.
+    private var spacesSummary: String {
+        var labels = files.shortcuts.map { $0.label.lowercased() }
+        if labels.isEmpty {
+            labels = session.profile.storage.filter { !$0.optional }.map { $0.label.lowercased() }
+        }
+        return labels.isEmpty ? "home" : ListFormatter.localizedString(byJoining: labels)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -772,7 +868,7 @@ private struct FileNameCell: View {
         case .directory:
             return .orange
         case .symlink:
-            return AIRETheme.gpu
+            return AppTheme.gpu
         default:
             return .secondary
         }
@@ -837,7 +933,7 @@ private struct BreadcrumbView: View {
             .padding(.vertical, 6)
         }
         .background(.thinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Current path")
         .accessibilityValue(path.isEmpty ? "No folder open" : path)
@@ -891,7 +987,7 @@ private struct ShortcutChip: View {
                         .stroke(
                             isCurrent || isHovered
                                 ? Color.orange.opacity(0.35)
-                                : AIRETheme.chipStroke(for: colorScheme),
+                                : AppTheme.chipStroke(for: colorScheme),
                             lineWidth: 1
                         )
                 )
@@ -899,7 +995,7 @@ private struct ShortcutChip: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
-        .animation(AIRETheme.smoothEase, value: isHovered)
+        .animation(AppTheme.smoothEase, value: isHovered)
         .accessibilityLabel(label)
         .accessibilityAddTraits(isCurrent ? [.isButton, .isSelected] : .isButton)
     }
@@ -954,7 +1050,7 @@ private struct TransferChip: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: item.direction == .upload ? "arrow.up.circle" : "arrow.down.circle")
-                .foregroundStyle(item.direction == .upload ? Color.orange : AIRETheme.gpu)
+                .foregroundStyle(item.direction == .upload ? Color.orange : AppTheme.gpu)
             Text(item.filename)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -965,9 +1061,10 @@ private struct TransferChip: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.thinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilitySummary)
+        .help(accessibilitySummary)
     }
 
     @ViewBuilder
@@ -994,14 +1091,16 @@ private struct TransferChip: View {
     }
 
     private var accessibilitySummary: String {
-        let direction = item.direction == .upload ? "Upload" : "Download"
+        let direction = item.direction == .upload
+            ? "Upload of \(item.filename) to \(item.clusterName)"
+            : "Download of \(item.filename) from \(item.clusterName)"
         switch item.state {
         case .running:
-            return "\(direction) of \(item.filename) in progress"
+            return "\(direction) in progress"
         case .done:
-            return "\(direction) of \(item.filename) finished"
+            return "\(direction) finished"
         case .failed(let message):
-            return "\(direction) of \(item.filename) failed: \(message)"
+            return "\(direction) failed: \(message)"
         }
     }
 }
@@ -1100,6 +1199,9 @@ private struct NameEntrySheet: View {
 
 private struct FilePreviewSheet: View {
     @ObservedObject var files: FileBrowserModel
+    /// The cluster the file was listed from: a path like /users/<u>/x is
+    /// valid on every cluster, so the sheet says whose copy it is showing.
+    let profile: ClusterProfile
     let entry: RemoteFileEntry
     var onOpenVim: (@MainActor (String) -> Void)?
 
@@ -1142,12 +1244,17 @@ private struct FilePreviewSheet: View {
                     .font(.title3.weight(.semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(entry.path)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    ClusterBadge(profile: profile, size: 15)
+                    Text(entry.path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(entry.path) on \(profile.displayName)")
             }
 
             Spacer()
@@ -1183,10 +1290,10 @@ private struct FilePreviewSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(12)
             }
-            .background(AIRETheme.mutedFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(AppTheme.mutedFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(AIRETheme.border, lineWidth: 1)
+                    .stroke(AppTheme.border, lineWidth: 1)
             )
 
         case .binary(let mimeType):
@@ -1242,7 +1349,7 @@ private struct FilePreviewSheet: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(onOpenVim == nil)
-                .help("Edit this file with vim over the live SSH session")
+                .help("Edit this file with vim over \(profile.displayName)'s live SSH session")
             }
 
             Button {
@@ -1251,7 +1358,7 @@ private struct FilePreviewSheet: View {
                 Label("Download", systemImage: "arrow.down.circle")
             }
             .buttonStyle(.bordered)
-            .help("Download to your local Downloads folder")
+            .help("Download from \(profile.displayName) to your local Downloads folder")
 
             Spacer()
         }
@@ -1262,7 +1369,11 @@ private struct FilePreviewSheet: View {
 
 /// First-visit hero for the Files tab, in the same voice as TerminalHero.
 private struct FilesHero: View {
+    let profile: ClusterProfile
+    let state: ClusterConnectionState
     let isLoggedIn: Bool
+    /// e.g. "home, scratch, and flash".
+    let spacesSummary: String
     let onOpenHome: () -> Void
 
     var body: some View {
@@ -1270,33 +1381,52 @@ private struct FilesHero: View {
             Spacer(minLength: 16)
 
             VStack(spacing: 14) {
-                Image(systemName: "folder")
-                    .font(.system(size: 34, weight: .medium))
-                    .foregroundStyle(.orange)
+                ZStack(alignment: .bottomTrailing) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 34, weight: .medium))
+                        .foregroundStyle(.orange)
+                    ClusterBadge(profile: profile, size: 20)
+                        .offset(x: 8, y: 6)
+                }
+                .accessibilityHidden(true)
 
                 Text(
                     isLoggedIn
-                        ? "Browse your files on AIRE"
-                        : "The file browser reuses the app's SSH session — log in first."
+                        ? "Browse your files on \(profile.displayName)"
+                        : "Connect to \(profile.displayName) to browse its files"
                 )
                 .font(.headline)
                 .multilineTextAlignment(.center)
 
                 Text(
                     isLoggedIn
-                        ? "List, preview, upload, and organize files in your home and scratch spaces over the existing SSH session — no extra password or Duo push."
-                        : "Once connected, your home and scratch spaces appear here with upload, download, and a server-side trash."
+                        ? "List, preview, upload, and organize files in your \(spacesSummary) spaces "
+                            + "over \(profile.displayName)'s existing SSH session — no extra password or Duo push."
+                        : "Use Connect for \(profile.displayName) in the sidebar. The file browser reuses "
+                            + "\(profile.displayName)'s SSH session, so your \(spacesSummary) spaces then appear "
+                            + "here with upload, download, and a server-side trash."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 400)
 
+                Text(sharingNote)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 400)
+
+                if !isLoggedIn {
+                    ConnectionStatePill(state: state)
+                }
+
                 Button(action: onOpenHome) {
                     Label("Open Home", systemImage: "house")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
+                .help("Open your home directory on \(profile.displayName)")
             }
             .padding(28)
             .frame(maxWidth: 520)
@@ -1305,5 +1435,17 @@ private struct FilesHero: View {
             Spacer(minLength: 16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Which of the spaces are shared, derived from the profile's storage
+    /// kinds rather than hard-coded paths.
+    private var sharingNote: String {
+        let hasClusterOnlySpaces = profile.storage.contains {
+            !StorageKind(label: $0.label).isSharedAcrossClusters
+        }
+        let shared = "Home is shared: the same files on \(FileBrowserModel.sharedHomeClusterList)"
+        return hasClusterOnlySpaces
+            ? "\(shared); the other spaces belong to \(profile.displayName) alone."
+            : "\(shared)."
     }
 }

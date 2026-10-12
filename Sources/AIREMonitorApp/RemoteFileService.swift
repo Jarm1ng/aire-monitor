@@ -87,22 +87,59 @@ private struct RemoteErrorPayload: Decodable {
 /// never become flags, and listings use a remote-python JSON protocol (the
 /// target path travels as a python argv element, never inside the script).
 ///
-/// All operations run through `MonitorService.runRemoteCommand` /
-/// `runTransfer`, which pre-flight the explicit-mode ControlMaster with
-/// `ssh -O check` so a dead session throws "SSH session expired — use Login
-/// to reconnect." instantly instead of hanging.
+/// The service is stateless and cluster-agnostic: every call takes the
+/// `ConnectionSettings` of the cluster it targets, and all operations run
+/// through `MonitorService.runRemoteCommand` / `runTransfer` over THAT
+/// cluster's ControlMaster. Both pre-flight the master with `ssh -O check`,
+/// so a dead session throws "<Cluster> SSH session expired — …" instantly
+/// instead of hanging.
+///
+/// Remote environment contract (holds on AIRE and on Calder's Rocky 9 login
+/// nodes): an sh-compatible login shell (bash is the Leeds default), GNU
+/// coreutils (`stat -c`, `du`, `head -c`, `mkdir`/`mv`/`rm` with `--`) and
+/// Python 3.6 or newer for the JSON listing (Calder ships 3.9). `file(1)` is
+/// optional: previews fall back to sniffing the content when it is missing.
 struct RemoteFileService: Sendable {
     private let monitor = MonitorService()
 
     private static let entryCap = 4000
 
+    /// Name of the server-side trash folder. It keeps the `.aire-trash`
+    /// name from the single-cluster app so everything trashed by earlier
+    /// versions stays exactly where users expect to find it.
+    ///
+    /// Home (/users/$USER) is ONE NFS export mounted on every Leeds cluster,
+    /// so `~/.aire-trash` is the same folder whether an item was trashed from
+    /// AIRE or from Calder. Items on another filesystem (scratch, flash) get
+    /// a folder of this name beside them instead — see `moveToTrash`.
+    static let trashDirectoryName = ".aire-trash"
+
+    /// `~/.aire-trash`, for user-facing text — one folder, whichever
+    /// cluster's Files tab is showing it.
+    static var homeTrashDisplayPath: String {
+        "~/\(trashDirectoryName)"
+    }
+
+    /// Exit status a POSIX shell reports when a command is not installed.
+    private static let commandNotFoundExitCode: Int32 = 127
+
     // MARK: Listing protocol
 
-    /// Runs remotely as `python3 -c <script> <path> <showHidden>`. The target
-    /// path and the hidden flag arrive via sys.argv — they are never
-    /// interpolated into the script body. Emits exactly one JSON object on
-    /// stdout; on failure emits {"error": "..."} and exits 3. Names with
-    /// invalid UTF-8 are sanitized (U+FFFD) so the JSON always parses.
+    /// Runs remotely as `python3 -I -c <script> <path> <showHidden>` (see
+    /// `pythonCommand`). The target path and the hidden flag arrive via
+    /// sys.argv — they are never interpolated into the script body. Emits
+    /// exactly one JSON object on stdout; on failure emits {"error": "..."}
+    /// and exits 3. Names with invalid UTF-8 are sanitized (U+FFFD) so the
+    /// JSON always parses, and `json.dumps` escapes everything else to
+    /// ASCII, so the output is independent of the remote locale.
+    ///
+    /// Deliberately restricted to Python 3.6 features — no walrus (3.8),
+    /// `str.removeprefix` (3.9), `match` or `X | Y` unions (3.10), and no
+    /// f-strings either; `os.scandir` as a context manager (3.6) is the
+    /// newest construct — so it runs on Calder's system python3 3.9 and on
+    /// older login nodes alike. It is exercised against /usr/bin/python3 3.9
+    /// through bash, sh and zsh, including hostile path arguments, modules
+    /// planted in the working directory, and the entry cap.
     private static let listingScript = """
     import json, os, pwd, stat, sys
 
@@ -194,10 +231,28 @@ struct RemoteFileService: Sendable {
     sys.stdout.write(os.path.realpath(os.path.expanduser("~")))
     """
 
+    /// Remote command running one of the embedded scripts.
+    ///
+    /// Prefers the system interpreter `/usr/bin/python3` (3.9 on Calder's
+    /// Rocky 9 login nodes) over whatever `python3` a user's conda or module
+    /// initialisation puts first on PATH, and falls back to the PATH lookup
+    /// where no system interpreter exists. `-I` (isolated mode) ignores
+    /// PYTHONPATH/PYTHONHOME and user site-packages and, crucially for `-c`,
+    /// keeps the remote working directory — the home directory — off
+    /// sys.path, so a stray ~/json.py or ~/stat.py can never shadow the
+    /// standard modules the scripts import. Arguments are shell-quoted here;
+    /// the script reads them from sys.argv.
+    private func pythonCommand(script: String, arguments: [String] = []) -> String {
+        let quotedArguments = arguments.map { " " + shellQuote($0) }.joined()
+        return "hpc_python=python3; "
+            + "if [ -x /usr/bin/python3 ]; then hpc_python=/usr/bin/python3; fi; "
+            + "\"$hpc_python\" -I -c \(shellQuote(script))\(quotedArguments)"
+    }
+
     // MARK: Public API
 
-    func homeDirectory(settings: ServerSettings) async throws -> String {
-        let command = "python3 -c \(shellQuote(Self.homeScript))"
+    func homeDirectory(settings: ConnectionSettings) async throws -> String {
+        let command = pythonCommand(script: Self.homeScript)
         let result = try await monitor.runRemoteCommand(
             settings: settings,
             command: command,
@@ -211,13 +266,15 @@ struct RemoteFileService: Sendable {
     }
 
     func listDirectory(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         path: String,
         showHidden: Bool
     ) async throws -> RemoteDirectoryListing {
         let target = path.isEmpty ? "~" : path
-        let command = "python3 -c \(shellQuote(Self.listingScript))"
-            + " \(shellQuote(target)) \(showHidden ? "1" : "0")"
+        let command = pythonCommand(
+            script: Self.listingScript,
+            arguments: [target, showHidden ? "1" : "0"]
+        )
         let result = try await monitor.runRemoteCommand(
             settings: settings,
             command: command,
@@ -263,7 +320,7 @@ struct RemoteFileService: Sendable {
         )
     }
 
-    func createDirectory(settings: ServerSettings, path: String) async throws {
+    func createDirectory(settings: ConnectionSettings, path: String) async throws {
         let target = try requireNonEmptyPath(path, operation: "Create folder")
         let result = try await monitor.runRemoteCommand(
             settings: settings,
@@ -278,7 +335,7 @@ struct RemoteFileService: Sendable {
     /// Renames/moves a single entry. Fails when the target already exists
     /// (checked server-side with `test -e`/`test -L` in the same command, so
     /// broken symlinks are also refused).
-    func rename(settings: ServerSettings, from: String, to: String) async throws {
+    func rename(settings: ConnectionSettings, from: String, to: String) async throws {
         let source = try requireNonEmptyPath(from, operation: "Rename")
         let target = try requireNonEmptyPath(to, operation: "Rename")
         let command = "if [ -e \(shellQuote(target)) ] || [ -L \(shellQuote(target)) ]; "
@@ -298,10 +355,11 @@ struct RemoteFileService: Sendable {
     }
 
     /// Thrown by `moveToTrash` when cross-filesystem items cannot get a
-    /// `.aire-trash` folder on their own filesystem: proceeding would COPY
-    /// the data into the home-quota trash (small on HPC). Callers confirm
-    /// with the user, then retry with `allowQuotaCopy: true` — or offer
-    /// permanent delete instead. Nothing has been moved when this is thrown.
+    /// trash folder on their own filesystem: proceeding would COPY the data
+    /// into the home trash, and home is a small quota (65 GiB) shared by
+    /// every cluster. Callers confirm with the user, then retry with
+    /// `allowQuotaCopy: true` — or offer permanent delete instead. Nothing
+    /// has been moved when this is thrown.
     struct QuotaCopyConfirmationRequired: Error, LocalizedError {
         let paths: [String]
 
@@ -312,29 +370,41 @@ struct RemoteFileService: Sendable {
     }
 
     /// Moves paths into fresh, per-operation server-side trash directories
-    /// (`<…>/.aire-trash/<timestamp>-<uuid8>/`) and returns every trash
-    /// directory used. This is the default "delete": recoverable with a
-    /// plain `mv` back.
+    /// (`<…>/<trashDirectoryName>/<timestamp>-<uuid8>/`) and returns every
+    /// trash directory used. This is the default "delete": recoverable with
+    /// a plain `mv` back.
     ///
-    /// Same-filesystem sources go to `~/.aire-trash` (atomic rename).
-    /// Cross-filesystem sources (e.g. scratch) get a trash directory next to
-    /// the source (`<parent>/.aire-trash/…`) so the `mv` is still a rename
-    /// and never copies data into the home quota. Only when that directory
-    /// cannot be created does the move fall back to a copy into
-    /// `~/.aire-trash` — gated on `allowQuotaCopy` (see
-    /// `QuotaCopyConfirmationRequired`) and run with a size-scaled timeout.
+    /// Same-filesystem sources go to `~/<trashDirectoryName>` (atomic
+    /// rename) — the shared home, so the same folder on every cluster.
+    /// Cross-filesystem sources (AIRE /mnt/scratch, Calder /scratch-calder
+    /// and /flash-calder) get a trash directory next to the source
+    /// (`<parent>/<trashDirectoryName>/…`) so the `mv` is still a rename and
+    /// never copies data into the home quota. Trashed data therefore keeps
+    /// counting toward that filesystem's quota — on Calder a Lustre PROJECT
+    /// quota, which follows the files, not the folder name — until the user
+    /// empties it. Only when that directory cannot be created does the move
+    /// fall back to a copy into `~/<trashDirectoryName>` — gated on
+    /// `allowQuotaCopy` (see `QuotaCopyConfirmationRequired`) and run with a
+    /// size-scaled timeout.
+    ///
+    /// The source/home device comparison is made per call against the home
+    /// directory resolved over THIS cluster's session, so it is correct for
+    /// whichever cluster `settings` names.
     func moveToTrash(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         paths: [String],
         allowQuotaCopy: Bool = false
     ) async throws -> [String] {
         let home = try await homeDirectory(settings: settings)
         let targets = try validatedTargets(paths, home: home, operation: "Move to trash")
         let runName = Self.trashRunName()
-        let homeTrash = "\(home)/.aire-trash/\(runName)"
+        let homeTrash = Self.joinPath(
+            Self.trimTrailingSlashes(home),
+            "\(Self.trashDirectoryName)/\(runName)"
+        )
 
         // The device of each source vs. the home filesystem decides whether
-        // `mv` into ~/.aire-trash is an atomic rename (same device) or a
+        // `mv` into the home trash is an atomic rename (same device) or a
         // copy+unlink (cross-device). When devices cannot be determined the
         // sources are treated as same-device — prior behavior.
         let devices = await deviceIDs(settings: settings, paths: [home] + targets)
@@ -362,7 +432,7 @@ struct RemoteFileService: Sendable {
         var perMountMoves: [(trashDirectory: String, targets: [String])] = []
         var quotaCopyTargets: [String] = []
         for (parent, group) in crossDeviceGroups.sorted(by: { $0.key < $1.key }) {
-            let trashDirectory = "\(parent)/.aire-trash/\(runName)"
+            let trashDirectory = Self.joinPath(parent, "\(Self.trashDirectoryName)/\(runName)")
             let mkdir = try await monitor.runRemoteCommand(
                 settings: settings,
                 command: "mkdir -p -- \(shellQuote(trashDirectory))",
@@ -451,7 +521,7 @@ struct RemoteFileService: Sendable {
     /// anything that is not an absolute path, and any path with `.`/`..`/
     /// empty components (dot-segment aliases of protected locations) —
     /// defense in depth.
-    func deletePermanently(settings: ServerSettings, paths: [String]) async throws {
+    func deletePermanently(settings: ConnectionSettings, paths: [String]) async throws {
         let home = try await homeDirectory(settings: settings)
         let targets = try validatedTargets(paths, home: home, operation: "Delete")
         let quotedTargets = targets.map(shellQuote).joined(separator: " ")
@@ -466,24 +536,30 @@ struct RemoteFileService: Sendable {
     }
 
     func preview(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         path: String,
         maxBytes: Int
     ) async throws -> RemoteFilePreview {
         let target = try requireNonEmptyPath(path, operation: "Preview")
         let cap = max(1, maxBytes)
 
+        // `file(1)` is not part of coreutils and may be absent from a
+        // minimal login-node image. The shell then reports 127 and the
+        // preview decides text vs. binary from the bytes themselves.
         let mimeResult = try await monitor.runRemoteCommand(
             settings: settings,
             command: "file -b --mime-type -- \(shellQuote(target))",
             timeout: 20
         )
-        guard mimeResult.exitCode == 0 else {
-            throw Self.failure("Could not inspect \(target)", mimeResult)
-        }
-        let mime = mimeResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard mime.hasPrefix("text/") || mime == "inode/x-empty" else {
-            return .binary(mimeType: mime.isEmpty ? "application/octet-stream" : mime)
+        let sniffContent = mimeResult.exitCode == Self.commandNotFoundExitCode
+        if !sniffContent {
+            guard mimeResult.exitCode == 0 else {
+                throw Self.failure("Could not inspect \(target)", mimeResult)
+            }
+            let mime = mimeResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard mime.hasPrefix("text/") || mime == "inode/x-empty" else {
+                return .binary(mimeType: mime.isEmpty ? "application/octet-stream" : mime)
+            }
         }
 
         let size = try await fileSize(settings: settings, path: target)
@@ -500,6 +576,9 @@ struct RemoteFileService: Sendable {
             throw Self.failure("Could not read \(target)", headResult)
         }
         var text = headResult.stdout
+        if sniffContent, Self.looksBinary(text) {
+            return .binary(mimeType: "application/octet-stream")
+        }
         // When the byte cap truncated the file mid-codepoint, the lossy
         // decode ends the text with a replacement character that is purely a
         // truncation artifact — drop it. Untruncated files keep theirs.
@@ -509,8 +588,26 @@ struct RemoteFileService: Sendable {
         return .text(text)
     }
 
+    /// Content sniff used only when `file(1)` is unavailable: NUL bytes, or
+    /// more than one in twenty characters failing UTF-8 decoding (they
+    /// arrive as U+FFFD from the lossy stdout decode), mean binary.
+    private static func looksBinary(_ text: String) -> Bool {
+        var scalars = 0
+        var replacements = 0
+        for scalar in text.unicodeScalars {
+            if scalar == "\0" {
+                return true
+            }
+            scalars += 1
+            if scalar == "\u{FFFD}" {
+                replacements += 1
+            }
+        }
+        return replacements > max(8, scalars / 20)
+    }
+
     /// Human-readable recursive size, e.g. "1.2G".
-    func diskUsage(settings: ServerSettings, path: String) async throws -> String {
+    func diskUsage(settings: ConnectionSettings, path: String) async throws -> String {
         let target = try requireNonEmptyPath(path, operation: "Disk usage")
         let result = try await monitor.runRemoteCommand(
             settings: settings,
@@ -534,7 +631,7 @@ struct RemoteFileService: Sendable {
     }
 
     func download(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         remotePath: String,
         toLocalDirectory: URL
     ) async throws -> URL {
@@ -576,7 +673,7 @@ struct RemoteFileService: Sendable {
     }
 
     func upload(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         localFile: URL,
         toRemoteDirectory: String
     ) async throws {
@@ -646,12 +743,16 @@ struct RemoteFileService: Sendable {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// Rejects blank paths but returns the path UNCHANGED. Remote names may
+    /// legitimately be, start with, or end in whitespace or a newline
+    /// (Linux allows any byte but "/" and NUL): trimming "/users/u/proj/ "
+    /// would turn "delete the file named ' '" into "delete /users/u/proj".
+    /// Names the user types are trimmed and validated by the callers.
     private func requireNonEmptyPath(_ path: String, operation: String) throws -> String {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MonitorError.processFailed("\(operation): no path given.")
         }
-        return trimmed
+        return path
     }
 
     /// Shared guard for trash/delete: expands a leading `~`, then refuses
@@ -672,6 +773,15 @@ struct RemoteFileService: Sendable {
             let trimmed = try requireNonEmptyPath(raw, operation: operation)
             let expanded = Self.expandLeadingTilde(trimmed, home: normalizedHome)
             let normalized = Self.trimTrailingSlashes(expanded)
+            // Defense in depth for destructive operations: normalisation may
+            // only ever drop trailing "/" characters. Anything else means the
+            // command would act on a different path than the one selected.
+            guard expanded.hasPrefix(normalized),
+                  expanded.dropFirst(normalized.count).allSatisfy({ $0 == "/" }) else {
+                throw MonitorError.processFailed(
+                    "\(operation) refused for \(trimmed): the path does not normalise safely."
+                )
+            }
             guard normalized.contains("/") else {
                 throw MonitorError.processFailed(
                     "\(operation) refused for \(trimmed): not an absolute path."
@@ -723,7 +833,7 @@ struct RemoteFileService: Sendable {
 
     // MARK: Helpers
 
-    private func expandTilde(_ path: String, settings: ServerSettings) async throws -> String {
+    private func expandTilde(_ path: String, settings: ConnectionSettings) async throws -> String {
         let home = try await homeDirectory(settings: settings)
         return Self.expandLeadingTilde(path, home: Self.trimTrailingSlashes(home))
     }
@@ -733,7 +843,7 @@ struct RemoteFileService: Sendable {
     /// scaling for symlinked files). Returns nil when the output is not a
     /// number; throws for broken symlinks (`stat -L` fails), which callers
     /// treat as unknown size via `try?`.
-    private func fileSize(settings: ServerSettings, path: String) async throws -> Int64? {
+    private func fileSize(settings: ConnectionSettings, path: String) async throws -> Int64? {
         let result = try await monitor.runRemoteCommand(
             settings: settings,
             command: "stat -Lc %s -- \(shellQuote(path))",
@@ -751,7 +861,7 @@ struct RemoteFileService: Sendable {
     /// means the device probe as a whole failed and callers should fall
     /// back to same-device behavior.
     private func deviceIDs(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         paths: [String]
     ) async -> [String?]? {
         guard !paths.isEmpty else {
@@ -782,7 +892,7 @@ struct RemoteFileService: Sendable {
     /// while still printing usable totals) and returns nil when nothing
     /// parses.
     private func totalSizeBytes(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         paths: [String]
     ) async -> Int64? {
         guard !paths.isEmpty else {
@@ -814,40 +924,56 @@ struct RemoteFileService: Sendable {
         return parent.isEmpty ? "/" : parent
     }
 
+    /// Joins without doubling the slash when `directory` is the root.
+    private static func joinPath(_ directory: String, _ relative: String) -> String {
+        directory == "/" ? "/\(relative)" : "\(directory)/\(relative)"
+    }
+
     private enum TransferDirection {
         case download
         case upload
     }
 
     /// scp argv. scp-over-SFTP (OpenSSH 9+) does NOT shell-expand remote
-    /// paths, so the remote spec travels as ONE argv element with no extra
-    /// quoting layer — spaces and metacharacters are safe as-is.
+    /// paths, so the remote spec travels as ONE argv element with no shell
+    /// quoting layer — spaces and shell metacharacters are safe as-is. It
+    /// DOES glob the source of a download (remote_glob with GLOB_NOCHECK), so
+    /// for downloads `\ * ? [` are backslash-escaped: otherwise fetching
+    /// "data[1].csv" would silently deliver data1.csv under that name.
     private func scpArguments(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         remotePath: String,
         localPath: String,
         direction: TransferDirection
     ) -> [String] {
-        // BatchMode in BOTH modes, matching runRemoteCommand's no-prompt
-        // contract: a dead alias-side master must fail fast instead of
-        // prompting for a password/Duo push (or stalling on SSH_ASKPASS).
-        var arguments = ["-q", "-o", "BatchMode=yes"]
-        let remoteSpec: String
-        if settings.useSSHAlias {
-            remoteSpec = "\(settings.sshAlias):\(remotePath)"
-        } else {
-            arguments.append(contentsOf: [
-                "-o", "ControlPath=\(settings.controlPath)",
-                "-o", "ConnectTimeout=5",
-                "-o", "User=\(settings.username)"
-            ])
-            remoteSpec = "\(settings.aireHostname):\(remotePath)"
-        }
+        // BatchMode, matching runRemoteCommand's no-prompt contract: a dead
+        // master must fail fast instead of prompting for a password/Duo push
+        // (or stalling on SSH_ASKPASS). ControlMaster=no, also as there:
+        // a stray `ControlMaster auto` in ~/.ssh/config must never let scp
+        // spawn a second master for this cluster. The ControlPath and host
+        // both come from the target cluster's settings, so a transfer can
+        // only ever ride that cluster's authenticated session. `--` ends
+        // option parsing before the (absolute, untrusted) path operands.
+        var arguments = [
+            "-q",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=\(settings.controlPath)",
+            "-o", "ControlMaster=no",
+            "-o", "ConnectTimeout=5",
+            "-o", "User=\(settings.username)",
+            "--"
+        ]
         switch direction {
         case .download:
-            arguments.append(contentsOf: [remoteSpec, localPath])
+            let escaped = remotePath
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "*", with: "\\*")
+                .replacingOccurrences(of: "?", with: "\\?")
+                .replacingOccurrences(of: "[", with: "\\[")
+            arguments.append(contentsOf: ["\(settings.hostname):\(escaped)", localPath])
         case .upload:
-            arguments.append(contentsOf: [localPath, remoteSpec])
+            // Upload targets are not globbed.
+            arguments.append(contentsOf: [localPath, "\(settings.hostname):\(remotePath)"])
         }
         return arguments
     }

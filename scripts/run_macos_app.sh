@@ -24,7 +24,10 @@ BUILD_LOG="$ROOT_DIR/.runtime/swift-build.log"
 # world-writable). Some backup/sync tools watching the project volume break
 # llbuild's SQLite database mid-build; the per-user temp volume is immune.
 USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime/")"
-BUILD_DIR="${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}"
+# HPC_SWIFTPM_BUILD_DIR overrides; the pre-rename AIRE_SWIFTPM_BUILD_DIR is
+# still honoured. The scratch dir name is unchanged so existing incremental
+# build state is reused.
+BUILD_DIR="${HPC_SWIFTPM_BUILD_DIR:-${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}}"
 APP_EXECUTABLE="$BUILD_DIR/debug/AIREMonitorApp"
 mkdir -p "$ROOT_DIR/.runtime"
 
@@ -53,12 +56,11 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$APP_EXECUTABLE" "$MACOS_DIR/AIREMonitorApp"
-if [[ -f "$ROOT_DIR/assets/AIRELogo.png" ]]; then
-    cp "$ROOT_DIR/assets/AIRELogo.png" "$RESOURCES_DIR/AIRELogo.png"
-fi
-if [[ -f "$ROOT_DIR/assets/AIREMonitor.icns" ]]; then
-    cp "$ROOT_DIR/assets/AIREMonitor.icns" "$RESOURCES_DIR/AIREMonitor.icns"
-fi
+for asset in LeedsHPCMark.png LeedsHPCMonitor.icns; do
+    if [[ -f "$ROOT_DIR/assets/$asset" ]]; then
+        cp "$ROOT_DIR/assets/$asset" "$RESOURCES_DIR/$asset"
+    fi
+done
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,17 +72,17 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>local.aire.monitor</string>
     <key>CFBundleName</key>
-    <string>AIRE Monitor</string>
+    <string>Leeds HPC Monitor</string>
     <key>CFBundleDisplayName</key>
-    <string>AIRE Monitor</string>
+    <string>Leeds HPC Monitor</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
-    <string>AIREMonitor</string>
+    <string>LeedsHPCMonitor</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

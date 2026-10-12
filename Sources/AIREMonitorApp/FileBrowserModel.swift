@@ -15,7 +15,8 @@ extension RemoteFileEntry {
 
     /// Double-clicking these attempts navigation. Symlinks are included
     /// because directory links (e.g. a scratch link in $HOME) are the common
-    /// case on AIRE; a file symlink surfaces a listing error banner instead.
+    /// case on the Leeds clusters; a file symlink surfaces a listing error
+    /// banner instead.
     var isNavigable: Bool {
         kind == .directory || kind == .symlink
     }
@@ -56,11 +57,17 @@ extension RemoteFileEntry {
 
 // MARK: - Model
 
-/// UI state for the Files tab. All remote I/O routes through
+/// UI state for one cluster's Files tab. All remote I/O routes through
 /// `RemoteFileService`, which owns shell quoting and the remote-python JSON
 /// listing protocol — this model never interpolates remote file names into
-/// command strings itself. Owned as a `@StateObject` by `ContentView` so
-/// navigation history, listings, and transfers survive tab switches.
+/// command strings itself.
+///
+/// Each `ClusterSession` owns exactly one browser (attached at creation), so
+/// a path, history entry, preview or transfer can never be replayed against
+/// the other cluster's filesystem: every operation captures the session's
+/// `ConnectionSettings` at the moment it starts. Living on the session also
+/// means navigation history, listings and transfers survive tab and sidebar
+/// switches.
 @MainActor
 final class FileBrowserModel: ObservableObject {
 
@@ -81,14 +88,35 @@ final class FileBrowserModel: ObservableObject {
         let id = UUID()
         let filename: String
         let direction: Direction
+        /// Cluster the transfer runs against, for status text.
+        let clusterName: String
         var state: Phase = .running
     }
 
+    /// A location chip: Home first, then the cluster's storage spaces.
     struct Shortcut: Identifiable {
         let label: String
         let path: String
-        let icon: String
+        let kind: StorageKind
+        /// Tooltip: the path plus what kind of space it is (shared home,
+        /// cluster-only scratch with a project quota, …).
+        let detail: String
+        var icon: String { kind.systemImage }
         var id: String { "\(label)|\(path)" }
+    }
+
+    /// Who and where the browser talks to: the account and the login host.
+    /// The route is deliberately not part of it — direct or through rash,
+    /// the same account on the same host sees the same filesystem, so a
+    /// route switch keeps the cached home and the open folder.
+    struct ConnectionIdentity: Equatable {
+        let username: String
+        let hostname: String
+
+        init(_ settings: ConnectionSettings) {
+            username = settings.username
+            hostname = settings.hostname.lowercased()
+        }
     }
 
     struct DiskUsageResult: Equatable {
@@ -112,12 +140,13 @@ final class FileBrowserModel: ObservableObject {
     }
 
     /// A trash request that needs user confirmation first: some items sit on
-    /// a filesystem where no `.aire-trash` folder could be created, so
-    /// trashing them would COPY the data into the home quota. The UI offers
-    /// Copy to Home Trash / Delete Permanently / Cancel.
+    /// a filesystem where no `RemoteFileService.trashDirectoryName` folder
+    /// could be created, so trashing them would COPY the data into the home
+    /// quota (one quota shared by every cluster). The UI offers Copy to Home
+    /// Trash / Delete Permanently / Cancel.
     struct PendingQuotaTrash {
         let entries: [RemoteFileEntry]
-        /// Subset of paths that would be copied into ~/.aire-trash.
+        /// Subset of paths that would be copied into the home trash.
         let affectedPaths: [String]
     }
 
@@ -165,10 +194,19 @@ final class FileBrowserModel: ObservableObject {
     // MARK: Private state
 
     private let service = RemoteFileService()
-    private weak var appModel: AppModel?
-    /// Resolved once per attach from the remote side (`$HOME`); never derived
-    /// from a hardcoded `/users/<name>` pattern.
-    private var homePath: String?
+    private weak var session: ClusterSession?
+    /// The remote `$HOME` (resolved with realpath on the login node; never
+    /// derived from a hardcoded `/users/<name>` pattern), tagged with the
+    /// connection identity it was resolved for. A different account or login
+    /// host misses the cache and resolves again, so changing the username, or
+    /// the cluster's host under Advanced, can never send Home to the previous
+    /// account's directory.
+    private var resolvedHome: (identity: ConnectionIdentity, path: String)?
+    /// Identity of the most recent listing REQUEST — what the open folder,
+    /// history and selection belong to. Recorded at request time (not on
+    /// success) so a navigation started just before the tab appears, such
+    /// as Browse workdir from a job sheet, is never mistaken for stale.
+    private var browsedIdentity: ConnectionIdentity?
     private var loadGeneration = 0
     private var bannerDismissTask: Task<Void, Never>?
 
@@ -178,20 +216,78 @@ final class FileBrowserModel: ObservableObject {
 
     // MARK: Wiring
 
-    /// Idempotent: called from every entry point (tab appear, Jobs deep
-    /// link) so the model always has settings and storage labels to hand.
-    func attach(appModel: AppModel) {
-        if self.appModel !== appModel {
-            self.appModel = appModel
+    /// Binds the browser to its cluster. Each `ClusterSession` owns one
+    /// browser and attaches it once at creation, so paths, history and
+    /// transfers never mix between clusters.
+    func attach(session: ClusterSession) {
+        if self.session !== session {
+            self.session = session
         }
     }
 
-    private func settings() -> ServerSettings? {
-        guard let appModel else {
-            showError("File browser is not connected to the app model yet.")
+    private func settings() -> ConnectionSettings? {
+        guard let session else {
+            showError("The file browser is not attached to a cluster session yet.")
             return nil
         }
-        return appModel.settings
+        return session.settings
+    }
+
+    /// Cluster name for banner and status text, so a message can never be
+    /// mistaken for the other cluster's.
+    private var clusterName: String {
+        session?.displayName ?? "the cluster"
+    }
+
+    /// The cached home, only while it belongs to the current connection
+    /// identity.
+    private var homePath: String? {
+        guard let resolvedHome, let session,
+              resolvedHome.identity == ConnectionIdentity(session.settings) else {
+            return nil
+        }
+        return resolvedHome.path
+    }
+
+    /// True while the session still connects as `identity`.
+    private func isCurrent(_ identity: ConnectionIdentity) -> Bool {
+        session.map { ConnectionIdentity($0.settings) } == identity
+    }
+
+    /// "AIRE and Calder": every cluster that mounts the shared /users home,
+    /// taken from the catalog so a new cluster is named automatically. Used
+    /// by the Home shortcut and by the trash wording in the view.
+    nonisolated static var sharedHomeClusterList: String {
+        ListFormatter.localizedString(byJoining: ClusterCatalog.all.map(\.displayName))
+    }
+
+    /// Drops the open folder, history, selection and pending dialogs when
+    /// they were produced under a different account or login host than the
+    /// session now uses: another account's paths are not this account's to
+    /// act on, and Back must never replay them. The view calls this when it
+    /// appears and when the session signs in or out — deliberately NOT on
+    /// every identity change, because the host field in the sidebar edits
+    /// the identity per keystroke while the Files tab may be on screen.
+    /// Transfers are left alone: each captured its own settings and names
+    /// its cluster.
+    func reconcileConnectionIdentity() {
+        guard let session, let browsedIdentity,
+              browsedIdentity != ConnectionIdentity(session.settings) else {
+            return
+        }
+        loadGeneration += 1     // orphan listings still in flight for the old identity
+        self.browsedIdentity = nil
+        currentPath = ""
+        listing = nil
+        isLoading = false
+        hasLoadedOnce = false
+        backStack.removeAll()
+        forwardStack.removeAll()
+        filterText = ""
+        selection.removeAll()
+        activePreview = nil
+        pendingQuotaTrash = nil
+        diskUsageResult = nil
     }
 
     // MARK: Derived state
@@ -199,47 +295,118 @@ final class FileBrowserModel: ObservableObject {
     var canGoBack: Bool { !backStack.isEmpty }
     var canGoForward: Bool { !forwardStack.isEmpty }
 
-    /// Toolbar chips: Home (resolved remotely) plus the labeled storage
-    /// spaces from the latest snapshot, deduplicated by path.
+    /// Toolbar chips: Home first, then this cluster's storage spaces from its
+    /// latest snapshot (home, scratch, flash order), deduplicated by path.
+    ///
+    /// Home is the remotely resolved `$HOME` once known; before the first
+    /// resolution the snapshot's own home row stands in, so the chip is
+    /// there from the start. Rows that do not name a usable directory are
+    /// skipped (see `isBrowsable`).
     var shortcuts: [Shortcut] {
+        let snapshot = session?.snapshot
+        let storage = (snapshot?.sortedStorage ?? []).filter(Self.isBrowsable)
+        let user = (snapshot?.remote.user ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let isLegacySnapshot = snapshot?.cluster == nil
+
         var items: [Shortcut] = []
         var seenPaths = Set<String>()
-        func add(label: String, path: String, icon: String) {
-            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.hasPrefix("/"), seenPaths.insert(trimmed).inserted else {
+        func add(label: String, path: String, kind: StorageKind, quotaType: String?) {
+            let normalized = Self.normalize(path)
+            guard normalized.hasPrefix("/"), seenPaths.insert(normalized).inserted else {
                 return
             }
-            items.append(Shortcut(label: label, path: trimmed, icon: icon))
+            items.append(Shortcut(
+                label: label,
+                path: normalized,
+                kind: kind,
+                detail: shortcutDetail(path: normalized, kind: kind, quotaType: quotaType)
+            ))
         }
-        if let homePath {
-            add(label: "Home", path: homePath, icon: "house")
+
+        let homeRow = storage.first { $0.kind == .home }
+        let homeFromSnapshot = homeRow.map {
+            Self.personalPath(for: $0, isLegacySnapshot: isLegacySnapshot, user: user)
         }
-        let user = (appModel?.snapshot?.remote.user ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        for space in appModel?.snapshot?.storage ?? [] {
+        let homeChipPath = homePath ?? homeFromSnapshot
+        if let homeChipPath {
+            add(label: "Home", path: homeChipPath, kind: .home, quotaType: homeRow?.quotaType)
+        }
+        for space in storage {
+            // The Home chip already stands for the snapshot's home row, even
+            // when the row spells the path differently from realpath(~)
+            // (e.g. through a symlinked /users).
+            if homeChipPath != nil, let homeRow, space.label == homeRow.label {
+                continue
+            }
             add(
                 label: space.label,
-                path: Self.personalPath(space.path, user: user),
-                icon: Self.icon(forStorageLabel: space.label)
+                path: Self.personalPath(for: space, isLegacySnapshot: isLegacySnapshot, user: user),
+                kind: space.kind,
+                quotaType: space.quotaType
             )
         }
         return items
     }
 
-    /// Storage snapshots report shared roots (e.g. `/mnt/scratch`), but users
-    /// almost always want their own account subdirectory. Append the username
-    /// unless the path already ends in it (home is already `/users/<user>`).
-    private static func personalPath(_ path: String, user: String) -> String {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !user.isEmpty, trimmed.hasPrefix("/") else {
-            return trimmed
+    private func shortcutDetail(path: String, kind: StorageKind, quotaType: String?) -> String {
+        if kind.isSharedAcrossClusters {
+            return "\(path) — shared home: the same files on \(Self.sharedHomeClusterList)"
         }
-        let normalized = trimmed.count > 1 && trimmed.hasSuffix("/")
-            ? String(trimmed.dropLast())
-            : trimmed
-        if normalized == "/\(user)" || normalized.hasSuffix("/\(user)") {
-            return normalized
+        var detail = "\(path) — \(clusterName) only"
+        switch quotaType {
+        case "lustre-project":
+            detail += ", Lustre project quota"
+        case "lustre-user":
+            detail += ", Lustre user quota"
+        default:
+            break
         }
-        return "\(normalized)/\(user)"
+        return detail
+    }
+
+    /// A storage row worth a shortcut. Rows the collector marks
+    /// "unavailable" are skipped: their path is the raw candidate template
+    /// (still holding `$USER`/`$HOME`, which only the login node expands),
+    /// a candidate that does not exist — e.g. a scratch directory not yet
+    /// provisioned on a newly opened cluster — or, rarely, a real directory
+    /// whose df/quota probe timed out. The row cannot tell that last case
+    /// apart, and a chip that opens "No such directory" is worse than one
+    /// that is missing until the next refresh. The token check is a second
+    /// line of defence for any row that still carries a template.
+    private static func isBrowsable(_ space: StorageSummary) -> Bool {
+        space.source != "unavailable"
+            && !space.path.contains("$USER")
+            && !space.path.contains("$HOME")
+    }
+
+    /// The directory a storage shortcut opens.
+    ///
+    /// The current collector reports the RESOLVED per-user directory — the
+    /// first candidate that exists on the login node, e.g.
+    /// `/scratch-calder/users/<user>` on Calder or `/mnt/scratch/<user>` on
+    /// AIRE — and marks its rows with `quota_type` (and the snapshot with a
+    /// `cluster` block). Those paths are used verbatim: appending the user
+    /// again would yield `/scratch-calder/users/<user>/<user>`, which does
+    /// not exist, and a layout whose directory is not named after the user
+    /// must not be second-guessed either.
+    ///
+    /// Snapshot caches written by the pre-multi-cluster collector carry
+    /// neither marker, and their rows may name the shared filesystem ROOT
+    /// (`/mnt/scratch`) rather than the user's directory. Only for those
+    /// legacy rows is the username appended — unless the path already ends
+    /// in it, or the row is home (always reported resolved). The next
+    /// successful refresh replaces such a cache.
+    static func personalPath(for space: StorageSummary, isLegacySnapshot: Bool, user: String) -> String {
+        let path = normalize(space.path)
+        let reportsResolvedDirectory = !isLegacySnapshot || space.quotaType != nil
+        guard !reportsResolvedDirectory, space.kind != .home,
+              !user.isEmpty, path.hasPrefix("/") else {
+            return path
+        }
+        if path == "/\(user)" || path.hasSuffix("/\(user)") {
+            return path
+        }
+        return join(path, user)
     }
 
     /// Current listing filtered by the search text and sorted by the table's
@@ -272,13 +439,22 @@ final class FileBrowserModel: ObservableObject {
         guard let settings = settings() else {
             return
         }
+        // Tagged with the identity the request was made for: if the account
+        // or host changes while this is in flight, the result can never be
+        // served as the new identity's home.
+        let identity = ConnectionIdentity(settings)
+        let name = clusterName
         Task {
             do {
                 let home = try await service.homeDirectory(settings: settings)
-                homePath = home
+                guard isCurrent(identity) else {
+                    // Superseded by an account/host change while in flight.
+                    return
+                }
+                resolvedHome = (identity, home)
                 navigate(to: home)
             } catch {
-                showError("Could not resolve the remote home directory — \(error.localizedDescription)")
+                showError("Could not find your home directory on \(name) — \(error.localizedDescription)")
             }
         }
     }
@@ -297,7 +473,10 @@ final class FileBrowserModel: ObservableObject {
     func navigate(to path: String) {
         let target = Self.normalize(path)
         guard target.hasPrefix("/") else {
-            showError("Only absolute remote paths can be opened (got \(path.isEmpty ? "an empty path" : "'\(path)'")).")
+            showError(
+                "Only absolute paths can be opened on \(clusterName) "
+                    + "(got \(path.isEmpty ? "an empty path" : "'\(path)'"))."
+            )
             return
         }
         load(path: target, resetFilter: true, intent: .push(previous: lastLoadedPath))
@@ -362,6 +541,8 @@ final class FileBrowserModel: ObservableObject {
             return
         }
         let previousPath = lastLoadedPath
+        let name = clusterName
+        browsedIdentity = ConnectionIdentity(settings)
         currentPath = path
         isLoading = true
         if resetFilter {
@@ -399,7 +580,7 @@ final class FileBrowserModel: ObservableObject {
                 // state and the currentPath-gated toolbar buttons (New
                 // Folder / Upload / Refresh) stay consistent.
                 currentPath = previousPath
-                showError("Could not open \(path) — \(error.localizedDescription)")
+                showError("Could not open \(path) on \(name) — \(error.localizedDescription)")
             }
         }
     }
@@ -411,21 +592,21 @@ final class FileBrowserModel: ObservableObject {
             return
         }
         if let issue = Self.validateName(name) {
-            showError(issue)
+            showError("Cannot create that folder on \(clusterName) — \(issue)")
             return
         }
         guard let settings = settings() else {
             return
         }
         let path = Self.join(currentPath, name.trimmingCharacters(in: .whitespacesAndNewlines))
-        performMutation(failurePrefix: "New folder failed") { [service] in
+        performMutation(failurePrefix: "New folder on \(clusterName) failed") { [service] in
             try await service.createDirectory(settings: settings, path: path)
         }
     }
 
     func rename(entry: RemoteFileEntry, to newName: String) {
         if let issue = Self.validateName(newName) {
-            showError(issue)
+            showError("Cannot rename “\(entry.name)” on \(clusterName) — \(issue)")
             return
         }
         guard let settings = settings() else {
@@ -437,16 +618,17 @@ final class FileBrowserModel: ObservableObject {
         guard destination != entry.path else {
             return
         }
-        performMutation(failurePrefix: "Rename failed") { [service] in
+        performMutation(failurePrefix: "Rename on \(clusterName) failed") { [service] in
             try await service.rename(settings: settings, from: entry.path, to: destination)
         }
     }
 
     /// Soft delete: the service moves paths into per-operation server-side
-    /// `.aire-trash/<timestamp>-<id>/` folders (same-filesystem whenever
-    /// possible, so nothing is copied into the home quota) and reports where
-    /// they went. When a quota copy would be required, the service throws
-    /// and the request parks in `pendingQuotaTrash` for user confirmation.
+    /// `<trashDirectoryName>/<timestamp>-<id>/` folders (same-filesystem
+    /// whenever possible, so nothing is copied into the shared home quota)
+    /// and reports where they went. When a quota copy would be required,
+    /// the service throws and the request parks in `pendingQuotaTrash` for
+    /// user confirmation.
     func trash(entries: [RemoteFileEntry]) {
         performTrash(entries: entries, allowQuotaCopy: false)
     }
@@ -468,6 +650,7 @@ final class FileBrowserModel: ObservableObject {
             return
         }
         let paths = entries.map(\.path)
+        let name = clusterName
         isMutating = true
         Task {
             do {
@@ -477,30 +660,41 @@ final class FileBrowserModel: ObservableObject {
                     allowQuotaCopy: allowQuotaCopy
                 )
                 selection.removeAll()
-                showInfo(Self.trashSuccessMessage(count: paths.count, destinations: destinations))
+                showInfo(Self.trashSuccessMessage(
+                    count: paths.count,
+                    destinations: destinations,
+                    clusterName: name
+                ))
                 isMutating = false
                 refreshCurrent()
             } catch let needsConfirmation as RemoteFileService.QuotaCopyConfirmationRequired {
                 // Nothing was moved — ask before copying into the home quota.
                 isMutating = false
+                // Confirming runs with the session's settings at that moment;
+                // if the account or host changed meanwhile, those would no
+                // longer be the settings these paths were listed under.
+                guard isCurrent(ConnectionIdentity(settings)) else {
+                    showError("Move to trash on \(name) was cancelled — the connection changed. Nothing was moved.")
+                    return
+                }
                 pendingQuotaTrash = PendingQuotaTrash(
                     entries: entries,
                     affectedPaths: needsConfirmation.paths
                 )
             } catch {
-                showError("Move to trash failed — \(error.localizedDescription)")
+                showError("Move to trash on \(name) failed — \(error.localizedDescription)")
                 isMutating = false
                 refreshCurrent()
             }
         }
     }
 
-    private static func trashSuccessMessage(count: Int, destinations: [String]) -> String {
+    private static func trashSuccessMessage(count: Int, destinations: [String], clusterName: String) -> String {
         let items = "\(count) item\(count == 1 ? "" : "s")"
         if destinations.count == 1, let only = destinations.first {
-            return "Moved \(items) to \(only)"
+            return "Moved \(items) on \(clusterName) to \(only)"
         }
-        return "Moved \(items) to trash: \(destinations.joined(separator: ", "))"
+        return "Moved \(items) on \(clusterName) to trash: \(destinations.joined(separator: ", "))"
     }
 
     /// Hard delete, only reachable through the doubly-confirmed UI path.
@@ -509,14 +703,15 @@ final class FileBrowserModel: ObservableObject {
             return
         }
         let paths = entries.map(\.path)
+        let name = clusterName
         isMutating = true
         Task {
             do {
                 try await service.deletePermanently(settings: settings, paths: paths)
                 selection.removeAll()
-                showInfo("Permanently deleted \(paths.count) item\(paths.count == 1 ? "" : "s")")
+                showInfo("Permanently deleted \(paths.count) item\(paths.count == 1 ? "" : "s") on \(name)")
             } catch {
-                showError("Permanent delete failed — \(error.localizedDescription)")
+                showError("Permanent delete on \(name) failed — \(error.localizedDescription)")
             }
             isMutating = false
             refreshCurrent()
@@ -547,7 +742,7 @@ final class FileBrowserModel: ObservableObject {
         }
         let files = entries.filter(\.isDownloadable)
         guard !files.isEmpty else {
-            showError("Select files to download — folders are not downloadable yet.")
+            showError("Select files to download from \(clusterName) — folders are not downloadable yet.")
             return
         }
         let downloadsDirectory = FileManager.default
@@ -555,7 +750,7 @@ final class FileBrowserModel: ObservableObject {
             .first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
         for entry in files {
-            let transfer = TransferItem(filename: entry.name, direction: .download)
+            let transfer = TransferItem(filename: entry.name, direction: .download, clusterName: clusterName)
             transfers.append(transfer)
             let transferID = transfer.id
             Task {
@@ -576,7 +771,7 @@ final class FileBrowserModel: ObservableObject {
 
     func upload(urls: [URL]) {
         guard !currentPath.isEmpty else {
-            showError("Open a remote folder before uploading.")
+            showError("Open a folder on \(clusterName) before uploading.")
             return
         }
         guard let settings = settings() else {
@@ -584,7 +779,7 @@ final class FileBrowserModel: ObservableObject {
         }
         let destination = currentPath
         for url in urls where url.isFileURL {
-            let transfer = TransferItem(filename: url.lastPathComponent, direction: .upload)
+            let transfer = TransferItem(filename: url.lastPathComponent, direction: .upload, clusterName: clusterName)
             transfers.append(transfer)
             let transferID = transfer.id
             Task {
@@ -671,6 +866,7 @@ final class FileBrowserModel: ObservableObject {
             return
         }
         diskUsageResult = DiskUsageResult(path: entry.path, summary: "Calculating…", isPending: true)
+        let name = clusterName
         Task {
             do {
                 let summary = try await service.diskUsage(settings: settings, path: entry.path)
@@ -683,7 +879,7 @@ final class FileBrowserModel: ObservableObject {
                     return
                 }
                 diskUsageResult = nil
-                showError("Folder size failed — \(error.localizedDescription)")
+                showError("Folder size on \(name) failed — \(error.localizedDescription)")
             }
         }
     }
@@ -694,14 +890,18 @@ final class FileBrowserModel: ObservableObject {
 
     // MARK: Shell
 
-    /// Opens a terminal session that lands in the current directory. The
-    /// path travels through `openShell(settings:startDirectory:)`, which
-    /// shell-quotes it before interpolation.
-    func openShellHere(using manager: TerminalManager) {
-        guard !currentPath.isEmpty, let settings = settings() else {
+    /// Opens a terminal session on this browser's cluster that lands in the
+    /// current directory. The manager is the session's own, never one passed
+    /// in, so a folder listed on Calder can only ever open a Calder shell.
+    /// The path travels through `openShell(settings:startDirectory:)`, which
+    /// shell-quotes it before interpolation. (The dashboard wires its "Open
+    /// Shell Here" items through `onOpenShellAt`, which also switches tabs;
+    /// this is the model-level equivalent.)
+    func openShellHere() {
+        guard !currentPath.isEmpty, let session, let settings = settings() else {
             return
         }
-        manager.openShell(settings: settings, startDirectory: currentPath)
+        session.terminals.openShell(settings: settings, startDirectory: currentPath)
     }
 
     // MARK: Banners
@@ -732,15 +932,20 @@ final class FileBrowserModel: ObservableObject {
 
     // MARK: Path helpers
 
-    /// Trims whitespace and trailing slashes (except the root itself).
-    /// Deliberately does NOT collapse `..` — the remote side resolves paths;
-    /// this is display-level normalization only.
+    /// Drops trailing slashes (except the root itself). Whitespace is kept:
+    /// remote names may legitimately end in spaces, and trimming would open
+    /// the parent instead of a directory called "data ". A whitespace-only
+    /// input becomes "" so callers reject it. Deliberately does NOT collapse
+    /// `..` — the remote side resolves paths.
     static func normalize(_ path: String) -> String {
-        var trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        while trimmed.count > 1, trimmed.hasSuffix("/") {
-            trimmed.removeLast()
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
         }
-        return trimmed
+        var normalized = path
+        while normalized.count > 1, normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        return normalized
     }
 
     static func join(_ directory: String, _ name: String) -> String {
@@ -765,16 +970,5 @@ final class FileBrowserModel: ObservableObject {
             return "Names cannot contain newlines or control characters."
         }
         return nil
-    }
-
-    static func icon(forStorageLabel label: String) -> String {
-        let lowered = label.lowercased()
-        if lowered.contains("home") {
-            return "house"
-        }
-        if lowered.contains("scratch") {
-            return "externaldrive"
-        }
-        return "folder"
     }
 }
