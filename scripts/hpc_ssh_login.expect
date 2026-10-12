@@ -1,0 +1,915 @@
+#!/usr/bin/expect -f
+#
+# Interactive login helper for one Leeds HPC cluster (AIRE, Calder, ...).
+# Several clusters can be logged in at the same time: each has its own target
+# ControlMaster, while all clusters on the rash route share ONE jump master.
+#
+# Reads configuration from environment variables:
+#   HPC_USERNAME           remote username (required)
+#   HPC_HOSTNAME           cluster login host, e.g. calder.leeds.ac.uk (required)
+#   HPC_TARGET_LABEL       human name used in every message, e.g. "Calder"
+#                          (default: HPC_HOSTNAME)
+#   HPC_USE_JUMP_HOST      "1" or "0" (default 1)
+#   HPC_JUMP_HOSTNAME      jump host (default rash.leeds.ac.uk)
+#   HPC_CONTROL_PATH       this cluster's ControlMaster socket (required
+#                          unless HPC_SKIP_TARGET=1)
+#   HPC_JUMP_CONTROL_PATH  the shared jump ControlMaster socket
+#   HPC_FORCE_RELOGIN      "1" replaces this cluster's TARGET master even if it
+#                          still works; it never forces the shared jump master
+#   HPC_SKIP_TARGET        "1" authenticates only the jump leg (what the app does)
+#   HPC_LOGIN_DEBUG_LOG    optional event log (0600)
+#   HPC_DUO_OPTION         Duo menu answer (default 1 = push)
+#   HPC_TIMEOUT            seconds to wait for each interactive prompt (default 120)
+#   HPC_JUMP_PROBE_TIMEOUT seconds the jump-master health probe waits for an
+#                          SSH banner (default 10)
+#   HPC_RUNTIME_DIR        this cluster's runtime dir, handed to the target
+#                          starter (default $HPC_PROJECT_ROOT/.runtime)
+#   HPC_PROJECT_ROOT       repository root (default: parent of this script's dir)
+#
+# Reads the password from stdin (preferred). HPC_PASSWORD is accepted as a
+# legacy fallback; every password variable (including the pre-rename AIRE_*
+# ones) is scrubbed from the environment immediately after reading so spawned
+# ssh processes never inherit them.
+#
+# Progress is reported on stdout as machine-readable lines:
+#   HPC-STATUS: <human-readable milestone>
+#
+# Exit codes:
+#   13  the remote host rejected the password (wrong password)
+#   14  the remote host demanded a password change (expired password)
+#   124 timed out waiting for a prompt
+#
+# The helper only starts OpenSSH ControlMaster sessions and verifies them with
+# read-only commands. The target master itself is started by
+# hpc_start_target_master.zsh (directly by the app, or delegated to from here
+# when HPC_SKIP_TARGET is not set).
+
+fconfigure stdout -buffering line
+
+proc env_or_default {name default} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} {
+        return $::env($name)
+    }
+    return $default
+}
+
+set script_dir [file dirname [file normalize [info script]]]
+set project_root [env_or_default "HPC_PROJECT_ROOT" [file dirname $script_dir]]
+
+# Resolve a helper/log path against the project root so the script works when
+# invoked from any working directory. Control-socket paths supplied via the
+# environment are intentionally left as-is: relative socket paths keep the
+# sun_path length short and are resolved by ssh against the caller's cwd.
+proc resolve_path {path} {
+    global project_root
+    if {$path eq ""} {
+        return ""
+    }
+    if {[string index $path 0] eq "/"} {
+        return $path
+    }
+    return [file join $project_root $path]
+}
+
+set username [env_or_default "HPC_USERNAME" ""]
+set target_hostname [env_or_default "HPC_HOSTNAME" ""]
+set target_label [env_or_default "HPC_TARGET_LABEL" $target_hostname]
+set use_jump_host [env_or_default "HPC_USE_JUMP_HOST" "1"]
+set jump_hostname [env_or_default "HPC_JUMP_HOSTNAME" "rash.leeds.ac.uk"]
+set control_path [env_or_default "HPC_CONTROL_PATH" ""]
+set jump_control_path [env_or_default "HPC_JUMP_CONTROL_PATH" ""]
+set force_relogin [env_or_default "HPC_FORCE_RELOGIN" "0"]
+set skip_target [env_or_default "HPC_SKIP_TARGET" "0"]
+set debug_log [resolve_path [env_or_default "HPC_LOGIN_DEBUG_LOG" ""]]
+set duo_option [env_or_default "HPC_DUO_OPTION" "1"]
+set timeout [env_or_default "HPC_TIMEOUT" "120"]
+set jump_probe_timeout [env_or_default "HPC_JUMP_PROBE_TIMEOUT" "10"]
+set runtime_dir [resolve_path [env_or_default "HPC_RUNTIME_DIR" ".runtime"]]
+
+if {$username eq ""} {
+    puts stderr "HPC_USERNAME is required"
+    exit 2
+}
+
+if {$target_hostname eq ""} {
+    puts stderr "HPC_HOSTNAME is required"
+    exit 2
+}
+
+if {$skip_target ne "1" && $control_path eq ""} {
+    puts stderr "HPC_CONTROL_PATH is required unless HPC_SKIP_TARGET=1"
+    exit 2
+}
+
+if {$use_jump_host eq "1" && $jump_control_path eq ""} {
+    # Keep the fallback socket path short: unix sockets are capped at 104
+    # bytes on macOS and ssh appends a random suffix during setup. The name
+    # is per user and jump host only — never per cluster — because the jump
+    # master is shared by every cluster.
+    set jump_control_path "$::env(HOME)/.ssh/ctl/jump-cli-$username.sock"
+}
+
+if {[info exists ::env(HPC_PASSWORD)] && $::env(HPC_PASSWORD) ne ""} {
+    set password $::env(HPC_PASSWORD)
+} else {
+    if {[gets stdin password] < 0} {
+        puts stderr "Password was not provided on stdin"
+        exit 2
+    }
+}
+
+# Scrub inherited secrets so no spawned ssh child carries them in its
+# environment. The password only lives in this process's memory from here on.
+# The pre-rename AIRE_* names are scrubbed too, defensively, in case an older
+# caller still exports them.
+foreach secret_var {HPC_PASSWORD HPC_ASKPASS_PASSWORD AIRE_PASSWORD AIRE_ASKPASS_PASSWORD} {
+    catch {unset ::env($secret_var)}
+}
+
+if {$password eq ""} {
+    puts stderr "Password was empty"
+    exit 2
+}
+
+proc ensure_directory {dir} {
+    if {$dir eq ""} {
+        return
+    }
+    file mkdir $dir
+    catch {file attributes $dir -permissions 0700}
+}
+
+proc ensure_parent_directory {path} {
+    if {$path eq ""} {
+        return
+    }
+    set parent [file dirname $path]
+    if {$parent ne "." && $parent ne ""} {
+        ensure_directory $parent
+    }
+}
+
+ensure_parent_directory $control_path
+ensure_parent_directory $jump_control_path
+
+proc log_event {message} {
+    global debug_log
+    if {$debug_log eq ""} {
+        return
+    }
+    set timestamp [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S %Z"]
+    if {[catch {
+        set handle [open $debug_log "a"]
+        puts $handle "$timestamp $message"
+        close $handle
+        file attributes $debug_log -permissions 0600
+    }]} {
+        return
+    }
+}
+
+proc status_line {message} {
+    puts "HPC-STATUS: $message"
+}
+
+proc starting_message {label} {
+    if {$label eq "jump host"} {
+        return "starting jump-host authentication"
+    }
+    return "starting $label authentication"
+}
+
+proc connected_message {label} {
+    if {$label eq "jump host"} {
+        return "jump host connected"
+    }
+    return "connected to $label"
+}
+
+proc interactive_base_args {} {
+    return [list \
+        ssh \
+        -o StrictHostKeyChecking=accept-new \
+        -o PubkeyAuthentication=no \
+        -o GSSAPIAuthentication=no \
+        -o PreferredAuthentications=password,keyboard-interactive \
+        -o KbdInteractiveAuthentication=yes \
+        -o PasswordAuthentication=yes \
+        -o NumberOfPasswordPrompts=1 \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=10 \
+        -o TCPKeepAlive=yes \
+        -o ExitOnForwardFailure=yes \
+        -o ConnectTimeout=20 \
+    ]
+}
+
+proc verify_base_args {} {
+    return [list \
+        ssh \
+        -n \
+        -o BatchMode=yes \
+        -o PubkeyAuthentication=no \
+        -o GSSAPIAuthentication=no \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o ConnectTimeout=20 \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=10 \
+        -o TCPKeepAlive=yes \
+        -o ExitOnForwardFailure=yes \
+    ]
+}
+
+proc add_interactive_master_options {args control_path} {
+    if {$control_path ne ""} {
+        lappend args \
+            -o ControlMaster=yes \
+            -o ControlPersist=24h \
+            -o ControlPath=$control_path
+    }
+    return $args
+}
+
+proc add_verify_master_options {args control_path} {
+    if {$control_path ne ""} {
+        lappend args \
+            -o ControlPath=$control_path \
+            -o ControlMaster=auto
+    }
+    return $args
+}
+
+proc shell_quote {value} {
+    if {$value eq ""} {
+        return "''"
+    }
+    regsub -all -- {'} $value {'"'"'} escaped
+    return "'$escaped'"
+}
+
+proc shell_join {values} {
+    set quoted [list]
+    foreach value $values {
+        lappend quoted [shell_quote $value]
+    }
+    return [join $quoted " "]
+}
+
+proc jump_proxy_command {} {
+    global username jump_hostname jump_control_path
+    set proxy_args [list \
+        ssh \
+        -o BatchMode=yes \
+        -o PubkeyAuthentication=no \
+        -o GSSAPIAuthentication=no \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o ConnectTimeout=20 \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=10 \
+        -o TCPKeepAlive=yes \
+        -o ControlMaster=auto \
+        -o ControlPath=$jump_control_path \
+        -o User=$username \
+        -W %h:%p \
+        $jump_hostname \
+    ]
+    return [shell_join $proxy_args]
+}
+
+proc cleanup_control_socket {control_path} {
+    if {$control_path ne "" && [file exists $control_path]} {
+        log_event "Removing stale control socket: $control_path"
+        file delete -force $control_path
+    }
+}
+
+proc regex_escape {value} {
+    return [regsub -all {[][{}()*+?.^$\\|]} $value {\\&}]
+}
+
+# Kill a pid only after verifying it is one of OUR ssh processes for exactly
+# this control socket. Two process shapes qualify:
+#   - "ssh: <control-path> [mux]": the detached master. OpenSSH rewrites the
+#     master's process title to this once it has backgrounded, so its
+#     original argv (and any ControlPath= option) is no longer visible.
+#   - "ssh ... ControlPath=<control-path> ... ControlMaster=yes ...": a master
+#     still authenticating (e.g. abandoned at a Duo prompt).
+# For the argv shape the *first* ControlPath option must match exactly: every
+# cluster's target master embeds the shared jump ControlPath inside its
+# ProxyCommand string, so a naive substring match on the jump path would kill
+# every cluster's target master. Requiring ControlMaster=yes additionally
+# keeps every cluster's `-W` proxy (an `ssh ... ControlPath=<jump>` mux
+# client without ControlMaster=yes) out of reach.
+proc kill_verified_pid {pid control_path} {
+    set pid [string trim $pid]
+    if {![string is integer -strict $pid] || $pid <= 0} {
+        return 0
+    }
+    if {[catch {exec ps -p $pid -o command=} cmdline]} {
+        return 0
+    }
+    set cmdline [string trim $cmdline]
+    set title "ssh: $control_path \[mux\]"
+    if {$cmdline eq $title || [string first "$title " $cmdline] == 0} {
+        log_event "Terminating SSH master pid $pid for $control_path"
+        catch {exec kill $pid}
+        return 1
+    }
+    if {![regexp {^ssh(\s|$)} $cmdline]} {
+        return 0
+    }
+    if {![regexp {ControlPath=(\S+)} $cmdline -> first_control_path]} {
+        return 0
+    }
+    if {$first_control_path ne $control_path} {
+        return 0
+    }
+    if {![regexp {(^|\s)ControlMaster=yes(\s|$)} $cmdline]} {
+        return 0
+    }
+    log_event "Terminating SSH master pid $pid for $control_path"
+    catch {exec kill $pid}
+    return 1
+}
+
+proc cleanup_orphan_master {control_path} {
+    if {$control_path eq ""} {
+        return
+    }
+    set escaped [regex_escape $control_path]
+    set title_pattern "^ssh: $escaped "
+    append title_pattern {\[mux\]}
+    # pgrep only nominates candidates; kill_verified_pid decides.
+    foreach pattern [list "^ssh .*ControlPath=$escaped" $title_pattern] {
+        if {[catch {exec pgrep -f $pattern} pid_output]} {
+            continue
+        }
+        foreach pid [split $pid_output "\n"] {
+            kill_verified_pid $pid $control_path
+        }
+    }
+}
+
+proc close_master {close_args label control_path} {
+    global timeout
+    if {$control_path eq ""} {
+        return
+    }
+    log_event "Closing $label master before re-authenticating"
+    set stop_args [linsert $close_args 1 -O exit]
+    set saved_timeout $timeout
+    set timeout 6
+    log_user 0
+    if {[catch {spawn {*}$stop_args} spawn_error]} {
+        log_event "Could not send $label master exit: $spawn_error"
+        set timeout $saved_timeout
+        log_user 1
+        cleanup_control_socket $control_path
+        return
+    }
+    expect {
+        eof {
+            set wait_result [wait]
+            set exit_code [lindex $wait_result 3]
+            log_event "$label master exit command returned $exit_code"
+        }
+        timeout {
+            log_event "$label master exit command timed out"
+            catch {close}
+            catch {wait}
+        }
+    }
+    set timeout $saved_timeout
+    log_user 1
+    cleanup_control_socket $control_path
+    cleanup_orphan_master $control_path
+}
+
+proc run_interactive_ssh {ssh_args success_re label} {
+    global password duo_option timeout expect_out
+    set saw_success 0
+    set password_prompts 0
+    set duo_prompts 0
+    set hostkey_prompts 0
+    # True between sending the password and the next Duo prompt. A
+    # keyboard-interactive-only server (AIRE, Calder) never re-prompts after a
+    # wrong password: with NumberOfPasswordPrompts=1 it answers "Permission
+    # denied" and ssh exits 255. Ending in that window is the rejection signal;
+    # ending after a Duo exchange (e.g. a denied push) is not.
+    set awaiting_password_verdict 0
+    set effective_success_re $success_re
+    if {$effective_success_re eq ""} {
+        set effective_success_re "__HPC_EXPECT_NO_SUCCESS_SENTINEL__"
+    }
+
+    log_event "Starting $label authentication"
+    status_line [starting_message $label]
+    log_user 0
+    spawn {*}$ssh_args
+
+    expect {
+        -nocase -re {are you sure you want to continue connecting[^\r\n]*} {
+            incr hostkey_prompts
+            if {$hostkey_prompts > 2} {
+                puts stderr "Unexpected repeated host-key prompts during $label authentication"
+                log_event "$label host-key prompt loop detected"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 1
+            }
+            log_event "$label prompt: accepting new host key"
+            send -- "yes\r"
+            exp_continue
+        }
+        -nocase -re {\m(new|current|old|retype|re-enter|reenter|confirm)\s+(unix\s+|ldap\s+|kerberos\s+)?password[^\r\n]*:\s*$|password (has )?expired|must change your password} {
+            # A PAM password-change flow: never feed the stored password into
+            # it (the askpass leg refuses the same prompts). Exit 14 is the
+            # app's "password expired" contract, distinct from a wrong one.
+            puts stderr "$label requires a password change (the password has expired)"
+            log_event "$label prompt: password change requested; refusing"
+            log_user 1
+            catch {close}
+            catch {wait}
+            return 14
+        }
+        -nocase -re {password[^\r\n]*:\s*$} {
+            incr password_prompts
+            if {$password_prompts >= 2} {
+                # An immediate re-prompt with no intervening Duo exchange
+                # means the password was rejected: with
+                # PreferredAuthentications=password,keyboard-interactive and
+                # NumberOfPasswordPrompts=1, ssh asks once per method, so the
+                # second prompt is keyboard-interactive retrying after the
+                # password method failed. The Duo branches below reset this
+                # counter, because a password prompt after a Duo exchange is
+                # a fresh leg, not a rejection. Exit 13 is the app's
+                # "password rejected" contract.
+                puts stderr "$label rejected the password"
+                log_event "$label password rejected (second password prompt)"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 13
+            }
+            log_event "$label prompt: sending password"
+            set awaiting_password_verdict 1
+            send -- "$password\r"
+            status_line "password sent, waiting for Duo approval on your phone ($label)"
+            exp_continue
+        }
+        -nocase -re {passcode\s+or\s+option[^\r\n]*:\s*$} {
+            incr duo_prompts
+            if {$duo_prompts > 3} {
+                puts stderr "$label Duo prompt repeated too many times; aborting"
+                log_event "$label Duo prompt loop detected"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 1
+            }
+            log_event "$label prompt: sending Duo option"
+            # Reaching a Duo prompt means the preceding password was accepted;
+            # only an immediate re-prompt (no intervening Duo exchange) counts
+            # as a rejection.
+            set password_prompts 0
+            set awaiting_password_verdict 0
+            send -- "$duo_option\r"
+            status_line "waiting for Duo approval on your phone ($label)"
+            exp_continue
+        }
+        -nocase -re {select one of the following options[^\r\n]*} {
+            # Duo menu header; the actionable "Passcode or option (1-N):"
+            # prompt follows. Consume it without answering.
+            exp_continue
+        }
+        -nocase -re {option\s*\([^\)]*\)\s*:\s*$} {
+            incr duo_prompts
+            if {$duo_prompts > 3} {
+                puts stderr "$label Duo prompt repeated too many times; aborting"
+                log_event "$label Duo prompt loop detected"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 1
+            }
+            log_event "$label prompt: sending Duo option"
+            set password_prompts 0
+            set awaiting_password_verdict 0
+            send -- "$duo_option\r"
+            status_line "waiting for Duo approval on your phone ($label)"
+            exp_continue
+        }
+        -nocase -re {verification code[^\r\n]*:\s*$} {
+            incr duo_prompts
+            if {$duo_prompts > 3} {
+                puts stderr "$label Duo prompt repeated too many times; aborting"
+                log_event "$label Duo prompt loop detected"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 1
+            }
+            log_event "$label prompt: sending Duo option"
+            set password_prompts 0
+            set awaiting_password_verdict 0
+            send -- "$duo_option\r"
+            status_line "waiting for Duo approval on your phone ($label)"
+            exp_continue
+        }
+        -nocase -re {response[^\r\n]*:\s*$} {
+            incr duo_prompts
+            if {$duo_prompts > 3} {
+                puts stderr "$label Duo prompt repeated too many times; aborting"
+                log_event "$label Duo prompt loop detected"
+                log_user 1
+                catch {close}
+                catch {wait}
+                return 1
+            }
+            log_event "$label prompt: sending Duo option"
+            set password_prompts 0
+            set awaiting_password_verdict 0
+            send -- "$duo_option\r"
+            status_line "waiting for Duo approval on your phone ($label)"
+            exp_continue
+        }
+        -re $effective_success_re {
+            set saw_success 1
+            log_user 1
+            puts $expect_out(0,string)
+            log_user 0
+            exp_continue
+        }
+        eof {
+            set leftover $expect_out(buffer)
+            set wait_result [wait]
+            set exit_code [lindex $wait_result 3]
+            log_event "$label authentication exited with $exit_code, success=$saw_success"
+            log_user 1
+            if {$exit_code != 0 && $awaiting_password_verdict
+                    && [regexp -nocase {permission denied} $leftover]} {
+                puts stderr "$label rejected the password"
+                log_event "$label password rejected (Permission denied right after the password)"
+                return 13
+            }
+            if {$success_re ne "" && $saw_success == 0 && $exit_code == 0} {
+                return 1
+            }
+            return $exit_code
+        }
+        timeout {
+            puts stderr "Timed out while waiting for $label SSH, password, or Duo prompt"
+            log_event "$label authentication timed out"
+            log_user 1
+            return 124
+        }
+    }
+}
+
+# Run a verification command under a hard timeout. Uses spawn/expect instead
+# of plain `exec` so a wedged mux command cannot hang the helper until the
+# remote LoginGraceTime expires.
+proc verify_ssh {verify_args {quiet 0}} {
+    global timeout
+    set saved_timeout $timeout
+    set timeout 25
+    set output ""
+    log_user 0
+    if {[catch {spawn {*}$verify_args} spawn_error]} {
+        set timeout $saved_timeout
+        log_user 1
+        log_event "Verification spawn failed: $spawn_error"
+        return 1
+    }
+    set exit_code 1
+    expect {
+        -re {.+} {
+            append output $expect_out(buffer)
+            exp_continue
+        }
+        eof {
+            set wait_result [wait]
+            set exit_code [lindex $wait_result 3]
+        }
+        timeout {
+            log_event "Verification timed out"
+            catch {close}
+            catch {wait}
+            set exit_code 124
+        }
+    }
+    set timeout $saved_timeout
+    log_user 1
+    if {$exit_code == 0} {
+        set trimmed [string trim $output]
+        if {!$quiet && $trimmed ne ""} {
+            puts $trimmed
+        }
+        log_event "Verification succeeded"
+        return 0
+    }
+    log_event "Verification failed with exit $exit_code"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Shared jump master policy
+#
+# The rash jump master is shared by EVERY cluster on the rash route: each
+# cluster's target master reaches its login host through a ProxyCommand that
+# is itself a mux client of the jump master (`ssh -S <jump> -W host:22`).
+# Closing the jump master therefore silently kills every other cluster's
+# tunnel. So the jump master is never torn down merely because
+# HPC_FORCE_RELOGIN=1 (forcing applies to this cluster's TARGET master only).
+# It is reused whenever it is healthy, and re-authenticated only when it is
+# missing or demonstrably unusable.
+#
+# Healthy means:
+#   1. `ssh -O check` succeeds (instant local socket probe: the master
+#      process is alive and answering on its control socket), AND
+#   2. a bounded end-to-end probe succeeds: ask the master to open a raw
+#      channel to <HPC_HOSTNAME>:22 (`-W`), wait up to HPC_JUMP_PROBE_TIMEOUT
+#      seconds for the far sshd's "SSH-" identification banner, then hang up
+#      before sending anything (no authentication is attempted on the far
+#      side). `-O check` alone is not enough: a master whose TCP connection
+#      silently died still answers its local socket until ServerAlive gives
+#      up (up to 5 minutes), while every channel through it hangs.
+#
+# Two refinements keep a responsive jump master alive when the problem is the
+# target rather than rash (Calder's round-robin DNS sometimes lands on a
+# login node that drops new connections, and tearing rash down would then
+# kill AIRE's live tunnel and cost a Duo push without fixing anything):
+#   - if rash answers the probe's channel request at all, it demonstrably
+#     relayed traffic, so the jump master counts as healthy and the target
+#     leg reports the real error. The probe is a MUX client, so a refusal
+#     does not use the familiar non-mux "channel 0: open failed: ..." wording:
+#     the master turns rash's CHANNEL_OPEN_FAILURE into MUX_S_FAILURE and the
+#     client dies (exit 255) with
+#         "Stdio forwarding request failed: Session open refused by peer"
+#     (connection refused, DNS failure at rash, ...). Likewise, when the
+#     channel opens but the far sshd hangs up before its banner — OpenSSH
+#     9.8+ drop_connection() (MaxStartups / PerSourcePenalties) writes
+#     "Not allowed at this time" and closes, which is the documented Calder
+#     quirk — the master closes the mux session and the client exits 0, with
+#     or without that text. Exit 0 is also what the client does when the
+#     master itself dies mid-probe, so every "refused" verdict is confirmed
+#     with a second `ssh -O check` before the master is kept.
+#   - if the target probe merely times out, one more bounded probe asks the
+#     jump host to connect to its own sshd (127.0.0.1:22). Any answer there
+#     (banner or refusal) proves the jump master is alive end to end.
+# Only a master that fails `-O check` (before or after the probe), fails at
+# the mux layer ("Master refused stdio forwarding request", control-socket
+# errors, any other non-zero exit), or answers nothing at all is closed and
+# re-authenticated.
+# ---------------------------------------------------------------------------
+
+# Returns one of:
+#   ok       saw an "SSH-" banner through the jump master
+#   refused  rash answered the channel request with a refusal, or the channel
+#            opened and was closed without a banner (rash relayed it; the
+#            caller still re-checks the master, see above)
+#   timeout  nothing came back within the deadline
+#   failed   the probe failed at the mux layer (socket gone, master refused)
+proc probe_through_jump {host} {
+    global username jump_hostname jump_control_path jump_probe_timeout timeout expect_out
+    # ControlMaster=no: a probe must never become a master itself.
+    set probe_args [list \
+        ssh \
+        -o BatchMode=yes \
+        -o PubkeyAuthentication=no \
+        -o GSSAPIAuthentication=no \
+        -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o ConnectTimeout=10 \
+        -o ControlMaster=no \
+        -o ControlPath=$jump_control_path \
+        -o User=$username \
+        -W $host:22 \
+        $jump_hostname \
+    ]
+    set saved_timeout $timeout
+    set timeout $jump_probe_timeout
+    log_user 0
+    if {[catch {spawn -noecho {*}$probe_args} spawn_error]} {
+        set timeout $saved_timeout
+        log_user 1
+        log_event "Jump probe spawn failed: $spawn_error"
+        return failed
+    }
+    set probe_pid [exp_pid]
+    set result failed
+    set exited 0
+    expect {
+        -re {SSH-[0-9]} {
+            set result ok
+        }
+        -nocase -re {session open refused by peer|open failed} {
+            # rash's sshd refused to open the channel: the mux wording
+            # ("Stdio forwarding request failed: Session open refused by
+            # peer") or the non-mux one ("open failed: connect failed ...").
+            # Deliberately NOT matched: "Master refused stdio forwarding
+            # request" (the local master said no) and any other "Stdio
+            # forwarding request failed: <reason>", which are local mux
+            # faults and fall through to eof -> failed.
+            set result refused
+        }
+        eof {
+            set exited 1
+            set leftover [string range [string trim $expect_out(buffer)] 0 199]
+            set wait_result [wait]
+            set exit_code [lindex $wait_result 3]
+            if {$exit_code == 0} {
+                # The mux client exits 0 when the master closes its session:
+                # the channel opened and the far end hung up before a banner
+                # (e.g. "Not allowed at this time"), so rash relayed it. A
+                # master dying mid-probe looks the same, hence the caller's
+                # follow-up `-O check`.
+                if {$leftover ne ""} {
+                    log_event "Jump probe to $host: channel closed before a banner after: $leftover"
+                }
+                set result refused
+            } else {
+                log_event "Jump probe to $host failed (exit $exit_code): $leftover"
+                set result failed
+            }
+        }
+        timeout {
+            set result timeout
+        }
+    }
+    if {!$exited} {
+        # Hang up: the probe never sends anything, so the far sshd only
+        # sees a connection that closed before identification.
+        catch {exec kill $probe_pid}
+        catch {close}
+        catch {wait}
+    }
+    set timeout $saved_timeout
+    log_user 1
+    log_event "Jump probe to $host:22 through $jump_control_path: $result"
+    return $result
+}
+
+# A "refused" probe proves rash relayed the request only if the master is
+# still there afterwards: a master that died mid-probe also ends the mux
+# session with exit 0 and no output. Re-run the instant `-O check`.
+proc jump_master_survived_probe {check_args} {
+    if {[verify_ssh $check_args 1] == 0} {
+        return 1
+    }
+    log_event "Jump master stopped answering during the probe (ssh -O check failed afterwards)"
+    return 0
+}
+
+proc jump_master_is_healthy {check_args} {
+    global target_hostname target_label
+    if {[verify_ssh $check_args 1] != 0} {
+        log_event "Jump master is not running (ssh -O check failed)"
+        return 0
+    }
+    set probe [probe_through_jump $target_hostname]
+    switch -- $probe {
+        ok {
+            return 1
+        }
+        refused {
+            if {![jump_master_survived_probe $check_args]} {
+                return 0
+            }
+            log_event "Jump master is responsive but $target_label refused the probe; keeping the shared jump master"
+            status_line "jump host is up, but $target_label did not answer through it yet"
+            return 1
+        }
+        timeout {
+            set self_probe [probe_through_jump 127.0.0.1]
+            if {$self_probe eq "ok" || ($self_probe eq "refused" && [jump_master_survived_probe $check_args])} {
+                log_event "$target_label did not answer in time, but the jump master is responsive; keeping it"
+                status_line "jump host is up, but $target_label is slow to answer through it"
+                return 1
+            }
+            log_event "Jump master passed -O check but carries no traffic (wedged)"
+            return 0
+        }
+        default {
+            log_event "Jump master passed -O check but failed the mux probe"
+            return 0
+        }
+    }
+}
+
+proc ensure_jump_master {check_args interactive_args close_args} {
+    global jump_control_path
+    if {[jump_master_is_healthy $check_args]} {
+        status_line "reusing the shared jump-host session"
+        status_line [connected_message "jump host"]
+        return 0
+    }
+    # Missing or unusable: clear whatever is left of it (any tunnel through a
+    # master in this state is already dead) and authenticate a fresh one.
+    close_master $close_args "jump host" $jump_control_path
+    set auth_exit [run_interactive_ssh $interactive_args "" "jump host"]
+    if {$auth_exit != 0} {
+        log_event "jump host authentication returned $auth_exit; verifying control connection before failing"
+    }
+    if {[verify_ssh $check_args 1] == 0} {
+        status_line [connected_message "jump host"]
+        return 0
+    }
+    return [expr {$auth_exit == 0 ? 1 : $auth_exit}]
+}
+
+# Start this cluster's target master by delegating to
+# hpc_start_target_master.zsh — the same starter the app runs — so there is a
+# single implementation of the target login (per-cluster runtime files,
+# verified teardown, FIFO password handoff, keepalive). The password goes down
+# the child's stdin pipe only (never argv or environment), exactly as the app
+# hands it over; the child's stdout (HPC-STATUS lines, auth_ok line) is
+# relayed and its stderr passes straight through.
+proc start_target_master {} {
+    global password project_root runtime_dir target_label
+    set starter [resolve_path "scripts/hpc_start_target_master.zsh"]
+    if {![file exists $starter]} {
+        puts stderr "Target master starter is missing: $starter"
+        log_event "$target_label target starter missing: $starter"
+        return 2
+    }
+    set ::env(HPC_PROJECT_ROOT) $project_root
+    set ::env(HPC_RUNTIME_DIR) $runtime_dir
+    log_event "Delegating $target_label target master start to $starter"
+    if {[catch {open "|[list /bin/zsh $starter 2>@ stderr]" r+} chan]} {
+        puts stderr "Failed to start $target_label target master starter: $chan"
+        log_event "Failed to start $target_label target starter: $chan"
+        return 1
+    }
+    fconfigure $chan -buffering line -translation lf
+    if {[catch {
+        puts $chan $password
+        flush $chan
+    } write_error]} {
+        log_event "Could not hand the password to the $target_label starter: $write_error"
+    }
+    while {[gets $chan line] >= 0} {
+        puts $line
+    }
+    set exit_code 0
+    if {[catch {close $chan} close_error close_options]} {
+        set error_code [dict get $close_options -errorcode]
+        if {[lindex $error_code 0] eq "CHILDSTATUS"} {
+            set exit_code [lindex $error_code 2]
+        } else {
+            log_event "$target_label target starter close failed: $close_error"
+            set exit_code 1
+        }
+    }
+    log_event "$target_label target starter exited with $exit_code"
+    return $exit_code
+}
+
+set target_command {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
+
+if {$use_jump_host eq "1"} {
+    set jump_args [add_interactive_master_options [interactive_base_args] $jump_control_path]
+    lappend jump_args -f -N -o User=$username $jump_hostname
+
+    # `ssh -O check` is the instant local half of the health check; the
+    # end-to-end half is probe_through_jump, which is bounded and hangs up
+    # actively (an unbounded `-W host:22` used as a verification command
+    # could otherwise hang until the far LoginGraceTime).
+    set check_jump_args [add_verify_master_options [verify_base_args] $jump_control_path]
+    lappend check_jump_args -O check -o User=$username $jump_hostname
+
+    set close_jump_args [add_verify_master_options [verify_base_args] $jump_control_path]
+    lappend close_jump_args -o User=$username $jump_hostname
+
+    # HPC_FORCE_RELOGIN deliberately plays no part here; see "Shared jump
+    # master policy" above.
+    set jump_exit [ensure_jump_master $check_jump_args $jump_args $close_jump_args]
+    if {$jump_exit != 0} {
+        exit $jump_exit
+    }
+}
+
+if {$skip_target eq "1"} {
+    log_event "Skipping $target_label target authentication by request"
+    exit 0
+}
+
+if {$force_relogin ne "1"} {
+    set verify_target_args [add_verify_master_options [verify_base_args] $control_path]
+    lappend verify_target_args -o User=$username
+    if {$use_jump_host eq "1"} {
+        lappend verify_target_args -o ProxyCommand=[jump_proxy_command]
+    } else {
+        lappend verify_target_args -o ProxyCommand=none -o ProxyJump=none
+    }
+    lappend verify_target_args $target_hostname $target_command
+    if {[verify_ssh $verify_target_args] == 0} {
+        status_line [connected_message $target_label]
+        exit 0
+    }
+}
+
+exit [start_target_master]

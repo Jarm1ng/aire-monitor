@@ -2,24 +2,28 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
-    // Owned here (not in DashboardView) so terminal sessions and their ssh
-    // processes survive any dashboard rebuild, not just tab switches.
-    @StateObject private var terminalManager = TerminalManager()
-    // Owned here for the same reason: navigation history, listings, and
-    // in-flight transfers survive dashboard rebuilds and tab switches.
-    @StateObject private var fileBrowserModel = FileBrowserModel()
 
     var body: some View {
         NavigationSplitView {
             ConnectionSidebar(model: model)
-                .navigationTitle("AIRE")
+                .navigationTitle("Leeds HPC")
                 .frame(minWidth: 340)
         } detail: {
-            DashboardView(
-                model: model,
-                terminalManager: terminalManager,
-                fileBrowserModel: fileBrowserModel
-            )
+            Group {
+                switch model.selection {
+                case .overview:
+                    OverviewDashboard(model: model)
+                case .cluster(let id):
+                    if let session = model.session(for: id) {
+                        ClusterDashboardView(model: model, session: session)
+                            // A distinct identity per cluster keeps SwiftUI from
+                            // reusing one cluster's view state for another.
+                            .id(id)
+                    } else {
+                        OverviewDashboard(model: model)
+                    }
+                }
+            }
             .background(DashboardBackdrop())
         }
         .frame(minWidth: 1000, minHeight: 680)
@@ -78,42 +82,41 @@ enum DashboardTab: String, CaseIterable, Identifiable {
     }
 }
 
-struct DashboardView: View {
+/// One cluster's tabbed dashboard. All state comes from the session, and
+/// per-tab UI state (selected tab, filters, open job sheet) lives on the
+/// session's `ClusterDashboardState`, so switching clusters in the sidebar
+/// and back restores exactly where the user was.
+struct ClusterDashboardView: View {
     @ObservedObject var model: AppModel
-    @ObservedObject var terminalManager: TerminalManager
-    @ObservedObject var fileBrowserModel: FileBrowserModel
-    @State private var selectedTab: DashboardTab = .jobs
+    @ObservedObject var session: ClusterSession
+    @ObservedObject private var dashboard: ClusterDashboardState
 
-    // Per-tab UI state lives here (not in the child dashboards) because the
-    // pill switcher's `switch` removes non-selected tabs from the hierarchy,
-    // which would destroy child @State on every switch. The old stock TabView
-    // kept all children alive; hoisting preserves that behavior.
-    @State private var jobsShowDetails = false
-    @State private var selectedJob: Job?
-    @State private var partitionsShowDetails = false
-    @State private var nodesFilter: NodeFilter = .all
-    @State private var nodesShowDetails = false
+    init(model: AppModel, session: ClusterSession) {
+        self.model = model
+        self.session = session
+        self._dashboard = ObservedObject(wrappedValue: session.dashboard)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
 
-            if model.snapshot == nil {
-                ConnectHeroView(model: model)
+            if session.snapshot == nil {
+                ConnectHeroView(model: model, session: session)
             } else {
                 summaryCards
-                DashboardTabBar(selection: $selectedTab)
+                DashboardTabBar(selection: $dashboard.selectedTab, accent: session.profile.accent.color)
 
-                if selectedTab == .terminal {
+                if dashboard.selectedTab == .terminal {
                     // The terminal fills the remaining space and manages its
                     // own scrollback — never wrap it in the dashboard scroller.
-                    TerminalDashboard(model: model, manager: terminalManager)
-                } else if selectedTab == .files {
+                    TerminalDashboard(session: session, manager: session.terminals)
+                } else if dashboard.selectedTab == .files {
                     // The file table likewise scrolls itself; wrapping it in
                     // the shared scroller would collapse its height.
                     FilesDashboard(
-                        model: model,
-                        files: fileBrowserModel,
+                        session: session,
+                        files: session.files,
                         onOpenShellAt: { path in
                             openShellSession(at: path)
                         },
@@ -130,25 +133,23 @@ struct DashboardView: View {
             }
         }
         .padding(18)
-        .animation(AIRETheme.smoothEase, value: model.snapshot == nil)
-        .onAppear {
-            fileBrowserModel.attach(appModel: model)
-        }
+        .animation(AppTheme.smoothEase, value: session.snapshot == nil)
     }
 
     @ViewBuilder
     private var tabContent: some View {
-        switch selectedTab {
+        switch dashboard.selectedTab {
         case .jobs:
             JobsDashboard(
-                jobs: model.snapshot?.jobs ?? [],
-                showDetails: $jobsShowDetails,
-                selectedJob: $selectedJob,
+                profile: session.profile,
+                jobs: session.snapshot?.jobs ?? [],
+                showDetails: $dashboard.jobsShowDetails,
+                selectedJob: $dashboard.selectedJob,
                 onTailOutput: { job in
                     openTailSession(for: job)
                 },
                 onCancelJob: { job in
-                    try await cancelJob(job)
+                    try await session.cancelJob(job)
                 },
                 onBrowseWorkDir: { job in
                     openFileBrowser(for: job)
@@ -156,26 +157,36 @@ struct DashboardView: View {
             )
         case .partitions:
             PartitionsDashboard(
-                partitions: model.snapshot?.partitions ?? [],
-                showDetails: $partitionsShowDetails
+                profile: session.profile,
+                partitions: session.snapshot?.partitions ?? [],
+                showDetails: $dashboard.partitionsShowDetails
             )
         case .nodes:
             NodesDashboard(
-                nodes: model.snapshot?.nodes ?? [],
-                jobs: model.snapshot?.jobs ?? [],
-                filter: $nodesFilter,
-                showDetails: $nodesShowDetails,
+                profile: session.profile,
+                nodes: session.snapshot?.nodes ?? [],
+                jobs: session.snapshot?.jobs ?? [],
+                filter: $dashboard.nodesFilter,
+                showDetails: $dashboard.nodesShowDetails,
                 onOpenShell: {
-                    withAnimation(AIRETheme.softSpring) {
-                        selectedTab = .terminal
+                    withAnimation(AppTheme.softSpring) {
+                        dashboard.selectedTab = .terminal
                     }
-                    terminalManager.focusOrOpenShell(settings: model.settings)
+                    session.terminals.focusOrOpenShell(settings: session.settings)
                 }
             )
         case .trends:
-            TrendsDashboard(history: model.history, snapshot: model.snapshot)
+            TrendsDashboard(
+                profile: session.profile,
+                history: session.history,
+                gpuModel: session.gpuAvailability.model
+            )
         case .storage:
-            StorageDashboard(storage: model.snapshot?.storage ?? [], history: model.history)
+            StorageDashboard(
+                profile: session.profile,
+                storage: session.snapshot?.sortedStorage ?? [],
+                history: session.history
+            )
         case .files, .terminal:
             // Rendered directly in `body` (outside the ScrollView); these
             // arms only satisfy exhaustiveness.
@@ -184,136 +195,110 @@ struct DashboardView: View {
     }
 
     /// Closes the job sheet, jumps to the Files tab, and opens the job's
-    /// working directory in the file browser.
+    /// working directory in this cluster's file browser.
     private func openFileBrowser(for job: Job) {
         guard let workDir = job.workDir, !workDir.isEmpty else {
             return
         }
-        selectedJob = nil
-        fileBrowserModel.attach(appModel: model)
-        withAnimation(AIRETheme.softSpring) {
-            selectedTab = .files
+        dashboard.selectedJob = nil
+        withAnimation(AppTheme.softSpring) {
+            dashboard.selectedTab = .files
         }
-        fileBrowserModel.navigate(to: workDir)
+        session.files.navigate(to: workDir)
     }
 
     /// Files tab → terminal: opens a shell landing in `path` (quoted inside
     /// `openShell(settings:startDirectory:)`).
     private func openShellSession(at path: String) {
-        withAnimation(AIRETheme.softSpring) {
-            selectedTab = .terminal
+        withAnimation(AppTheme.softSpring) {
+            dashboard.selectedTab = .terminal
         }
-        terminalManager.openShell(settings: model.settings, startDirectory: path)
+        session.terminals.openShell(settings: session.settings, startDirectory: path)
     }
 
     /// Files preview → terminal: edits the file with vim over the live SSH
     /// session. The remote path is untrusted listing data, so it is
     /// single-quoted before interpolation.
     private func openVimSession(for path: String) {
-        withAnimation(AIRETheme.softSpring) {
-            selectedTab = .terminal
+        withAnimation(AppTheme.softSpring) {
+            dashboard.selectedTab = .terminal
         }
-        terminalManager.open(
+        session.terminals.open(
             command: "vim \(SSHTerminalCommand.shellQuote(path))",
             title: "vim \((path as NSString).lastPathComponent)",
-            settings: model.settings
+            settings: session.settings
         )
     }
 
     /// Closes the job sheet, jumps to the terminal tab, and tails the job's
-    /// stdout over the existing SSH session.
+    /// stdout over this cluster's SSH session.
     private func openTailSession(for job: Job) {
-        selectedJob = nil
-        withAnimation(AIRETheme.softSpring) {
-            selectedTab = .terminal
+        dashboard.selectedJob = nil
+        withAnimation(AppTheme.softSpring) {
+            dashboard.selectedTab = .terminal
         }
-        terminalManager.openTail(job: job, settings: model.settings)
-    }
-
-    /// Runs `scancel` for the job over the ControlMaster socket, then asks the
-    /// model for a fresh snapshot so the queue reflects the cancellation.
-    /// Failures also land in `model.errorMessage`, because the job sheet that
-    /// shows the inline status can be dismissed while the cancel is in flight.
-    private func cancelJob(_ job: Job) async throws {
-        do {
-            let result = try await MonitorService().runRemoteCommand(
-                settings: model.settings,
-                command: "scancel \(SSHTerminalCommand.shellQuote(job.jobId))"
-            )
-            guard result.exitCode == 0 else {
-                let message = result.stderr.isEmpty ? result.stdout : result.stderr
-                throw MonitorError.processFailed(
-                    message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "scancel exited with code \(result.exitCode)"
-                        : MonitorService.explainSSHFailure(message, exitCode: result.exitCode)
-                )
-            }
-        } catch {
-            model.errorMessage = "Could not cancel job \(job.jobId) — \(error.localizedDescription)"
-            throw error
-        }
-        // Non-droppable: a plain refresh() silently no-ops while another
-        // refresh is in flight, which would leave the cancelled job showing
-        // as RUNNING (indefinitely so while monitoring is paused).
-        model.refreshAfterMutation()
+        session.terminals.openTail(job: job, settings: session.settings)
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
+        HStack(alignment: .center, spacing: 12) {
+            ClusterBadge(profile: session.profile, size: 34)
             VStack(alignment: .leading, spacing: 4) {
-                Text("AIRE Monitor")
+                Text(session.displayName)
                     .font(.title2.weight(.semibold))
-                if let snapshot = model.snapshot {
+                if let snapshot = session.snapshot {
                     TimelineView(.periodic(from: .now, by: 30)) { context in
                         Text(headerSubtitle(for: snapshot, now: context.date))
                             .font(.caption)
-                            .foregroundStyle(model.isLoggedIn ? Color.secondary : Color.orange)
+                            .foregroundStyle(session.isLoggedIn ? Color.secondary : Color.orange)
                             .textSelection(.enabled)
                             .help(headerTooltip(for: snapshot))
                     }
                 } else {
-                    Text("Not connected yet")
+                    Text("\(session.settings.hostname) • \(session.profile.tagline)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
-            StatusBadge(isConnected: model.isLoggedIn, isCached: model.hasCachedSnapshot)
+            ConnectionStatePill(state: session.connectionState)
             Button {
-                model.refresh()
+                session.refresh()
             } label: {
-                Label(model.isRefreshing ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
+                Label(session.isRefreshing ? "Refreshing" : "Refresh", systemImage: "arrow.clockwise")
             }
-            .disabled(model.isRefreshing || model.isLoggingIn)
+            .disabled(session.isRefreshing || session.isLoggingIn || !session.isEnabled)
             .buttonStyle(.bordered)
             .controlSize(.large)
             .keyboardShortcut("r", modifiers: .command)
-            .help("Refresh now (⌘R) • auto-refreshes every \(model.refreshIntervalText)")
+            .help("Refresh \(session.displayName) now (⌘R) • auto-refreshes every \(session.refreshIntervalText)")
         }
-        .animation(AIRETheme.smoothEase, value: model.isRefreshing)
+        .animation(AppTheme.smoothEase, value: session.isRefreshing)
     }
 
     private func headerSubtitle(for snapshot: ClusterSnapshot, now: Date) -> String {
-        let updated = AIRETimestamp.relativeText(snapshot.collectedAt, reference: now)
-        let staleness = model.isLoggedIn ? "updated \(updated)" : "cached data from \(updated)"
+        let updated = SlurmTimestamp.relativeText(snapshot.collectedAt, reference: now)
+        let staleness = session.isLoggedIn ? "updated \(updated)" : "cached data from \(updated)"
         return "\(snapshot.remote.hostname) • \(snapshot.remote.user) • \(staleness)"
     }
 
     private func headerTooltip(for snapshot: ClusterSnapshot) -> String {
-        "Collected \(AIRETimestamp.absoluteText(snapshot.collectedAt)) • remote time \(AIRETimestamp.absoluteText(snapshot.remote.remoteTime))"
+        "Collected \(SlurmTimestamp.absoluteText(snapshot.collectedAt)) • remote time \(SlurmTimestamp.absoluteText(snapshot.remote.remoteTime))"
     }
 
     private var summaryCards: some View {
-        HStack(spacing: 12) {
-            MetricView(title: "Jobs", value: "\(model.snapshot?.jobs.count ?? 0)", systemImage: "list.bullet.rectangle", accent: .blue)
-            MetricView(title: "Partitions", value: "\(model.snapshot?.partitions.count ?? 0)", systemImage: "square.grid.2x2", accent: .purple)
-            MetricView(title: "Nodes", value: "\(model.snapshot?.nodes.count ?? 0)", systemImage: "server.rack", accent: .teal)
-            MetricView(title: "GPU Nodes", value: "\(gpuNodeCount)", systemImage: "memorychip", accent: AIRETheme.gpu)
+        let gpus = session.gpuAvailability
+        return HStack(spacing: 12) {
+            MetricView(title: "My jobs", value: "\(session.snapshot?.jobs.count ?? 0)", systemImage: "list.bullet.rectangle", accent: .blue)
+            MetricView(title: "Partitions", value: "\(Set(session.snapshot?.partitions.map(\.partition) ?? []).count)", systemImage: "square.grid.2x2", accent: .purple)
+            MetricView(title: "Nodes", value: "\(session.snapshot?.nodes.count ?? 0)", systemImage: "server.rack", accent: .teal)
+            MetricView(
+                title: gpus.model.map { "Idle \($0) GPUs" } ?? "Idle GPUs",
+                value: "\(gpus.idle) / \(gpus.total)",
+                systemImage: "memorychip",
+                accent: AppTheme.gpu
+            )
         }
-    }
-
-    private var gpuNodeCount: Int {
-        model.snapshot?.nodes.filter { gpuTotal($0) > 0 }.count ?? 0
     }
 }
 
@@ -322,13 +307,14 @@ struct DashboardView: View {
 /// Custom pill switcher in the glass language, replacing the stock TabView.
 struct DashboardTabBar: View {
     @Binding var selection: DashboardTab
+    var accent: Color = AppTheme.gpu
     @Namespace private var pillNamespace
 
     var body: some View {
         HStack(spacing: 4) {
             ForEach(DashboardTab.allCases) { tab in
-                DashboardTabPill(tab: tab, isSelected: selection == tab, namespace: pillNamespace) {
-                    withAnimation(AIRETheme.softSpring) {
+                DashboardTabPill(tab: tab, isSelected: selection == tab, accent: accent, namespace: pillNamespace) {
+                    withAnimation(AppTheme.softSpring) {
                         selection = tab
                     }
                 }
@@ -340,7 +326,7 @@ struct DashboardTabBar: View {
                 .fill(.regularMaterial)
                 .overlay {
                     Capsule()
-                        .stroke(AIRETheme.border, lineWidth: 1)
+                        .stroke(AppTheme.border, lineWidth: 1)
                 }
         }
         .accessibilityElement(children: .contain)
@@ -353,6 +339,7 @@ struct DashboardTabBar: View {
 private struct DashboardTabPill: View {
     let tab: DashboardTab
     let isSelected: Bool
+    let accent: Color
     let namespace: Namespace.ID
     let action: () -> Void
 
@@ -368,10 +355,10 @@ private struct DashboardTabPill: View {
                 .background {
                     if isSelected {
                         Capsule()
-                            .fill(AIRETheme.gpu.opacity(0.16))
+                            .fill(accent.opacity(0.16))
                             .overlay {
                                 Capsule()
-                                    .stroke(AIRETheme.gpu.opacity(0.35), lineWidth: 1)
+                                    .stroke(accent.opacity(0.35), lineWidth: 1)
                             }
                             .matchedGeometryEffect(id: "dashboard-tab-pill", in: namespace)
                     } else if isHovered {
@@ -383,7 +370,7 @@ private struct DashboardTabPill: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
-        .animation(AIRETheme.smoothEase, value: isHovered)
+        .animation(AppTheme.smoothEase, value: isHovered)
         .accessibilityLabel(tab.title)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
@@ -395,29 +382,29 @@ private struct DashboardTabPill: View {
 /// "not connected yet" can never be confused with "cluster is empty".
 struct ConnectHeroView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var session: ClusterSession
 
     var body: some View {
         VStack(spacing: 0) {
             Spacer(minLength: 24)
 
             VStack(spacing: 18) {
-                AIRELogoMark(cornerRadius: 14)
-                    .frame(width: 72, height: 72)
+                ClusterBadge(profile: session.profile, size: 72)
 
                 VStack(spacing: 6) {
-                    Text("Connect to AIRE")
+                    Text(heroTitle)
                         .font(.title.weight(.semibold))
-                    Text("Live Slurm monitoring for the University of Leeds AIRE cluster")
+                    Text("\(session.settings.hostname) • \(session.profile.tagline)")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
 
-                if model.isLoggingIn {
+                if session.isLoggingIn || session.isLoginQueued {
                     HStack(spacing: 10) {
                         ProgressView()
                             .controlSize(.small)
-                        Text(model.loginProgress ?? "Connecting… check your phone for a Duo push")
+                        Text(session.loginProgress ?? session.statusMessage)
                             .font(.callout.weight(.medium))
                     }
                     .padding(.horizontal, 16)
@@ -425,37 +412,97 @@ struct ConnectHeroView: View {
                     .background(Color.orange.opacity(0.12), in: Capsule())
                     .overlay(Capsule().stroke(Color.orange.opacity(0.25), lineWidth: 1))
                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                } else if !session.isEnabled {
+                    Button("Turn on \(session.displayName) monitoring") {
+                        session.isEnabled = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else if session.isLoggedIn || session.isRefreshing {
+                    // Signed in (or probing an existing session) but the
+                    // first snapshot is still being collected — common on a
+                    // first sign-in with no cache. Offering Connect here
+                    // would invite a needless second sign-in and Duo push.
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(session.isLoggedIn
+                            ? "Signed in — collecting the first \(session.displayName) snapshot…"
+                            : "Checking for a live \(session.displayName) session…")
+                            .font(.callout.weight(.medium))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.green.opacity(0.10), in: Capsule())
+                    .overlay(Capsule().stroke(Color.green.opacity(0.22), lineWidth: 1))
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
                 } else {
                     VStack(alignment: .leading, spacing: 14) {
                         HeroStep(
                             number: 1,
-                            title: "Enter your password",
-                            detail: "Use the sidebar on the left. Optionally remember it in the macOS Keychain."
+                            title: "Enter your university password",
+                            detail: "Use the sidebar. One Keychain entry covers every Leeds cluster."
                         )
                         HeroStep(
                             number: 2,
                             title: "Approve the Duo push",
                             detail: model.connectionRoute == .rashJump
-                                ? "Two approvals on your phone — one for the jump host, one for AIRE."
-                                : "One approval on your phone keeps the SSH session alive."
+                                ? "One approval for rash (skipped if it is already open), then one for \(session.displayName)."
+                                : "One approval on your phone keeps the \(session.displayName) session alive."
                         )
                         HeroStep(
                             number: 3,
                             title: "Watch the live dashboard",
-                            detail: "Jobs, GPUs, nodes, and storage refresh automatically every \(model.refreshIntervalText)."
+                            detail: "Jobs, GPUs, nodes and storage refresh automatically every \(session.refreshIntervalText)."
                         )
                     }
                     .frame(maxWidth: 440, alignment: .leading)
+
+                    Button {
+                        model.connect(session.id)
+                    } label: {
+                        Label("Connect to \(session.displayName)", systemImage: "person.crop.circle.badge.checkmark")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .tint(session.profile.accent.color)
+                }
+
+                // App-level sign-in problems (missing username or password)
+                // are shown here too: the user clicked Connect in this pane,
+                // not in the sidebar where they would otherwise appear.
+                ForEach(heroErrors, id: \.self) { error in
+                    Text(error)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 480, alignment: .leading)
+                        .lineLimit(8)
                 }
             }
             .padding(28)
             .frame(maxWidth: 560)
-            .dashboardCard(padding: 24, accent: AIRETheme.gpu)
+            .dashboardCard(padding: 24, accent: session.profile.accent.color)
 
             Spacer(minLength: 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(AIRETheme.smoothEase, value: model.isLoggingIn)
+        .animation(AppTheme.smoothEase, value: session.isLoggingIn)
+    }
+
+    private var heroTitle: String {
+        if !session.isEnabled {
+            return "\(session.displayName) monitoring is off"
+        }
+        if session.isLoggedIn {
+            return "Loading \(session.displayName)"
+        }
+        return "Connect to \(session.displayName)"
+    }
+
+    private var heroErrors: [String] {
+        [model.errorMessage, session.errorMessage]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
     }
 }
 
@@ -468,10 +515,10 @@ private struct HeroStep: View {
         HStack(alignment: .top, spacing: 12) {
             Text("\(number)")
                 .font(.callout.monospacedDigit().weight(.bold))
-                .foregroundStyle(AIRETheme.gpu)
+                .foregroundStyle(AppTheme.gpu)
                 .frame(width: 26, height: 26)
-                .background(AIRETheme.gpu.opacity(0.14), in: Circle())
-                .overlay(Circle().stroke(AIRETheme.gpu.opacity(0.28), lineWidth: 1))
+                .background(AppTheme.gpu.opacity(0.14), in: Circle())
+                .overlay(Circle().stroke(AppTheme.gpu.opacity(0.28), lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)

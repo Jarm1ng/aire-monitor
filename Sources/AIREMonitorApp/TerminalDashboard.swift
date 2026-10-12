@@ -6,34 +6,40 @@ import SwiftUI
 // in the file is ambiguous between SwiftTerm.Color and SwiftUI.Color.
 private typealias Color = SwiftUI.Color
 
-/// Terminal tab: a session strip of glass pills, the active terminal filling
-/// the remaining space, and a quick-command chip row. Sessions live in
-/// `TerminalManager` (a `@StateObject` up in `ContentView`), so switching
-/// tabs never interrupts a running ssh.
+/// Terminal tab of one cluster's dashboard: a session strip of glass pills,
+/// the active terminal filling the remaining space, and a quick-command chip
+/// row. Sessions live in the cluster's own `TerminalManager`
+/// (`session.terminals`), so switching tabs or clusters never interrupts a
+/// running ssh, and everything here — new shells, chips, restarts — goes
+/// to this cluster only. The cluster's accent color tints the chrome so an
+/// AIRE terminal and a Calder terminal are never mistaken for each other.
 struct TerminalDashboard: View {
-    @ObservedObject var model: AppModel
+    @ObservedObject var session: ClusterSession
     @ObservedObject var manager: TerminalManager
+
+    private var clusterName: String { session.displayName }
+    private var accent: Color { session.profile.accent.color }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             PageHeader(
                 title: "Terminal",
-                subtitle: "Interactive shells over the app's live SSH session",
+                subtitle: "Interactive shells on \(clusterName) over the app's live SSH session",
                 systemImage: "terminal",
-                accent: AIRETheme.gpu
+                accent: accent
             ) {
                 HStack(spacing: 10) {
                     fontSizeControls
 
                     Button {
-                        manager.openShell(settings: model.settings)
+                        manager.openShell(settings: session.settings)
                     } label: {
                         Image(systemName: "plus")
                     }
                     .buttonStyle(.bordered)
                     .keyboardShortcut(.return, modifiers: .command)
-                    .help("New shell on AIRE (⌘⏎)")
-                    .accessibilityLabel("New shell")
+                    .help("New shell on \(clusterName) (⌘⏎)")
+                    .accessibilityLabel("New shell on \(clusterName)")
                 }
             }
 
@@ -43,18 +49,33 @@ struct TerminalDashboard: View {
                 sessionStrip
             }
 
-            if let session = manager.activeSession {
-                TerminalSessionPane(session: session)
+            if let terminal = manager.activeSession {
+                TerminalSessionPane(session: terminal, accent: accent) {
+                    // Fresh settings, so a restart follows a route or host
+                    // change made since the session was opened.
+                    manager.restart(terminal, settings: session.settings)
+                }
             } else {
-                TerminalHero(isLoggedIn: model.isLoggedIn) {
-                    manager.openShell(settings: model.settings)
+                TerminalHero(
+                    clusterName: clusterName,
+                    accent: accent,
+                    connectionState: session.connectionState,
+                    isLoggedIn: session.isLoggedIn
+                ) {
+                    manager.openShell(settings: session.settings)
                 }
             }
 
             quickCommandRow
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .animation(AIRETheme.smoothEase, value: manager.sessions.isEmpty)
+        .animation(AppTheme.smoothEase, value: manager.sessions.isEmpty)
+        // Keyed by cluster: the same view slot is reused when the sidebar
+        // switches clusters, so plain onAppear would miss that switch and
+        // leave this cluster's terminals at a stale text size.
+        .task(id: session.id) {
+            manager.adoptSharedFontSize()
+        }
     }
 
     // MARK: Session strip
@@ -62,18 +83,20 @@ struct TerminalDashboard: View {
     private var sessionStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(manager.sessions) { session in
+                ForEach(manager.sessions) { terminal in
                     SessionPill(
-                        session: session,
-                        isActive: manager.activeSession?.id == session.id,
-                        onSelect: { manager.activeSessionID = session.id },
-                        onClose: { manager.close(session) }
+                        session: terminal,
+                        accent: accent,
+                        isActive: manager.activeSession?.id == terminal.id,
+                        onSelect: { manager.activeSessionID = terminal.id },
+                        onClose: { manager.close(terminal) }
                     )
                 }
             }
             .padding(.vertical, 1)
         }
-        .animation(AIRETheme.softSpring, value: manager.sessions.count)
+        .animation(AppTheme.softSpring, value: manager.sessions.count)
+        .accessibilityLabel("\(clusterName) terminal sessions")
     }
 
     /// One-line hint shown in place of the session strip while no session
@@ -82,7 +105,7 @@ struct TerminalDashboard: View {
         HStack(spacing: 6) {
             Image(systemName: "keyboard")
                 .font(.caption2.weight(.semibold))
-            Text("⌘ Return opens a shell on the login node")
+            Text("⌘ Return opens a shell on the \(clusterName) login node")
                 .font(.caption)
         }
         .foregroundStyle(.secondary)
@@ -117,33 +140,28 @@ struct TerminalDashboard: View {
 
     // MARK: Quick commands
 
-    private struct QuickCommand: Identifiable {
-        let title: String
-        let command: String
-        let systemImage: String
-        /// Full-screen programs must never be typed into an existing shell:
-        /// a later chip's text would land in them as raw keystrokes.
-        var opensDedicatedSession: Bool = false
-        var id: String { title }
+    /// Rebuilt from the profile on every render: cheap (five tiny values)
+    /// and it can never go stale against the cluster this view shows.
+    private var quickCommandItems: [TerminalQuickCommand] {
+        TerminalQuickCommand.items(for: session.profile)
     }
-
-    private static let quickCommandItems: [QuickCommand] = [
-        QuickCommand(title: "My jobs", command: "squeue --me", systemImage: "list.bullet.rectangle"),
-        QuickCommand(title: "Cluster", command: "sinfo", systemImage: "square.grid.2x2"),
-        QuickCommand(title: "Quota", command: "quota -s", systemImage: "internaldrive"),
-        QuickCommand(title: "GPU nodes", command: "sinfo -N -p gpu", systemImage: "memorychip"),
-        QuickCommand(title: "htop", command: "htop || top", systemImage: "gauge", opensDedicatedSession: true)
-    ]
 
     private var quickCommandRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Self.quickCommandItems) { item in
-                    QuickCommandChip(title: item.title, systemImage: item.systemImage) {
+                ForEach(quickCommandItems) { item in
+                    QuickCommandChip(
+                        title: item.title,
+                        systemImage: item.systemImage,
+                        accent: accent,
+                        accessibilityHint: item.opensDedicatedSession
+                            ? "Opens in its own \(clusterName) session"
+                            : "Runs in the active \(clusterName) shell, or in a new session"
+                    ) {
                         manager.runQuickCommand(
                             item.command,
                             title: item.title,
-                            settings: model.settings,
+                            settings: session.settings,
                             prefersDedicatedSession: item.opensDedicatedSession
                         )
                     }
@@ -152,7 +170,7 @@ struct TerminalDashboard: View {
             }
             .padding(.vertical, 1)
         }
-        .accessibilityLabel("Quick commands")
+        .accessibilityLabel("\(clusterName) quick commands")
     }
 }
 
@@ -160,6 +178,8 @@ struct TerminalDashboard: View {
 
 private struct TerminalSessionPane: View {
     @ObservedObject var session: TerminalSession
+    let accent: Color
+    let onRestart: () -> Void
 
     var body: some View {
         TerminalHostView(session: session)
@@ -169,35 +189,61 @@ private struct TerminalSessionPane: View {
             // poke square into the card's rounded chrome.
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .overlay(alignment: .bottom) {
-                if case .exited(let exitStatus) = session.status {
-                    exitBar(status: exitStatus)
+                switch session.status {
+                case .running:
+                    EmptyView()
+                case .exited(let exitStatus):
+                    statusBar(
+                        systemImage: "bolt.slash.fill",
+                        text: exitStatus?.label ?? "exited",
+                        buttonTitle: "Restart",
+                        accessibilityText: exitStatus.map { "Session \($0.label)" } ?? "Session exited"
+                    )
+                case .sessionUnavailable:
+                    // ssh never ran: the pre-flight found no live master.
+                    // "Retry" rather than "Restart" — after Connect in the
+                    // sidebar the same session simply tries again.
+                    statusBar(
+                        systemImage: "bolt.horizontal.circle",
+                        text: "\(session.clusterName) not connected",
+                        buttonTitle: "Retry",
+                        accessibilityText: "\(session.clusterName) SSH session is not running"
+                    )
                 }
             }
             // Terminals want space: minimal padding, but still glass chrome.
-            .dashboardCard(padding: 8, accent: AIRETheme.gpu)
-            .animation(AIRETheme.smoothEase, value: session.status)
+            .dashboardCard(padding: 8, accent: accent)
+            .animation(AppTheme.smoothEase, value: session.status)
     }
 
-    private func exitBar(status: TerminalExitStatus?) -> some View {
+    private func statusBar(
+        systemImage: String,
+        text: String,
+        buttonTitle: String,
+        accessibilityText: String
+    ) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: "bolt.slash.fill")
+            Image(systemName: systemImage)
                 .foregroundStyle(.orange)
-            Text(status?.label ?? "exited")
+                .accessibilityHidden(true)
+            Text(text)
                 .font(.caption.monospacedDigit().weight(.medium))
-            Button("Restart") {
-                session.restart()
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
+            Button(buttonTitle, action: onRestart)
+                .buttonStyle(.borderedProminent)
+                .tint(accent)
+                .controlSize(.small)
+                .accessibilityLabel("\(buttonTitle) \(session.title) on \(session.clusterName)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AIRETheme.border, lineWidth: 1))
+        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
         .padding(.bottom, 12)
         .transition(.opacity.combined(with: .move(edge: .bottom)))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(status.map { "Session \($0.label)" } ?? "Session exited")
+        // .contain (not .combine) keeps the button its own element, so
+        // VoiceOver can reach Restart/Retry directly.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityText)
     }
 }
 
@@ -222,6 +268,7 @@ private struct TerminalHostView: NSViewRepresentable {
 
 private struct SessionPill: View {
     @ObservedObject var session: TerminalSession
+    let accent: Color
     let isActive: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
@@ -230,10 +277,25 @@ private struct SessionPill: View {
     @State private var isHovered = false
 
     private var statusColor: Color {
-        if case .running = session.status {
+        switch session.status {
+        case .running:
             return .green
+        case .exited:
+            return .red
+        case .sessionUnavailable:
+            return .orange
         }
-        return .red
+    }
+
+    private var statusText: String {
+        switch session.status {
+        case .running:
+            return "running"
+        case .exited(let exitStatus):
+            return exitStatus?.label ?? "exited"
+        case .sessionUnavailable:
+            return "not connected"
+        }
     }
 
     var body: some View {
@@ -251,7 +313,7 @@ private struct SessionPill: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .accessibilityLabel("Close \(session.title)")
+            .accessibilityLabel("Close \(session.title) on \(session.clusterName)")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -260,13 +322,13 @@ private struct SessionPill: View {
                 .fill(.regularMaterial)
                 .overlay {
                     Capsule()
-                        .fill(AIRETheme.gpu.opacity(isActive ? 0.16 : (isHovered ? 0.10 : 0.04)))
+                        .fill(accent.opacity(isActive ? 0.18 : (isHovered ? 0.11 : 0.05)))
                 }
         }
         .overlay(
             Capsule()
                 .stroke(
-                    isActive ? AIRETheme.gpu.opacity(0.35) : AIRETheme.chipStroke(for: colorScheme),
+                    isActive ? accent.opacity(0.45) : AppTheme.chipStroke(for: colorScheme),
                     lineWidth: 1
                 )
         )
@@ -274,10 +336,11 @@ private struct SessionPill: View {
         .contentShape(Capsule())
         .onTapGesture(perform: onSelect)
         .onHover { isHovered = $0 }
-        .animation(AIRETheme.smoothEase, value: isActive)
-        .animation(AIRETheme.smoothEase, value: isHovered)
+        .help("\(session.title) on \(session.clusterName) — \(statusText)")
+        .animation(AppTheme.smoothEase, value: isActive)
+        .animation(AppTheme.smoothEase, value: isHovered)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Session \(session.title)")
+        .accessibilityLabel("Session \(session.title) on \(session.clusterName), \(statusText)")
         .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
     }
 }
@@ -287,6 +350,8 @@ private struct SessionPill: View {
 private struct QuickCommandChip: View {
     let title: String
     let systemImage: String
+    let accent: Color
+    let accessibilityHint: String
     let action: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -298,11 +363,11 @@ private struct QuickCommandChip: View {
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(AIRETheme.gpu.opacity(isHovered ? 0.16 : 0.10), in: Capsule())
+                .background(accent.opacity(isHovered ? 0.16 : 0.10), in: Capsule())
                 .overlay(
                     Capsule()
                         .stroke(
-                            isHovered ? AIRETheme.gpu.opacity(0.35) : AIRETheme.chipStroke(for: colorScheme),
+                            isHovered ? accent.opacity(0.35) : AppTheme.chipStroke(for: colorScheme),
                             lineWidth: 1
                         )
                 )
@@ -310,16 +375,35 @@ private struct QuickCommandChip: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
-        .animation(AIRETheme.smoothEase, value: isHovered)
+        .animation(AppTheme.smoothEase, value: isHovered)
         .accessibilityLabel(title)
+        .accessibilityHint(accessibilityHint)
     }
 }
 
 // MARK: - Empty state
 
 private struct TerminalHero: View {
+    let clusterName: String
+    let accent: Color
+    let connectionState: ClusterConnectionState
     let isLoggedIn: Bool
     let onOpenShell: () -> Void
+
+    private var headline: String {
+        isLoggedIn
+            ? "No terminal sessions on \(clusterName) yet"
+            : "The terminal reuses \(clusterName)'s SSH session — connect first."
+    }
+
+    /// The not-connected copy is honest about what a shell will do: every
+    /// session pre-flights the cluster's master, so trying anyway costs
+    /// nothing and never prompts for a password or a Duo push.
+    private var detail: String {
+        isLoggedIn
+            ? "Open a shell on the \(clusterName) login node over the existing SSH session — no extra password or Duo push."
+            : "Use Connect for \(clusterName) in the sidebar. You can still try a shell: it checks for \(clusterName)'s session first and never asks for a password."
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -328,37 +412,32 @@ private struct TerminalHero: View {
             VStack(spacing: 14) {
                 Image(systemName: "terminal")
                     .font(.system(size: 34, weight: .medium))
-                    .foregroundStyle(AIRETheme.gpu)
+                    .foregroundStyle(accent)
+                    .accessibilityHidden(true)
 
-                Text(
-                    isLoggedIn
-                        ? "No terminal sessions yet"
-                        : "The terminal reuses the app's SSH session — log in first."
-                )
-                .font(.headline)
-                .multilineTextAlignment(.center)
+                ConnectionStatePill(state: connectionState)
 
-                Text(
-                    isLoggedIn
-                        ? "Open a shell on the AIRE login node over the existing SSH session — no extra password or Duo push."
-                        : "You can still open a shell; ssh will print its own error if no session is available."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
+                Text(headline)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
 
                 Button {
                     onOpenShell()
                 } label: {
-                    Label("New shell", systemImage: "plus")
+                    Label("New shell on \(clusterName)", systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(AIRETheme.gpu)
+                .tint(accent)
             }
             .padding(28)
             .frame(maxWidth: 520)
-            .dashboardCard(padding: 24, accent: AIRETheme.gpu)
+            .dashboardCard(padding: 24, accent: accent)
 
             Spacer(minLength: 16)
         }

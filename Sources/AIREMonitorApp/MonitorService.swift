@@ -2,18 +2,26 @@ import CryptoKit
 import Foundation
 import Darwin
 
-struct ServerSettings {
-    var useSSHAlias: Bool
-    var sshAlias: String
+/// Everything needed to reach one cluster over SSH. Built by `ClusterSession`
+/// from the shared sign-in configuration plus the cluster's own profile.
+struct ConnectionSettings: Sendable {
+    let clusterID: ClusterID
+    let clusterName: String
     var username: String
-    var aireHostname: String
-    var useJumpHost: Bool
+    /// Login host of this cluster, e.g. calder.leeds.ac.uk.
+    var hostname: String
+    var route: ConnectionRoute
     var jumpHostname: String
     var duoOption: String
     var projectRoot: String
+    var storage: [StorageVolumeSpec]
 
+    var useJumpHost: Bool { route == .rashJump }
+
+    /// Per-cluster runtime directory: snapshot cache, history, login logs,
+    /// master/keepalive pid files. Nothing in it is shared between clusters.
     var runtimeDirectory: String {
-        "\(projectRoot)/.runtime"
+        "\(projectRoot)/.runtime/clusters/\(clusterID.rawValue)"
     }
 
     // Unix domain socket paths are limited to 104 bytes on macOS, and ssh
@@ -24,16 +32,20 @@ struct ServerSettings {
         (NSHomeDirectory() as NSString).appendingPathComponent(".ssh/ctl")
     }
 
+    /// The cluster's own ControlMaster. The key format predates multi-cluster
+    /// support and is kept byte-for-byte, so an AIRE master started by an
+    /// older build (aire-<hash>.sock) is still found after an upgrade.
     var controlPath: String {
-        if useSSHAlias {
-            return ""
-        }
-        let route = useJumpHost ? "via-\(jumpHostname)" : "direct"
-        return shortControlPath(prefix: "aire", key: "\(username)@\(aireHostname):\(route)")
+        let routeKey = useJumpHost ? "via-\(jumpHostname)" : "direct"
+        return shortControlPath(prefix: clusterID.rawValue, key: "\(username)@\(hostname):\(routeKey)")
     }
 
+    /// The rash jump master. Deliberately independent of the cluster: every
+    /// cluster on the rash route tunnels through the same authenticated
+    /// jump session, so rash costs one Duo approval in total, not one per
+    /// cluster.
     var jumpControlPath: String {
-        if useSSHAlias || !useJumpHost {
+        guard useJumpHost else {
             return ""
         }
         return shortControlPath(prefix: "jump", key: "\(username)@\(jumpHostname)")
@@ -44,29 +56,6 @@ struct ServerSettings {
         let hash = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
         return "\(controlDirectory)/\(prefix)-\(hash).sock"
     }
-
-    var keychainAccount: String {
-        if useSSHAlias {
-            let alias = sshAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-            return "alias:\(alias.isEmpty ? "aire" : alias)"
-        }
-
-        let user = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        let host = aireHostname.trimmingCharacters(in: .whitespacesAndNewlines)
-        let route = useJumpHost
-            ? "via:\(jumpHostname.trimmingCharacters(in: .whitespacesAndNewlines))"
-            : "direct"
-        return "explicit:\(user)@\(host):\(route)"
-    }
-
-    var legacyKeychainAccount: String? {
-        let user = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !useSSHAlias && !user.isEmpty else {
-            return nil
-        }
-        return "\(user)@leeds"
-    }
-
 }
 
 struct ProcessResult {
@@ -78,13 +67,22 @@ struct ProcessResult {
 enum MonitorError: LocalizedError {
     case missingFile(String)
     case processFailed(String)
+    /// A login helper exited 13: the server rejected the password.
+    case passwordRejected(String)
+    /// A login helper exited 14: the server demanded a password change.
+    case passwordExpired(String)
+    /// The shared rash jump leg failed for another reason. Every other
+    /// queued cluster would retry the same rash authentication, so the
+    /// coordinator stops the queue.
+    case jumpHostFailed(String)
     case invalidJSON(String)
 
     var errorDescription: String? {
         switch self {
         case .missingFile(let path):
             return "Missing file: \(path)"
-        case .processFailed(let message):
+        case .processFailed(let message), .passwordRejected(let message),
+             .passwordExpired(let message), .jumpHostFailed(let message):
             return message
         case .invalidJSON(let message):
             return "Could not parse snapshot JSON: \(message)"
@@ -256,37 +254,41 @@ private final class ProcessSignalState: @unchecked Sendable {
 }
 
 struct MonitorService: Sendable {
-    static let statusLinePrefix = "AIRE-STATUS: "
+    static let statusLinePrefix = "HPC-STATUS: "
 
+    static let loginHelperScript = "scripts/hpc_ssh_login.expect"
+    static let targetStarterScript = "scripts/hpc_start_target_master.zsh"
+    static let collectorScript = "scripts/hpc_snapshot.py"
+
+    /// Authenticates one cluster: on the rash route the expect helper first
+    /// makes sure the shared jump master is up (reusing a healthy one, so
+    /// logging into a second cluster never tears down the first), then the
+    /// target starter launches this cluster's own ControlMaster. The
+    /// password travels only as the first line of each helper's stdin.
     func login(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         password: String,
         onStatus: (@Sendable (String) -> Void)? = nil
     ) async throws -> String {
+        try requireFile("\(settings.projectRoot)/\(Self.targetStarterScript)")
         try prepareRuntime(settings: settings)
-        let helper = "\(settings.projectRoot)/scripts/aire_ssh_login.expect"
-        try requireFile(helper)
 
         var environment = ProcessInfo.processInfo.environment
-        environment["AIRE_CONNECTION_MODE"] = settings.useSSHAlias ? "alias" : "explicit"
-        environment["AIRE_SSH_ALIAS"] = settings.sshAlias
-        environment["AIRE_USERNAME"] = settings.username
-        environment["AIRE_HOSTNAME"] = settings.aireHostname
-        environment["AIRE_USE_JUMP_HOST"] = settings.useJumpHost ? "1" : "0"
-        environment["AIRE_JUMP_HOSTNAME"] = settings.jumpHostname
-        environment["AIRE_DUO_OPTION"] = settings.duoOption
-        if !settings.controlPath.isEmpty {
-            environment["AIRE_CONTROL_PATH"] = settings.controlPath
-        }
+        environment["HPC_PROJECT_ROOT"] = settings.projectRoot
+        environment["HPC_RUNTIME_DIR"] = settings.runtimeDirectory
+        environment["HPC_TARGET_LABEL"] = settings.clusterName
+        environment["HPC_USERNAME"] = settings.username
+        environment["HPC_HOSTNAME"] = settings.hostname
+        environment["HPC_USE_JUMP_HOST"] = settings.useJumpHost ? "1" : "0"
+        environment["HPC_JUMP_HOSTNAME"] = settings.jumpHostname
+        environment["HPC_DUO_OPTION"] = settings.duoOption
+        environment["HPC_CONTROL_PATH"] = settings.controlPath
         if !settings.jumpControlPath.isEmpty {
-            environment["AIRE_JUMP_CONTROL_PATH"] = settings.jumpControlPath
+            environment["HPC_JUMP_CONTROL_PATH"] = settings.jumpControlPath
         }
-        environment["AIRE_FORCE_RELOGIN"] = "1"
-        environment["AIRE_LOGIN_DEBUG_LOG"] = "\(settings.runtimeDirectory)/login_debug.log"
-        environment["AIRE_TIMEOUT"] = "180"
-        if !settings.useSSHAlias {
-            environment["AIRE_SKIP_TARGET"] = "1"
-        }
+        environment["HPC_FORCE_RELOGIN"] = "1"
+        environment["HPC_LOGIN_DEBUG_LOG"] = "\(settings.runtimeDirectory)/login_debug.log"
+        environment["HPC_TIMEOUT"] = "180"
 
         var statusLineHandler: (@Sendable (String) -> Void)?
         if let onStatus {
@@ -302,33 +304,41 @@ struct MonitorService: Sendable {
             }
         }
 
-        let helperResult = try await runProcess(
-            executable: "/usr/bin/expect",
-            arguments: [helper],
-            currentDirectory: settings.projectRoot,
-            environment: environment,
-            stdin: password + "\n",
-            timeout: 190,
-            onOutputLine: statusLineHandler
-        )
-
-        if helperResult.exitCode != 0 {
-            let message = helperResult.stderr.isEmpty ? helperResult.stdout : helperResult.stderr
-            try? writeLoginDebug(settings: settings, result: helperResult)
-            throw MonitorError.processFailed(
-                Self.explainSSHFailure(message, exitCode: helperResult.exitCode)
+        var transcript = ProcessResult(stdout: "", stderr: "", exitCode: 0)
+        if settings.useJumpHost {
+            let helper = "\(settings.projectRoot)/\(Self.loginHelperScript)"
+            try requireFile(helper)
+            var jumpEnvironment = environment
+            // The expect helper only owns the jump leg; the target master is
+            // started by the zsh starter below for both routes.
+            jumpEnvironment["HPC_SKIP_TARGET"] = "1"
+            let helperResult = try await runProcess(
+                executable: "/usr/bin/expect",
+                arguments: [helper],
+                currentDirectory: settings.projectRoot,
+                environment: jumpEnvironment,
+                stdin: password + "\n",
+                timeout: 190,
+                onOutputLine: statusLineHandler
             )
+            transcript = helperResult
+            if helperResult.exitCode != 0 {
+                let message = helperResult.stderr.isEmpty ? helperResult.stdout : helperResult.stderr
+                try? writeLoginDebug(settings: settings, result: helperResult)
+                // This helper only handles the shared jump leg, so its
+                // failures (including a rejected password) belong to rash,
+                // not to the cluster being signed in to.
+                throw Self.loginError(
+                    message,
+                    exitCode: helperResult.exitCode,
+                    clusterName: "\(settings.jumpHostname) (jump host)",
+                    isJumpLeg: true
+                )
+            }
         }
 
-        guard !settings.useSSHAlias else {
-            try? writeLoginDebug(settings: settings, result: helperResult)
-            return helperResult.stdout
-        }
-
-        let targetStarter = "\(settings.projectRoot)/scripts/aire_start_target_master.zsh"
+        let targetStarter = "\(settings.projectRoot)/\(Self.targetStarterScript)"
         try requireFile(targetStarter)
-        var targetEnvironment = environment
-        targetEnvironment["AIRE_PROJECT_ROOT"] = settings.projectRoot
         // The password is handed to the starter as the first line of stdin
         // (read via `read -rs`); it must never appear in any child environment
         // or argv.
@@ -336,39 +346,56 @@ struct MonitorService: Sendable {
             executable: "/bin/zsh",
             arguments: [targetStarter],
             currentDirectory: settings.projectRoot,
-            environment: targetEnvironment,
+            environment: environment,
             stdin: password + "\n",
             timeout: 190,
             onOutputLine: statusLineHandler
         )
         let combinedResult = ProcessResult(
-            stdout: [helperResult.stdout, targetResult.stdout]
+            stdout: [transcript.stdout, targetResult.stdout]
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n"),
-            stderr: [helperResult.stderr, targetResult.stderr]
+            stderr: [transcript.stderr, targetResult.stderr]
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n"),
             exitCode: targetResult.exitCode
         )
+        try? writeLoginDebug(settings: settings, result: combinedResult)
         if targetResult.exitCode != 0 {
             let message = targetResult.stderr.isEmpty ? targetResult.stdout : targetResult.stderr
-            try? writeLoginDebug(settings: settings, result: combinedResult)
-            throw MonitorError.processFailed(
-                Self.explainSSHFailure(message, exitCode: targetResult.exitCode)
-            )
+            throw Self.loginError(message, exitCode: targetResult.exitCode, clusterName: settings.clusterName)
         }
-        try? writeLoginDebug(settings: settings, result: combinedResult)
         return combinedResult.stdout
     }
 
-    func collectSnapshot(settings: ServerSettings) async throws -> ClusterSnapshot {
-        try prepareRuntime(settings: settings)
-        let script = "\(settings.projectRoot)/scripts/aire_monitor_snapshot.py"
+    private static func loginError(
+        _ message: String,
+        exitCode: Int32,
+        clusterName: String,
+        isJumpLeg: Bool = false
+    ) -> MonitorError {
+        let explanation = explainSSHFailure(message, exitCode: exitCode, clusterName: clusterName)
+        switch exitCode {
+        case 13:
+            return .passwordRejected(explanation)
+        case 14:
+            return .passwordExpired(explanation)
+        default:
+            return isJumpLeg ? .jumpHostFailed(explanation) : .processFailed(explanation)
+        }
+    }
+
+    func collectSnapshot(settings: ConnectionSettings) async throws -> ClusterSnapshot {
+        // Check the script first: the project root is a free-text field, and
+        // creating runtime directories under a half-typed path would litter
+        // the disk (and turn "missing file" into a confusing mkdir error).
+        let script = "\(settings.projectRoot)/\(Self.collectorScript)"
         try requireFile(script)
+        try prepareRuntime(settings: settings)
 
         let result = try await runProcess(
             executable: "/usr/bin/python3",
-            arguments: snapshotArguments(settings: settings, script: script),
+            arguments: [script] + Self.collectorArguments(settings: settings),
             currentDirectory: settings.projectRoot,
             environment: ProcessInfo.processInfo.environment,
             stdin: nil,
@@ -378,7 +405,7 @@ struct MonitorService: Sendable {
         guard !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let detail = result.stderr.isEmpty
                 ? "snapshot script produced no output"
-                : Self.explainSSHFailure(result.stderr, exitCode: result.exitCode)
+                : Self.explainSSHFailure(result.stderr, exitCode: result.exitCode, clusterName: settings.clusterName)
             throw MonitorError.invalidJSON(detail)
         }
         let data = Data(result.stdout.utf8)
@@ -387,48 +414,45 @@ struct MonitorService: Sendable {
             let snapshot = try JSONDecoder().decode(ClusterSnapshot.self, from: data)
             if result.exitCode != 0 && snapshot.errors.isEmpty {
                 let message = result.stderr.isEmpty ? result.stdout : result.stderr
-                throw MonitorError.processFailed(Self.explainSSHFailure(message, exitCode: result.exitCode))
+                throw MonitorError.processFailed(
+                    Self.explainSSHFailure(message, exitCode: result.exitCode, clusterName: settings.clusterName)
+                )
             }
             return snapshot
         } catch let error as MonitorError {
             throw error
         } catch {
             let detail = result.stderr.isEmpty ? error.localizedDescription : result.stderr
-            throw MonitorError.invalidJSON(Self.explainSSHFailure(detail))
+            throw MonitorError.invalidJSON(Self.explainSSHFailure(detail, clusterName: settings.clusterName))
         }
     }
 
-    /// One-shot remote command over the existing SSH session (ControlMaster
-    /// socket in explicit mode, the alias's own config in alias mode). Never
+    /// One-shot remote command over the cluster's ControlMaster. Never
     /// touches a password: BatchMode suppresses every prompt. A dead master
     /// does NOT fail fast on its own — OpenSSH silently falls back to a
-    /// direct, un-jumped connection — so explicit mode pre-flights the master
-    /// with `ssh -O check` and throws a readable error instead.
+    /// direct, un-jumped connection — so the master is pre-flighted with
+    /// `ssh -O check` and a readable error is thrown instead.
     func runRemoteCommand(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         command: String,
         timeout: TimeInterval = 30
     ) async throws -> ProcessResult {
-        var arguments = ["-o", "BatchMode=yes"]
-        if settings.useSSHAlias {
-            arguments.append(settings.sshAlias)
-        } else {
-            try await requireLiveMaster(settings: settings)
-            arguments.append(contentsOf: [
-                "-S", settings.controlPath,
-                "-o", "User=\(settings.username)",
-                "-o", "PasswordAuthentication=no",
-                "-o", "KbdInteractiveAuthentication=no",
-                // Defense in depth behind the pre-flight: if ssh still falls
-                // back to a direct connection, fail within seconds instead of
-                // hanging into the watchdog timeout, and never let a stray
-                // ~/.ssh/config ControlMaster=auto spawn a new master.
-                "-o", "ConnectTimeout=5",
-                "-o", "ControlMaster=no",
-                settings.aireHostname
-            ])
-        }
-        arguments.append(command)
+        try await requireLiveMaster(settings: settings)
+        let arguments = [
+            "-o", "BatchMode=yes",
+            "-S", settings.controlPath,
+            "-o", "User=\(settings.username)",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            // Defense in depth behind the pre-flight: if ssh still falls
+            // back to a direct connection, fail within seconds instead of
+            // hanging into the watchdog timeout, and never let a stray
+            // ~/.ssh/config ControlMaster=auto spawn a new master.
+            "-o", "ConnectTimeout=5",
+            "-o", "ControlMaster=no",
+            settings.hostname,
+            command
+        ]
         return try await runProcess(
             executable: "/usr/bin/ssh",
             arguments: arguments,
@@ -441,18 +465,16 @@ struct MonitorService: Sendable {
 
     /// File-transfer entry point for `RemoteFileService`: executes
     /// `/usr/bin/scp` with pre-built arguments — no shell is ever involved,
-    /// so argv elements need no quoting. Explicit mode pre-flights the
-    /// ControlMaster exactly like `runRemoteCommand`, so a dead session
-    /// throws a readable error instantly instead of scp silently dialing the
-    /// host directly (bypassing the jump host) and hanging.
+    /// so argv elements need no quoting. The ControlMaster is pre-flighted
+    /// exactly like `runRemoteCommand`, so a dead session throws a readable
+    /// error instantly instead of scp silently dialing the host directly
+    /// (bypassing the jump host) and hanging.
     func runTransfer(
-        settings: ServerSettings,
+        settings: ConnectionSettings,
         arguments: [String],
         timeout: TimeInterval
     ) async throws -> ProcessResult {
-        if !settings.useSSHAlias {
-            try await requireLiveMaster(settings: settings)
-        }
+        try await requireLiveMaster(settings: settings)
         return try await runProcess(
             executable: "/usr/bin/scp",
             arguments: arguments,
@@ -463,40 +485,40 @@ struct MonitorService: Sendable {
         )
     }
 
-    /// Verifies the explicit-mode ControlMaster with `ssh -O check`, which
-    /// fails in milliseconds for both a missing and a dead socket. Without
-    /// this, a dead master makes ssh silently dial the host directly
-    /// (bypassing the jump host) and the eventual timeout surfaces as a
-    /// misleading login/Duo-flavored error.
-    private func requireLiveMaster(settings: ServerSettings) async throws {
+    /// Verifies the cluster's ControlMaster with `ssh -O check`, which fails
+    /// in milliseconds for both a missing and a dead socket. Without this, a
+    /// dead master makes ssh silently dial the host directly (bypassing the
+    /// jump host) and the eventual timeout surfaces as a misleading
+    /// login/Duo-flavored error.
+    func requireLiveMaster(settings: ConnectionSettings) async throws {
         let check = try await runProcess(
             executable: "/usr/bin/ssh",
-            arguments: ["-S", settings.controlPath, "-O", "check", settings.aireHostname],
+            arguments: ["-S", settings.controlPath, "-O", "check", settings.hostname],
             currentDirectory: settings.projectRoot,
             environment: ProcessInfo.processInfo.environment,
             stdin: nil,
             timeout: 5
         )
         guard check.exitCode == 0 else {
-            throw MonitorError.processFailed("SSH session expired — use Login to reconnect.")
+            throw MonitorError.processFailed(
+                "\(settings.clusterName) SSH session expired — use Connect to sign in to \(settings.clusterName) again."
+            )
         }
     }
 
-    private func snapshotArguments(settings: ServerSettings, script: String) -> [String] {
-        if settings.useSSHAlias {
-            return [
-                script,
-                "--host", settings.sshAlias,
-                "--timeout", "30"
-            ]
-        }
+    /// The collector's argument list (without the script path). Also written,
+    /// password-free, to the cluster's runtime directory so the desktop
+    /// widget can run the identical collection when the app is not running.
+    static func collectorArguments(settings: ConnectionSettings) -> [String] {
         var arguments = [
-            script,
+            "--cluster-id", settings.clusterID.rawValue,
+            "--cluster-name", settings.clusterName,
             "--username", settings.username,
-            "--aire-hostname", settings.aireHostname,
+            "--hostname", settings.hostname,
             "--jump-hostname", settings.jumpHostname,
             settings.useJumpHost ? "--use-jump-host" : "--no-jump-host",
             "--control-path", settings.controlPath,
+            "--storage-spec", storageSpecJSON(settings.storage),
             "--timeout", "30"
         ]
         if !settings.jumpControlPath.isEmpty {
@@ -505,12 +527,24 @@ struct MonitorService: Sendable {
         return arguments
     }
 
-    private func prepareRuntime(settings: ServerSettings) throws {
-        if settings.controlPath.isEmpty && settings.jumpControlPath.isEmpty {
-            return
+    private static func storageSpecJSON(_ storage: [StorageVolumeSpec]) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(storage),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
         }
+        return json
+    }
+
+    private func prepareRuntime(settings: ConnectionSettings) throws {
         try FileManager.default.createDirectory(
             atPath: settings.controlDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createDirectory(
+            atPath: settings.runtimeDirectory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
@@ -522,7 +556,7 @@ struct MonitorService: Sendable {
         }
     }
 
-    private func writeLoginDebug(settings: ServerSettings, result: ProcessResult) throws {
+    private func writeLoginDebug(settings: ConnectionSettings, result: ProcessResult) throws {
         try FileManager.default.createDirectory(
             atPath: settings.runtimeDirectory,
             withIntermediateDirectories: true
@@ -546,36 +580,74 @@ struct MonitorService: Sendable {
             try handle.close()
         } else {
             try data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 
-    static func explainSSHFailure(_ rawMessage: String, exitCode: Int32? = nil) -> String {
+    static func explainSSHFailure(
+        _ rawMessage: String,
+        exitCode: Int32? = nil,
+        clusterName: String = "the cluster"
+    ) -> String {
         let raw = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = raw.lowercased()
         let prefix: String
 
         if exitCode == 13 {
             prefix = """
-            Password was rejected — re-enter it (and check for a pending Duo lockout).
+            Password was rejected by \(clusterName) — re-enter it (and check for a pending Duo lockout).
 
             The server asked for the password a second time, which normally means the password is wrong. Update the saved password and try again; repeated wrong attempts can temporarily lock the account.
             """
-        } else if lower.contains("connection timed out during banner exchange")
-            || lower.contains("connection to unknown port 65535 timed out") {
+        } else if exitCode == 14 {
             prefix = """
-            SSH timed out while opening the connection to AIRE.
+            \(clusterName) asked for a password change — the university password has expired.
 
-            If you are on the University VPN, use the "Direct (VPN)" route. If you are off-VPN, use the "Via rash jump host" route. Then check the AIRE host, the jump host (rash route only), network access, and that your username is valid on both hosts.
+            Change it through the University's password service, then sign in again with the new password. The app never answers password-change prompts.
+            """
+        } else if lower.contains("not allowed at this time")
+            || lower.contains("kex_exchange_identification")
+            || lower.contains("connection reset by")
+            || lower.contains("session open refused by peer") {
+            // Checked before the "UNKNOWN port 65535" tunnel case: through
+            // rash OpenSSH has no peer address, so a login node refusing us
+            // ALSO reads "... by UNKNOWN port 65535". These markers prove
+            // the far end answered, so rash itself was fine.
+            prefix = """
+            \(clusterName) closed the connection before authentication.
+
+            This is a server-side refusal, not a wrong password. Busy or newly opened login nodes (Calder's round-robin DNS has shown this) sometimes drop new connections — wait a minute and connect again. If it persists, report the time and the raw output below to Research Computing.
+            """
+        } else if lower.contains("unknown port 65535") {
+            // OpenSSH reports a ProxyCommand failure as "UNKNOWN port 65535":
+            // the rash tunnel, not the cluster, is what broke.
+            prefix = """
+            The rash jump tunnel to \(clusterName) failed.
+
+            The jump-host session has probably expired or the network changed. Connect again — the app re-authenticates rash only when its session is no longer healthy. If you are on the University VPN, the "Direct (VPN)" route avoids rash entirely.
+            """
+        } else if lower.contains("connection closed by") && !lower.contains("permission denied") {
+            prefix = """
+            \(clusterName) closed the connection before authentication.
+
+            This is a server-side refusal, not a wrong password. Busy or newly opened login nodes (Calder's round-robin DNS has shown this) sometimes drop new connections — wait a minute and connect again. If it persists, report the time and the raw output below to Research Computing.
+            """
+        } else if lower.contains("connection timed out during banner exchange")
+            || lower.contains("operation timed out") {
+            prefix = """
+            SSH timed out while opening the connection to \(clusterName).
+
+            If you are on the University VPN or campus network, use the "Direct (VPN)" route. If you are off-VPN, use the "Via rash jump host" route. Then check the host names in Advanced, network access, and that your username is valid on both hosts.
             """
         } else if lower.contains("permission denied") {
             prefix = """
-            SSH authentication was rejected.
+            SSH authentication to \(clusterName) was rejected.
 
             Check the password, Duo approval, and username. If Duo sends a push, approve it before the login timeout expires.
             """
         } else if lower.contains("timed out while waiting") || lower.contains("process timed out") {
             prefix = """
-            The login process timed out.
+            The \(clusterName) login timed out.
 
             This usually means the app was waiting for a password, Duo prompt, Duo approval, or SSH banner. Try again and watch for a Duo push notification.
             """
@@ -583,16 +655,16 @@ struct MonitorService: Sendable {
             prefix = """
             SSH could not resolve one of the hostnames.
 
-            Check the AIRE host and, on the rash route, the jump host in Advanced.
+            Check the \(clusterName) host and, on the rash route, the jump host in Advanced.
             """
         } else if lower.contains("no such file or directory") && lower.contains("ssh-askpass") {
             prefix = """
             SSH attempted to ask for a password outside the app.
 
-            Use Login in the app first so the expect helper can handle the password and Duo prompts.
+            Use Connect in the app first so the helper can handle the password and Duo prompts.
             """
         } else {
-            prefix = "SSH command failed."
+            prefix = "SSH command to \(clusterName) failed."
         }
 
         if raw.isEmpty {
@@ -631,7 +703,7 @@ struct MonitorService: Sendable {
         let signalState = ProcessSignalState()
 
         let drainGroup = DispatchGroup()
-        let drainQueue = DispatchQueue(label: "AIREMonitor.process-pipes", attributes: .concurrent)
+        let drainQueue = DispatchQueue(label: "HPCMonitor.process-pipes", attributes: .concurrent)
 
         func startDraining(_ handle: FileHandle, into collector: PipeCollector) {
             drainGroup.enter()

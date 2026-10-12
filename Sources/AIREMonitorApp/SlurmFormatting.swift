@@ -18,6 +18,14 @@ enum SlurmState: Equatable {
 
     init(parsing raw: String) {
         let value = raw.lowercased()
+        // A trailing "*" in compact sinfo states means the node is not
+        // responding ("idle*", "down*"): whatever its base state, the
+        // scheduler cannot start work there, so it must not count as free
+        // capacity.
+        if value.hasSuffix("*") {
+            self = .unavailable
+            return
+        }
         if value.contains("maint")
             || value.contains("down")
             || value.contains("drain")
@@ -40,7 +48,12 @@ enum SlurmState: Equatable {
             self = .running
         } else if value.contains("pend") {
             self = .pending
-        } else if value.contains("idle") {
+        } else if value.contains("idle") || value.contains("plnd") {
+            // Compact `sinfo %t` prints IDLE+PLANNED (an idle node the
+            // backfill scheduler has earmarked for a queued job, routine on
+            // Calder's H200 nodes) as "plnd". Its base state is idle, so it
+            // is classified as such; StatePill still shows the raw "PLND"
+            // so the reservation stays visible. MIXED+PLANNED is "mix".
             self = .idle
         } else if value.contains("up") {
             self = .up
@@ -105,7 +118,8 @@ func isAvailable(_ node: NodeSummary) -> Bool {
 // MARK: - GRES / GPU parsing
 
 /// Sums GPU counts from a Slurm GRES string.
-/// Handles `gpu:4`, `gpu:l40s:3`, `gpu:l40s:3(S:0-1)`, `gpu:a100:4,mps:400`, and `(null)`.
+/// Handles `gpu:4`, `gpu:l40s:3` (AIRE), `gpu:nvidia_h200:8(S:0-1)` (Calder),
+/// `gpu:a100:4,mps:400`, and `(null)`.
 func slurmGPUTotal(from gres: String) -> Int {
     let trimmed = gres.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, trimmed.lowercased() != "(null)" else {
@@ -129,7 +143,10 @@ func slurmGPUTotal(from gres: String) -> Int {
     return total
 }
 
-/// Model name from a GRES string, e.g. "l40s" for `gpu:l40s:3(S:0-1)`.
+/// Raw Slurm gres type from a GRES string: "l40s" for `gpu:l40s:3(S:0-1)`,
+/// "nvidia_h200" for `gpu:nvidia_h200:8(S:0-1)`, nil for `gpu:4` or `(null)`.
+/// This is an identifier, not display text — never show it uppercased
+/// ("NVIDIA_H200"); use `slurmGPUModelDisplayName(from:)` instead.
 func slurmGPUModel(from gres: String) -> String? {
     for rawEntry in splitOutsideParentheses(gres, separator: ",") {
         let core = rawEntry.trimmingCharacters(in: .whitespaces).prefix { $0 != "(" }
@@ -140,6 +157,13 @@ func slurmGPUModel(from gres: String) -> String? {
         return String(pieces[1])
     }
     return nil
+}
+
+/// Display name of the GPU model in a GRES string: "L40S" for `gpu:l40s:3`,
+/// "H200" for `gpu:nvidia_h200:8(S:0-1)`, nil when the GRES names no model.
+/// The one way GPU models reach the UI, so AIRE and Calder read alike.
+func slurmGPUModelDisplayName(from gres: String) -> String? {
+    slurmGPUModel(from: gres).map(gpuModelDisplayName)
 }
 
 func gpuTotal(_ node: NodeSummary) -> Int {
@@ -161,6 +185,8 @@ func gpuIdle(_ node: NodeSummary) -> Int {
 
 /// Expands a compressed Slurm node list into concrete hostnames.
 /// `gpu[001-004,007],cpu01` -> `["gpu001", "gpu002", "gpu003", "gpu004", "gpu007", "cpu01"]`.
+/// Dashes outside the brackets are part of the name, so Calder's
+/// `calder-h200-[01-03]` -> `["calder-h200-01", "calder-h200-02", "calder-h200-03"]`.
 func expandNodeList(_ compressed: String) -> [String] {
     let trimmed = compressed.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, trimmed.lowercased() != "(null)" else {
@@ -200,6 +226,8 @@ func expandNodeList(_ compressed: String) -> [String] {
 
 /// Set of nodes running the given jobs, built from exact expanded hostnames.
 /// Never substring-matches, so `gpu1` can not collide with `gpu10`.
+/// Hostnames are only unique within one cluster: pass a single cluster's
+/// jobs and test the result only against that cluster's nodes.
 func busyNodeSet(for jobs: [Job]) -> Set<String> {
     var nodes = Set<String>()
     for job in jobs {
@@ -261,11 +289,32 @@ func gpuText(_ node: NodeSummary) -> String {
     return "\(gpuAllocated(node))/\(total)"
 }
 
+/// Human text for a Slurm time limit as printed by `sinfo %l` / `squeue %l`:
+/// "2-00:00:00" -> "2 days" (Calder's partition maximum), "1-12:00:00" ->
+/// "1 day 12 h", "12:00:00" -> "12 h", "0:30:00" or "30:00" -> "30 min",
+/// "infinite" / "UNLIMITED" -> "no limit". Empty and "n/a" give the
+/// missing-value placeholder. Anything unparsable is returned unchanged:
+/// showing Slurm's own text beats guessing at a walltime.
+func formatSlurmTimeLimit(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lowered = trimmed.lowercased()
+    if trimmed.isEmpty || lowered == "n/a" {
+        return missingValuePlaceholder
+    }
+    if lowered == "infinite" || lowered == "unlimited" {
+        return "no limit"
+    }
+    guard let seconds = slurmDurationSeconds(trimmed) else {
+        return trimmed
+    }
+    return slurmDurationText(seconds: seconds)
+}
+
 // MARK: - Timestamps
 
 /// Humane timestamp presentation: relative text for display, absolute for tooltips.
 @MainActor
-enum AIRETimestamp {
+enum SlurmTimestamp {
     private static let isoWithFraction: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -320,6 +369,75 @@ enum AIRETimestamp {
         }
         return date.formatted(date: .abbreviated, time: .standard)
     }
+}
+
+// MARK: - Private duration helpers
+
+/// Seconds in a Slurm duration. Slurm accepts "M", "M:S", "H:M:S", "D-H",
+/// "D-H:M" and "D-H:M:S": without a day part a lone field is minutes, with
+/// one the clock fields are hours[:minutes[:seconds]].
+private func slurmDurationSeconds(_ text: String) -> Int? {
+    var days = 0
+    var clock = Substring(text)
+    let hasDayPart = text.contains("-")
+    if hasDayPart {
+        let pieces = text.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard pieces.count == 2, let parsedDays = Int(pieces[0]), parsedDays >= 0 else {
+            return nil
+        }
+        days = parsedDays
+        clock = pieces[1]
+    }
+    var values: [Int] = []
+    for field in clock.split(separator: ":", omittingEmptySubsequences: false) {
+        guard let value = Int(field), value >= 0 else {
+            return nil
+        }
+        values.append(value)
+    }
+    let clockSeconds: Int
+    if hasDayPart {
+        guard (1...3).contains(values.count) else {
+            return nil
+        }
+        let padded = values + Array(repeating: 0, count: 3 - values.count)
+        clockSeconds = padded[0] * 3600 + padded[1] * 60 + padded[2]
+    } else {
+        switch values.count {
+        case 1:
+            clockSeconds = values[0] * 60
+        case 2:
+            clockSeconds = values[0] * 60 + values[1]
+        case 3:
+            clockSeconds = values[0] * 3600 + values[1] * 60 + values[2]
+        default:
+            return nil
+        }
+    }
+    return days * 86_400 + clockSeconds
+}
+
+/// "2 days", "1 day 12 h", "1 h 30 min", "45 s". Seconds only appear for
+/// sub-hour values; a walltime is never meaningfully "2 days 0 h 0 min 5 s".
+private func slurmDurationText(seconds total: Int) -> String {
+    let days = total / 86_400
+    let hours = total % 86_400 / 3600
+    let minutes = total % 3600 / 60
+    let seconds = total % 60
+    var parts: [String] = []
+    if days > 0 {
+        parts.append(days == 1 ? "1 day" : "\(days) days")
+    }
+    if hours > 0 {
+        parts.append("\(hours) h")
+    }
+    if minutes > 0 {
+        parts.append("\(minutes) min")
+    }
+    if seconds > 0 && days == 0 && hours == 0 {
+        parts.append("\(seconds) s")
+    }
+    return parts.isEmpty ? "0 min" : parts.joined(separator: " ")
 }
 
 // MARK: - Private splitting helpers

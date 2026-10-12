@@ -2,7 +2,7 @@ import Foundation
 import UserNotifications
 import os
 
-private let cacheLogger = Logger(subsystem: "AIREMonitor", category: "SnapshotCache")
+private let cacheLogger = Logger(subsystem: "HPCMonitor", category: "SnapshotCache")
 
 // ISO8601DateFormatter is documented as thread-safe; share one instance
 // instead of allocating a formatter per call.
@@ -21,30 +21,6 @@ struct JobStateSnapshot: Codable {
     let jobs: [String: JobStateRecord]
 }
 
-struct ConnectionProfile: Codable {
-    let updatedAt: String
-    let useSSHAlias: Bool
-    let sshAlias: String
-    let username: String
-    let aireHostname: String
-    let useJumpHost: Bool
-    let jumpHostname: String
-    let controlPath: String
-    let jumpControlPath: String
-
-    init(settings: ServerSettings) {
-        updatedAt = iso8601Formatter.string(from: Date())
-        useSSHAlias = settings.useSSHAlias
-        sshAlias = settings.sshAlias
-        username = settings.username
-        aireHostname = settings.aireHostname
-        useJumpHost = settings.useJumpHost
-        jumpHostname = settings.jumpHostname
-        controlPath = settings.controlPath
-        jumpControlPath = settings.jumpControlPath
-    }
-}
-
 struct TrendPoint: Codable, Identifiable {
     let collectedAt: String
     let totalJobs: Int
@@ -58,37 +34,17 @@ struct TrendPoint: Codable, Identifiable {
     let scratchUsedPercent: Double?
     let homeAvailableGB: Double?
     let scratchAvailableGB: Double?
+    // Optional so history files written before flash was collected decode.
+    let flashUsedPercent: Double?
+    let flashAvailableGB: Double?
 
     var id: String { collectedAt }
 }
 
-struct SnapshotCache {
-    let projectRoot: String
-
-    private var runtimeURL: URL {
-        URL(fileURLWithPath: projectRoot).appendingPathComponent(".runtime")
-    }
-
-    var latestSnapshotURL: URL {
-        runtimeURL.appendingPathComponent("latest_snapshot.json")
-    }
-
-    private var jobStateURL: URL {
-        runtimeURL.appendingPathComponent("job_state.json")
-    }
-
-    private var historyURL: URL {
-        runtimeURL.appendingPathComponent("snapshot_history.json")
-    }
-
-    private var connectionProfileURL: URL {
-        runtimeURL.appendingPathComponent("connection_profile.json")
-    }
-
-    /// Decodes the JSON file at `url`. A file that exists but no longer
-    /// decodes is moved aside (".bad" suffix) and logged rather than being
-    /// silently discarded and overwritten on the next save.
-    private func decodeQuarantining<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
+/// Reads and writes one file atomically, quarantining files that no longer
+/// decode instead of silently discarding (and later overwriting) them.
+private enum JSONFile {
+    static func decodeQuarantining<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else {
             return nil
         }
@@ -105,32 +61,63 @@ struct SnapshotCache {
         }
     }
 
+    static func write<T: Encodable>(_ value: T, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder.prettySorted.encode(value)
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+/// Per-cluster cache under `.runtime/clusters/<id>/`. Every cluster has its
+/// own snapshot, history and job-state baseline: Slurm job ids are only
+/// unique within one cluster, so a shared baseline would mis-fire
+/// start/end notifications across clusters.
+struct SnapshotCache {
+    let projectRoot: String
+    let clusterID: ClusterID
+
+    static func clustersRoot(projectRoot: String) -> URL {
+        URL(fileURLWithPath: projectRoot)
+            .appendingPathComponent(".runtime")
+            .appendingPathComponent("clusters")
+    }
+
+    var directoryURL: URL {
+        Self.clustersRoot(projectRoot: projectRoot).appendingPathComponent(clusterID.rawValue)
+    }
+
+    var latestSnapshotURL: URL {
+        directoryURL.appendingPathComponent("latest_snapshot.json")
+    }
+
+    private var jobStateURL: URL {
+        directoryURL.appendingPathComponent("job_state.json")
+    }
+
+    private var historyURL: URL {
+        directoryURL.appendingPathComponent("snapshot_history.json")
+    }
+
+    private var collectorURL: URL {
+        directoryURL.appendingPathComponent("collector.json")
+    }
+
     func loadLatestSnapshot() -> ClusterSnapshot? {
-        decodeQuarantining(ClusterSnapshot.self, from: latestSnapshotURL)
+        JSONFile.decodeQuarantining(ClusterSnapshot.self, from: latestSnapshotURL)
     }
 
     func saveLatestSnapshot(_ snapshot: ClusterSnapshot) throws {
-        try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
-        let data = try JSONEncoder.prettyAIRE.encode(snapshot)
-        try data.write(to: latestSnapshotURL, options: .atomic)
-    }
-
-    func loadConnectionProfile() -> ConnectionProfile? {
-        decodeQuarantining(ConnectionProfile.self, from: connectionProfileURL)
-    }
-
-    func saveConnectionProfile(_ profile: ConnectionProfile) throws {
-        try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
-        let data = try JSONEncoder.prettyAIRE.encode(profile)
-        try data.write(to: connectionProfileURL, options: .atomic)
+        try JSONFile.write(snapshot, to: latestSnapshotURL)
     }
 
     func loadHistory() -> [TrendPoint] {
-        decodeQuarantining([TrendPoint].self, from: historyURL) ?? []
+        JSONFile.decodeQuarantining([TrendPoint].self, from: historyURL) ?? []
     }
 
     func recordHistory(from snapshot: ClusterSnapshot) throws -> [TrendPoint] {
-        try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
         var history = loadHistory()
         let point = TrendPoint(snapshot: snapshot)
         // Dedupe by membership, not just the last entry: a stale collectedAt
@@ -143,17 +130,15 @@ struct SnapshotCache {
         if history.count > 1440 {
             history = Array(history.suffix(1440))
         }
-        let data = try JSONEncoder.prettyAIRE.encode(history)
-        try data.write(to: historyURL, options: .atomic)
+        try JSONFile.write(history, to: historyURL)
         return history
     }
 
     func loadJobStateSnapshot() -> JobStateSnapshot? {
-        decodeQuarantining(JobStateSnapshot.self, from: jobStateURL)
+        JSONFile.decodeQuarantining(JobStateSnapshot.self, from: jobStateURL)
     }
 
     func saveJobStates(from jobs: [Job]) throws {
-        try FileManager.default.createDirectory(at: runtimeURL, withIntermediateDirectories: true)
         let now = iso8601Formatter.string(from: Date())
         let records = Dictionary(
             jobs.map { job in
@@ -171,9 +156,138 @@ struct SnapshotCache {
             uniquingKeysWith: { _, last in last }
         )
         let state = JobStateSnapshot(updatedAt: now, jobs: records)
-        let data = try JSONEncoder.prettyAIRE.encode(state)
-        try data.write(to: jobStateURL, options: .atomic)
+        try JSONFile.write(state, to: jobStateURL)
     }
+
+    /// Password-free record of the exact collector invocation, consumed by
+    /// the desktop widget's fallback collection.
+    func saveCollectorArguments(_ arguments: [String]) throws {
+        struct CollectorInvocation: Encodable {
+            let updatedAt: String
+            let script: String
+            let arguments: [String]
+        }
+        try JSONFile.write(
+            CollectorInvocation(
+                updatedAt: iso8601Formatter.string(from: Date()),
+                script: MonitorService.collectorScript,
+                arguments: arguments
+            ),
+            to: collectorURL
+        )
+    }
+}
+
+// MARK: - Preferences
+
+/// Password-free settings persisted in `.runtime/preferences.json`.
+struct AppPreferences: Codable {
+    struct ClusterPreference: Codable {
+        var enabled: Bool
+        var hostname: String
+    }
+
+    var username: String = ""
+    var route: ConnectionRoute = .directVPN
+    var jumpHostname: String = "rash.leeds.ac.uk"
+    var duoOption: String = "1"
+    /// Keyed by ClusterID.rawValue.
+    var clusters: [String: ClusterPreference] = [:]
+    /// "overview" or "cluster:<id>".
+    var selection: String?
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+        route = (try? container.decodeIfPresent(ConnectionRoute.self, forKey: .route)) ?? .directVPN
+        jumpHostname = try container.decodeIfPresent(String.self, forKey: .jumpHostname) ?? "rash.leeds.ac.uk"
+        duoOption = try container.decodeIfPresent(String.self, forKey: .duoOption) ?? "1"
+        clusters = try container.decodeIfPresent([String: ClusterPreference].self, forKey: .clusters) ?? [:]
+        selection = try container.decodeIfPresent(String.self, forKey: .selection)
+    }
+}
+
+struct PreferencesStore {
+    let projectRoot: String
+
+    private var runtimeURL: URL {
+        URL(fileURLWithPath: projectRoot).appendingPathComponent(".runtime")
+    }
+
+    private var preferencesURL: URL {
+        runtimeURL.appendingPathComponent("preferences.json")
+    }
+
+    /// Loads preferences, migrating a pre-multi-cluster installation on
+    /// first launch: the single-cluster connection profile seeds the shared
+    /// sign-in fields and AIRE's host, and the single-cluster snapshot cache
+    /// files move into `.runtime/clusters/aire/` (the only cluster that
+    /// existed then).
+    func load() -> AppPreferences {
+        migrateLegacySnapshotFiles()
+        if let preferences = JSONFile.decodeQuarantining(AppPreferences.self, from: preferencesURL) {
+            return preferences
+        }
+        return legacyPreferences() ?? AppPreferences()
+    }
+
+    func save(_ preferences: AppPreferences) throws {
+        try JSONFile.write(preferences, to: preferencesURL)
+    }
+
+    private func legacyPreferences() -> AppPreferences? {
+        struct LegacyConnectionProfile: Decodable {
+            let username: String?
+            let aireHostname: String?
+            let useJumpHost: Bool?
+            let useSSHAlias: Bool?
+            let jumpHostname: String?
+        }
+        let url = runtimeURL.appendingPathComponent("connection_profile.json")
+        guard let legacy = JSONFile.decodeQuarantining(LegacyConnectionProfile.self, from: url) else {
+            return nil
+        }
+        var preferences = AppPreferences()
+        preferences.username = legacy.username ?? ""
+        preferences.route = (legacy.useSSHAlias != true && legacy.useJumpHost == true) ? .rashJump : .directVPN
+        if let jump = legacy.jumpHostname, !jump.isEmpty {
+            preferences.jumpHostname = jump
+        }
+        if let host = legacy.aireHostname, !host.isEmpty {
+            preferences.clusters[ClusterID.aire.rawValue] = .init(enabled: true, hostname: host)
+        }
+        return preferences
+    }
+
+    private func migrateLegacySnapshotFiles() {
+        let fileManager = FileManager.default
+        let aireDirectory = SnapshotCache.clustersRoot(projectRoot: projectRoot)
+            .appendingPathComponent(ClusterID.aire.rawValue)
+        for name in ["latest_snapshot.json", "snapshot_history.json", "job_state.json"] {
+            let legacy = runtimeURL.appendingPathComponent(name)
+            let migrated = aireDirectory.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: legacy.path),
+                  !fileManager.fileExists(atPath: migrated.path) else {
+                continue
+            }
+            do {
+                try fileManager.createDirectory(at: aireDirectory, withIntermediateDirectories: true)
+                try fileManager.moveItem(at: legacy, to: migrated)
+            } catch {
+                cacheLogger.error(
+                    "Could not migrate \(name, privacy: .public) into clusters/aire: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+    }
+}
+
+/// File-scope so it can call the global `gpuIdle(_:)`, which TrendPoint's
+/// own `gpuIdle` property shadows inside the initializer.
+private func idleGPUsOnAvailableNodes(_ nodes: [NodeSummary]) -> Int {
+    nodes.filter { isAvailable($0) }.reduce(0) { $0 + gpuIdle($1) }
 }
 
 extension TrendPoint {
@@ -182,8 +296,9 @@ extension TrendPoint {
         let gpuTotalValue = gpuNodes.reduce(0) { $0 + ($1.gpuTotal ?? slurmGPUTotal(from: $1.gres)) }
         let gpuAllocatedValue = gpuNodes.reduce(0) { $0 + ($1.gpuAllocated ?? 0) }
         let storage = snapshot.storage ?? []
-        let home = storage.first { $0.label.lowercased() == "home" }
-        let scratch = storage.first { $0.label.lowercased() == "scratch" }
+        let home = storage.first { $0.kind == .home }
+        let scratch = storage.first { $0.kind == .scratch }
+        let flash = storage.first { $0.kind == .flash }
 
         collectedAt = snapshot.collectedAt
         totalJobs = snapshot.jobs.count
@@ -191,17 +306,23 @@ extension TrendPoint {
         pendingJobs = snapshot.jobs.filter { $0.state.uppercased().contains("PEND") }.count
         gpuTotal = gpuTotalValue
         gpuAllocated = gpuAllocatedValue
-        gpuIdle = Swift.max(gpuTotalValue - gpuAllocatedValue, 0)
+        // Free means startable now: idle GPUs on drained/down/not-responding
+        // nodes are excluded, matching ClusterSession.gpuAvailability, the
+        // Nodes tab and the widget (a drained 8-GPU node otherwise shows up
+        // as 8 "free" GPUs in the trend).
+        gpuIdle = idleGPUsOnAvailableNodes(gpuNodes)
         unavailableGpuNodes = gpuNodes.filter { !isAvailable($0) }.count
         homeUsedPercent = home?.usedPercent
         scratchUsedPercent = scratch?.usedPercent
         homeAvailableGB = home?.availableGB
         scratchAvailableGB = scratch?.availableGB
+        flashUsedPercent = flash?.usedPercent
+        flashAvailableGB = flash?.availableGB
     }
 }
 
 extension JSONEncoder {
-    static let prettyAIRE: JSONEncoder = {
+    static let prettySorted: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
@@ -259,7 +380,11 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
     /// job starts and endings. Returns true when the diff was actually
     /// processed (or there was nothing to diff yet), so callers know whether
     /// it is safe to persist the current job states as the new baseline.
-    func notifyChanges(previous: JobStateSnapshot?, current jobs: [Job]) async -> Bool {
+    func notifyChanges(
+        cluster: ClusterProfile,
+        previous: JobStateSnapshot?,
+        current jobs: [Job]
+    ) async -> Bool {
         guard Self.notificationsSupported else {
             return false
         }
@@ -304,7 +429,7 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
             } else if isPendingState(old.state),
                       isRunningState(job.state),
                       notifiedStartIds.insert(job.jobId).inserted {
-                sendJobStartedNotification(name: job.name, jobId: job.jobId, partition: job.partition)
+                sendJobStartedNotification(cluster: cluster, name: job.name, jobId: job.jobId, partition: job.partition)
             }
         }
 
@@ -322,9 +447,9 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         }
 
         if endings.count == 1, let ending = endings.first {
-            sendJobEndedNotification(ending)
+            sendJobEndedNotification(cluster: cluster, ending)
         } else if endings.count > 1 {
-            sendJobsEndedSummaryNotification(endings)
+            sendJobsEndedSummaryNotification(cluster: cluster, endings)
         }
         return true
     }
@@ -357,7 +482,12 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
     /// notification was actually queued, so the caller can start its
     /// cooldown; the same support/authorization guards as job notifications
     /// apply.
-    func notifyGPUBecameAvailable(idleCount: Int, partitions: [String]) async -> Bool {
+    func notifyGPUBecameAvailable(
+        cluster: ClusterProfile,
+        idleCount: Int,
+        gpuModel: String?,
+        partitions: [String]
+    ) async -> Bool {
         guard Self.notificationsSupported else {
             return false
         }
@@ -371,13 +501,14 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         let nodesText = partitions.isEmpty
             ? "GPU nodes"
             : "\(partitions.joined(separator: ", ")) partition nodes"
-        let countText = "\(idleCount) GPU\(idleCount == 1 ? "" : "s")"
+        let modelText = gpuModel.map { " \($0)" } ?? ""
+        let countText = "\(idleCount)\(modelText) GPU\(idleCount == 1 ? "" : "s")"
         send(
-            title: "GPU available on AIRE",
+            title: "GPU available on \(cluster.displayName)",
             subtitle: "Idle GPUs detected",
             body: "\(countText) idle across \(nodesText)",
-            identifier: "gpu-available-\(iso8601Formatter.string(from: Date()))",
-            thread: "aire-gpu-availability"
+            identifier: "\(cluster.id.rawValue)-gpu-available-\(iso8601Formatter.string(from: Date()))",
+            thread: "\(cluster.id.rawValue)-gpu-availability"
         )
         return true
     }
@@ -400,16 +531,17 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         return cleanName.isEmpty ? "Job \(jobId)" : cleanName
     }
 
-    private func sendJobStartedNotification(name: String, jobId: String, partition: String) {
+    private func sendJobStartedNotification(cluster: ClusterProfile, name: String, jobId: String, partition: String) {
         send(
-            title: "AIRE Monitor",
+            title: "\(cluster.displayName) · job started",
             subtitle: "Your job started",
             body: "\(displayName(name: name, jobId: jobId)) (#\(jobId))\nNow running on partition \(partition).",
-            identifier: "job-started-\(jobId)-\(iso8601Formatter.string(from: Date()))"
+            identifier: "\(cluster.id.rawValue)-job-started-\(jobId)-\(iso8601Formatter.string(from: Date()))",
+            thread: "\(cluster.id.rawValue)-job-events"
         )
     }
 
-    private func sendJobEndedNotification(_ ending: JobEnding) {
+    private func sendJobEndedNotification(cluster: ClusterProfile, _ ending: JobEnding) {
         let subtitle = ending.finalState == "Left queue"
             ? "Job finished or left the queue"
             : "Job ended: \(ending.finalState)"
@@ -420,22 +552,24 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         ].joined(separator: "\n")
 
         send(
-            title: "AIRE Monitor",
+            title: "\(cluster.displayName) · job ended",
             subtitle: subtitle,
             body: body,
-            identifier: "job-ended-\(ending.jobId)-\(ending.finalState)-\(iso8601Formatter.string(from: Date()))"
+            identifier: "\(cluster.id.rawValue)-job-ended-\(ending.jobId)-\(ending.finalState)-\(iso8601Formatter.string(from: Date()))",
+            thread: "\(cluster.id.rawValue)-job-events"
         )
     }
 
-    private func sendJobsEndedSummaryNotification(_ endings: [JobEnding]) {
+    private func sendJobsEndedSummaryNotification(cluster: ClusterProfile, _ endings: [JobEnding]) {
         let lines = endings.map { ending in
             "\(displayName(name: ending.name, jobId: ending.jobId)) (#\(ending.jobId)) — \(ending.finalState)"
         }
         send(
-            title: "AIRE Monitor",
+            title: "\(cluster.displayName) · jobs ended",
             subtitle: "\(endings.count) jobs ended",
             body: lines.joined(separator: "\n"),
-            identifier: "jobs-ended-summary-\(iso8601Formatter.string(from: Date()))"
+            identifier: "\(cluster.id.rawValue)-jobs-ended-summary-\(iso8601Formatter.string(from: Date()))",
+            thread: "\(cluster.id.rawValue)-job-events"
         )
     }
 
@@ -444,7 +578,7 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
         subtitle: String,
         body: String,
         identifier: String,
-        thread: String = "aire-job-events"
+        thread: String
     ) {
         let content = UNMutableNotificationContent()
         content.title = title

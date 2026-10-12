@@ -51,7 +51,7 @@ final class DashboardWindowPresenter {
             backing: .buffered,
             defer: false
         )
-        dashboardWindow.title = "AIRE Monitor"
+        dashboardWindow.title = "Leeds HPC Monitor"
         dashboardWindow.titlebarAppearsTransparent = true
         dashboardWindow.isReleasedWhenClosed = false
         dashboardWindow.contentViewController = hostingController
