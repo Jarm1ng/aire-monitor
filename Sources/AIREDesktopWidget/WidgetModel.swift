@@ -30,7 +30,7 @@ final class WidgetModel: ObservableObject {
         self.projectRoot = projectRoot
         preferences = projectRoot.map { WidgetPreferencesReader(path: "\($0)/.runtime/preferences.json") }
         if projectRoot == nil {
-            WidgetLog.app.error("Cannot find the Leeds HPC checkout (no scripts/hpc_snapshot.py under HPC_PROJECT_ROOT, the working directory or the bundle's grandparent)")
+            WidgetLog.app.error("Cannot find the Leeds HPC checkout (no scripts/hpc_snapshot.py under HPC_PROJECT_ROOT, the bundle's HPCProjectRoot, the working directory or the bundle's grandparent)")
         }
     }
 
@@ -84,10 +84,11 @@ final class WidgetModel: ObservableObject {
         feeds.first { $0.id == clusterID }?.sync(manual: true)
     }
 
-    /// Brings the app forward, or builds (only if the sources changed) and
-    /// opens it — see `WidgetAppLauncher` for why an existing bundle is
-    /// never opened directly. The launcher also repackages the widget, so a
-    /// widget whose bundle changed is restarted by it on the new build.
+    /// Brings the app forward, opens the installed app, or builds (only if
+    /// the sources changed) and opens it — see `WidgetAppLauncher` for why
+    /// a .runtime bundle is never opened directly. The launcher also
+    /// repackages the widget, so a widget whose bundle changed is restarted
+    /// by it on the new build.
     func openMainApp() {
         errorMessage = nil
         guard let projectRoot else {
@@ -104,11 +105,14 @@ final class WidgetModel: ObservableObject {
         let plan = WidgetAppLauncher.plan(
             projectRoot: projectRoot,
             runningBundlePaths: running.map { $0.bundleURL?.path },
+            installedAppPath: AppInstallRecord.installedAppPath(projectRoot: projectRoot),
             fileExists: { FileManager.default.fileExists(atPath: $0) }
         )
         switch plan {
         case .activate(let index):
             activate(running[index])
+        case .openInstalled(let path):
+            openInstalledApp(at: path)
         case .missingLauncher(let script):
             errorMessage = "Cannot find the Leeds HPC Monitor launcher at \(script)"
         case .runLauncher(let script):
@@ -133,6 +137,25 @@ final class WidgetModel: ObservableObject {
             let message = error.localizedDescription
             Task { @MainActor in
                 WidgetLog.app.error("Could not bring the app forward: \(message, privacy: .public)")
+                self?.errorMessage = "Could not open Leeds HPC Monitor: \(message)"
+            }
+        }
+    }
+
+    /// The copy scripts/install_app.sh put in /Applications (or wherever it
+    /// recorded): a normal app, opened as Finder would open it. It is not
+    /// rebuilt here; the user updates it with install_app.sh or
+    /// run_macos_app.sh. It finds this checkout through its HPCProjectRoot
+    /// Info.plist key (the record lives in this checkout, so the install was
+    /// built from it), so no environment is passed.
+    private func openInstalledApp(at path: String) {
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: path), configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+            guard let error else {
+                return
+            }
+            let message = error.localizedDescription
+            Task { @MainActor in
+                WidgetLog.app.error("Could not open the installed app: \(message, privacy: .public)")
                 self?.errorMessage = "Could not open Leeds HPC Monitor: \(message)"
             }
         }

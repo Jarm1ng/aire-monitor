@@ -278,7 +278,7 @@ struct WidgetPanel: View {
         let cached = feeds.filter { $0.status == .cached }
 
         if !model.hasProjectRoot {
-            message = "The widget looks for scripts/hpc_snapshot.py under HPC_PROJECT_ROOT, its working directory and the folder holding its .runtime bundle."
+            message = "The widget looks for scripts/hpc_snapshot.py under HPC_PROJECT_ROOT, the checkout its bundle was built from, its working directory and the folder holding its .runtime bundle."
         } else if let launchMessage = model.launchMessage {
             message = launchMessage
             isWarning = false

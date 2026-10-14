@@ -559,10 +559,35 @@ struct WidgetAppLauncherTests {
         #expect(bare == .missingLauncher(script: root + "/scripts/run_macos_app.sh"))
     }
 
+    @Test("Not running but installed: the installed app is opened, not the .runtime bundle or the launcher")
+    func opensInstalledApp() {
+        let installed = "/Applications/Leeds HPC Monitor.app"
+        let plan = WidgetAppLauncher.plan(
+            projectRoot: root,
+            runningBundlePaths: [],
+            installedAppPath: installed,
+            fileExists: { _ in true }
+        )
+        #expect(plan == .openInstalled(path: installed))
+    }
+
+    @Test("A running installed copy is brought forward in preference to any other copy")
+    func prefersInstalledCopy() {
+        let installed = "/Applications/Leeds HPC Monitor.app"
+        let plan = WidgetAppLauncher.plan(
+            projectRoot: root,
+            runningBundlePaths: ["/path/to/other/.runtime/AIREMonitorApp.app", nil, installed + "/"],
+            installedAppPath: installed,
+            fileExists: { _ in true }
+        )
+        #expect(plan == .activate(index: 2))
+    }
+
     @Test("Launcher exit statuses read as the build script means them")
     func failureMessages() {
         #expect(WidgetAppLauncher.failureMessage(status: 0) == nil)
         #expect(WidgetAppLauncher.failureMessage(status: 75)?.contains("Another build of this checkout") == true)
+        #expect(WidgetAppLauncher.failureMessage(status: 3)?.contains("did not quit") == true)
         #expect(WidgetAppLauncher.failureMessage(status: 1)?.contains(".runtime/swift-build.log") == true)
     }
 
@@ -574,5 +599,10 @@ struct WidgetAppLauncherTests {
         let text = try String(contentsOf: script, encoding: .utf8)
         #expect(text.contains("BUNDLE_ID=\"\(WidgetAppLauncher.appBundleIdentifier)\""))
         #expect(text.contains("75 when another"))
+        let install = try String(
+            contentsOf: script.deletingLastPathComponent().appendingPathComponent("install_app.sh"),
+            encoding: .utf8
+        )
+        #expect(install.contains("EXIT_STILL_RUNNING=\(WidgetAppLauncher.appStillRunningExitStatus)"))
     }
 }
