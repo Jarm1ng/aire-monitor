@@ -1,3 +1,4 @@
+import HPCCore
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -31,6 +32,11 @@ struct FilesDashboard: View {
     @State private var showDeleteStepOne = false
     @State private var showDeleteStepTwo = false
     @State private var isDropTargeted = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// Margin kept free in home when deciding whether a quota copy fits:
+    /// a full home quota breaks logins, shells and jobs on every cluster.
+    private static let homeSafetyMargin: Int64 = 1_000_000_000
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -49,18 +55,19 @@ struct FilesDashboard: View {
 
             content
 
-            transfersStrip
+            FileActivityStrip(activity: files.activity)
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .animation(AppTheme.smoothEase, value: files.errorBanner)
-        .animation(AppTheme.smoothEase, value: files.infoBanner)
-        .animation(AppTheme.smoothEase, value: files.transfers.isEmpty)
+        .animation(AppTheme.smoothEase, value: files.banner)
         // ContentView keys each cluster's dashboard by cluster id, so this
         // also runs on every sidebar switch to this cluster.
         .onAppear {
             files.reconcileConnectionIdentity()
             openHomeIfFirstVisit()
+            // Coming back to the tab: files may have changed in the
+            // terminal or under a running job since this was listed.
+            files.refreshIfStale()
         }
         .onChange(of: session.isLoggedIn) { _ in
             // A sign-in may be under a new account or host: drop the old
@@ -93,10 +100,17 @@ struct FilesDashboard: View {
         .sheet(item: $files.activePreview) { preview in
             FilePreviewSheet(
                 files: files,
+                activity: files.activity,
                 profile: session.profile,
                 entry: preview.entry,
-                onOpenVim: onOpenVim
+                onOpenVim: onOpenVim,
+                onOpenPager: { path in
+                    openPager(for: path)
+                }
             )
+        }
+        .sheet(isPresented: $files.isTrashPresented) {
+            TrashSheet(files: files, trash: files.trash, profile: session.profile)
         }
         .fileImporter(
             isPresented: $showUploadImporter,
@@ -125,8 +139,10 @@ struct FilesDashboard: View {
             titleVisibility: .visible,
             presenting: files.pendingQuotaTrash
         ) { pending in
-            Button("Copy to Home Trash", role: .destructive) {
-                files.confirmQuotaTrash(pending)
+            if quotaCopyBlocker(pending) == nil {
+                Button(quotaCopyButtonTitle(pending), role: .destructive) {
+                    files.confirmQuotaTrash(pending)
+                }
             }
             Button("Delete Permanently…", role: .destructive) {
                 files.cancelQuotaTrash()
@@ -139,7 +155,7 @@ struct FilesDashboard: View {
             Text(quotaTrashMessage(pending))
         }
         .confirmationDialog(
-            "Permanently delete \(deleteCandidates.count) item\(deleteCandidates.count == 1 ? "" : "s") on \(clusterName)?",
+            "Permanently delete \(FileBrowserModel.itemCount(deleteCandidates.count)) on \(clusterName)?",
             isPresented: $showDeleteStepOne,
             titleVisibility: .visible
         ) {
@@ -159,7 +175,7 @@ struct FilesDashboard: View {
             titleVisibility: .visible
         ) {
             Button(
-                "Delete \(deleteCandidates.count) item\(deleteCandidates.count == 1 ? "" : "s") permanently",
+                "Delete \(FileBrowserModel.itemCount(deleteCandidates.count)) permanently",
                 role: .destructive
             ) {
                 files.deleteForever(entries: deleteCandidates)
@@ -180,6 +196,20 @@ struct FilesDashboard: View {
         }
     }
 
+    /// Files preview → terminal: pages the file from its end with less
+    /// over this cluster's session. The path is untrusted listing data and
+    /// is single-quoted before interpolation.
+    private func openPager(for path: String) {
+        withAnimation(AppTheme.softSpring) {
+            session.dashboard.selectedTab = .terminal
+        }
+        session.terminals.open(
+            command: "less +G -- \(SSHTerminalCommand.shellQuote(path))",
+            title: "less \((path as NSString).lastPathComponent)",
+            settings: session.settings
+        )
+    }
+
     // MARK: Header actions
 
     private var headerActions: some View {
@@ -187,7 +217,18 @@ struct FilesDashboard: View {
             if files.isMutating {
                 ProgressView()
                     .controlSize(.small)
+                    .help("Changes in progress on \(clusterName)")
+                    .accessibilityLabel("Changes in progress")
             }
+
+            Button {
+                files.isTrashPresented = true
+            } label: {
+                Label("Trash", systemImage: "trash")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!session.isLoggedIn)
+            .help("Review, restore and empty what you moved to the trash on \(clusterName)")
 
             Button {
                 showNewFolderSheet = true
@@ -269,6 +310,11 @@ struct FilesDashboard: View {
                 .textFieldStyle(.plain)
                 .font(.callout)
                 .frame(width: 140)
+            if files.isAwaitingServerFilter {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel("Searching the whole folder")
+            }
             if !files.filterText.isEmpty {
                 Button {
                     files.filterText = ""
@@ -285,6 +331,11 @@ struct FilesDashboard: View {
         .padding(.vertical, 5)
         .background(.thinMaterial, in: Capsule())
         .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
+        .help(
+            files.listing?.truncated == true
+                ? "Filter searches the whole folder on \(clusterName), not just the entries shown"
+                : "Filter the entries shown by name"
+        )
         .accessibilityLabel("Filter listing")
     }
 
@@ -314,14 +365,29 @@ struct FilesDashboard: View {
 
     @ViewBuilder
     private var bannerRow: some View {
-        if let message = files.errorBanner {
-            FilesBanner(message: message, isError: true) {
-                files.errorBanner = nil
-            }
-        } else if let message = files.infoBanner {
-            FilesBanner(message: message, isError: false) {
-                files.infoBanner = nil
-            }
+        if let banner = files.banner {
+            FilesBanner(
+                message: banner.message,
+                isError: banner.isError,
+                actionTitle: banner.action.map(Self.actionTitle),
+                onAction: {
+                    if let action = banner.action {
+                        files.perform(action)
+                    }
+                },
+                onDismiss: {
+                    files.dismissBanner()
+                }
+            )
+        }
+    }
+
+    private static func actionTitle(_ action: FileBrowserModel.Banner.Action) -> String {
+        switch action {
+        case .reveal:
+            return "Show"
+        case .openTrash:
+            return "Open Trash"
         }
     }
 
@@ -346,7 +412,7 @@ struct FilesDashboard: View {
     private var tableArea: some View {
         fileTable
             .overlay {
-                if files.isLoading {
+                if files.isLoading && !files.isAwaitingServerFilter {
                     loadingOverlay
                 } else if files.visibleEntries.isEmpty {
                     emptyListingOverlay
@@ -371,7 +437,7 @@ struct FilesDashboard: View {
     private var fileTable: some View {
         Table(files.visibleEntries, selection: $files.selection, sortOrder: $files.sortOrder) {
             TableColumn("Name", value: \.sortName) { entry in
-                FileNameCell(entry: entry)
+                FileNameCell(entry: entry, isPending: files.pendingPaths.contains(entry.path))
             }
             .width(min: 200, ideal: 340)
 
@@ -434,18 +500,41 @@ struct FilesDashboard: View {
             Image(systemName: files.filterText.isEmpty ? "folder" : "magnifyingglass")
                 .font(.system(size: 28, weight: .medium))
                 .foregroundStyle(.secondary)
-            Text(files.filterText.isEmpty ? "This folder is empty" : "No matches for “\(files.filterText)”")
+            Text(emptyTitle)
                 .font(.headline)
-            Text(
-                files.filterText.isEmpty
-                    ? "Drop files here to upload them, or create a folder."
-                    : "Try a different filter, or clear it to see everything."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text(emptySubtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
         }
         .allowsHitTesting(false)
         .accessibilityElement(children: .combine)
+    }
+
+    /// A capped listing only holds the first entries, so "No matches" is
+    /// only ever stated once the server has searched the whole folder.
+    private var emptyTitle: String {
+        if files.filterText.isEmpty {
+            return "This folder is empty"
+        }
+        if files.isAwaitingServerFilter, let listing = files.listing {
+            return "Searching all \(listing.totalCount.formatted()) entries…"
+        }
+        return "No matches for “\(files.filterText)”"
+    }
+
+    private var emptySubtitle: String {
+        if files.filterText.isEmpty {
+            return "Drop files here to upload them, or create a folder."
+        }
+        if files.isAwaitingServerFilter {
+            return "This folder has more entries than are shown, so the filter searches it on \(clusterName)."
+        }
+        if let listing = files.listing, !listing.filter.isEmpty {
+            return "Searched every entry in this folder on \(clusterName). Try a different filter, or clear it."
+        }
+        return "Try a different filter, or clear it to see everything."
     }
 
     private var dropOverlay: some View {
@@ -464,7 +553,7 @@ struct FilesDashboard: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                .foregroundStyle(Color.orange)
+                .foregroundStyle(Color.orange.legibleText(in: colorScheme))
                 .padding(16)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
@@ -472,38 +561,32 @@ struct FilesDashboard: View {
             .transition(.opacity)
     }
 
-    // MARK: Transfers strip
-
-    @ViewBuilder
-    private var transfersStrip: some View {
-        if !files.transfers.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(files.transfers) { transfer in
-                        TransferChip(item: transfer) {
-                            files.dismissTransfer(transfer.id)
-                        }
-                    }
-                }
-                .padding(.vertical, 1)
-            }
-            .transition(.opacity.combined(with: .move(edge: .bottom)))
-            .accessibilityLabel("File transfers")
-        }
-    }
-
     // MARK: Footer
+
+    /// The footer's item count. A capped listing says so in orange, and that
+    /// line is the only sign the folder holds more than is shown, so it uses
+    /// the legible text shade: a plain system orange caption measures about
+    /// 2:1 on the light window background (and plain `.secondary` about 4:1).
+    static func itemsSummaryColor(truncated: Bool, in scheme: ColorScheme) -> Color {
+        (truncated ? Color.orange : Color.secondary).legibleText(in: scheme)
+    }
 
     private var footer: some View {
         HStack(spacing: 12) {
-            Text(itemsSummary)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if files.listing != nil {
+                Text(itemsSummary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(Self.itemsSummaryColor(truncated: files.listing?.truncated == true, in: colorScheme))
+                    .help(itemsHelp)
+            }
 
-            if files.listing?.truncated == true {
-                Label("Listing truncated — not all entries are shown", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+            if let listedAt = files.listedAt {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text("listed \(FileDisplay.relativeText(listedAt, now: context.date))")
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary.legibleText(in: colorScheme))
+                }
+                .help("When this listing was fetched from \(clusterName). Refresh to update it.")
             }
 
             if let listing = files.listing,
@@ -525,13 +608,41 @@ struct FilesDashboard: View {
         .frame(minHeight: 20)
     }
 
+    /// Counts that never pretend a capped listing is complete.
     private var itemsSummary: String {
-        let total = files.visibleEntries.count
-        let selected = files.selection.count
-        if selected > 0 {
-            return "\(total) item\(total == 1 ? "" : "s") (\(selected) selected)"
+        guard let listing = files.listing else {
+            return FileBrowserModel.itemCount(0)
         }
-        return "\(total) item\(total == 1 ? "" : "s")"
+        let shown = files.visibleEntries.count
+        let selected = files.selection.count
+        var text: String
+        if files.isAwaitingServerFilter {
+            let total = listing.filter.isEmpty ? listing.totalCount : max(listing.totalCount, listing.matchedCount)
+            text = "Searching all \(total.formatted()) entries on \(clusterName)…"
+        } else if listing.truncated {
+            if listing.filter.isEmpty {
+                text = "Showing \(shown.formatted()) of \(listing.totalCount.formatted()) — type in Filter to search all"
+            } else {
+                text = "Showing \(shown.formatted()) of \(listing.matchedCount.formatted()) matches"
+            }
+        } else if !files.filterText.isEmpty {
+            let total = listing.filter.isEmpty ? listing.entries.count : listing.totalCount
+            text = "\(shown.formatted()) of \(FileBrowserModel.itemCount(total))"
+        } else {
+            text = FileBrowserModel.itemCount(shown)
+        }
+        if selected > 0 {
+            text += " (\(selected) selected)"
+        }
+        return text
+    }
+
+    private var itemsHelp: String {
+        guard let listing = files.listing, listing.truncated else {
+            return "Entries in this folder"
+        }
+        return "Only the first \(RemoteFileService.entryCap.formatted()) entries (folders first, then by name) are "
+            + "listed. Typing in Filter searches all \(listing.totalCount.formatted()) on \(clusterName)."
     }
 
     private func diskUsageChip(_ usage: FileBrowserModel.DiskUsageResult) -> some View {
@@ -589,29 +700,44 @@ struct FilesDashboard: View {
                 }
                 .disabled(onOpenShellAt == nil)
             }
+        } else if targets.contains(where: \.nameIsLossy) {
+            Button("Copy Path") {
+                if let entry = targets.first {
+                    copyPath(entry)
+                }
+            }
+            Text("Name is not valid UTF-8 — rename it in the Terminal")
         } else {
+            let actionable = targets.filter { !files.isPending($0) }
             Button("Open") {
                 openEntries(targets)
             }
             if targets.count == 1, let entry = targets.first {
-                if !entry.isNavigable {
+                if entry.isPreviewable {
                     Button("Preview") {
                         files.preview(entry: entry)
                     }
                 }
-                Button("Rename…") {
-                    renameTarget = entry
+                // Trash runs are managed in the Trash sheet: a renamed run
+                // (or .aire-trash folder) would only show there as missing
+                // until it is renamed back.
+                if !RemoteFileService.isInsideTrash(entry.path) {
+                    Button("Rename…") {
+                        renameTarget = entry
+                    }
+                    .disabled(actionable.isEmpty)
                 }
                 Button("Copy Path") {
                     copyPath(entry)
                 }
-                if entry.kind == .directory {
+                if entry.isDirectoryLike {
                     Button("Folder Size") {
                         files.requestDiskUsage(for: entry)
                     }
                     Button("Open Shell Here") {
                         onOpenShellAt?(entry.path)
                     }
+                    .disabled(onOpenShellAt == nil)
                 }
             }
             if targets.contains(where: \.isDownloadable) {
@@ -620,12 +746,16 @@ struct FilesDashboard: View {
                 }
             }
             Divider()
-            Button("Move to Trash", role: .destructive) {
-                beginTrash(targets)
+            if !targets.contains(where: { RemoteFileService.isInsideTrash($0.path) }) {
+                Button("Move to Trash", role: .destructive) {
+                    beginTrash(targets)
+                }
+                .disabled(actionable.isEmpty)
             }
             Button("Delete Permanently…", role: .destructive) {
                 beginDelete(targets)
             }
+            .disabled(actionable.isEmpty)
         }
     }
 
@@ -643,8 +773,10 @@ struct FilesDashboard: View {
         }
         if entry.isNavigable {
             files.navigate(to: entry.path)
-        } else {
+        } else if entry.isPreviewable {
             files.preview(entry: entry)
+        } else {
+            files.showInfo("“\(entry.name)” is a pipe, socket or device — there is nothing to open.")
         }
     }
 
@@ -655,19 +787,28 @@ struct FilesDashboard: View {
         files.showInfo("Copied the \(clusterName) path \(entry.path) to the clipboard")
     }
 
+    /// Rows with a mutation already in flight are left out, so a second
+    /// Delete cannot start another trash of items that are still moving.
     private func beginTrash(_ entries: [RemoteFileEntry]) {
-        guard !entries.isEmpty else {
+        let targets = entries.filter { !files.isPending($0) }
+        guard !targets.isEmpty else {
             return
         }
-        trashCandidates = entries
+        if targets.contains(where: { RemoteFileService.isInsideTrash($0.path) }) {
+            // Same refusal (and wording) as the model, before any dialog.
+            files.trash(entries: targets)
+            return
+        }
+        trashCandidates = targets
         showTrashConfirmation = true
     }
 
     private func beginDelete(_ entries: [RemoteFileEntry]) {
-        guard !entries.isEmpty else {
+        let targets = entries.filter { !files.isPending($0) }
+        guard !targets.isEmpty else {
             return
         }
-        deleteCandidates = entries
+        deleteCandidates = targets
         showDeleteStepOne = true
     }
 
@@ -702,11 +843,11 @@ struct FilesDashboard: View {
     /// project quota follows the data, not the folder it sits in.
     private var trashLocationNote: String {
         let trash = RemoteFileService.trashDirectoryName
-        var note = "Items move to a \(trash) folder and can be restored with mv from a shell. "
+        var note = "Items move to a \(trash) folder; restore or empty them from Trash in the Files toolbar. "
             + "Home items go to \(RemoteFileService.homeTrashDisplayPath) — one folder seen from "
             + "\(FileBrowserModel.sharedHomeClusterList), because home is shared. "
             + "Items elsewhere are moved, never copied, into a \(trash) folder beside them "
-            + "and keep using that filesystem's quota until you empty it."
+            + "and keep using that filesystem's quota until you empty the trash."
         let projectQuotaSpaces = (session.snapshot?.sortedStorage ?? [])
             .filter { $0.quotaType == "lustre-project" }
             .map(\.label)
@@ -743,18 +884,48 @@ struct FilesDashboard: View {
         )
     }
 
+    /// Why the copy cannot be offered, or nil when it fits in home with a
+    /// safety margin to spare.
+    private func quotaCopyBlocker(_ pending: FileBrowserModel.PendingQuotaTrash) -> String? {
+        guard let bytes = pending.bytes else {
+            return "Their size could not be measured in time, so copying them into home is not offered."
+        }
+        guard let available = files.homeAvailableBytes else {
+            return "Home's free space is unknown until the next refresh, so copying \(FileDisplay.byteText(bytes)) is not offered."
+        }
+        if bytes > available - Self.homeSafetyMargin {
+            return "\(FileDisplay.byteText(bytes)) would not fit in the \(FileDisplay.byteText(max(0, available))) "
+                + "free in home (with \(FileDisplay.byteText(Self.homeSafetyMargin)) kept spare)."
+        }
+        return nil
+    }
+
+    private func quotaCopyButtonTitle(_ pending: FileBrowserModel.PendingQuotaTrash) -> String {
+        guard let bytes = pending.bytes else {
+            return "Copy to Home Trash"
+        }
+        return "Copy \(FileDisplay.byteText(bytes)) to Home Trash"
+    }
+
     private func quotaTrashMessage(_ pending: FileBrowserModel.PendingQuotaTrash) -> String {
         let count = pending.affectedPaths.count
-        let items = "\(count) item\(count == 1 ? "" : "s")"
+        let items = FileBrowserModel.itemCount(count)
         var paths = pending.affectedPaths.prefix(3).joined(separator: "\n")
         if count > 3 {
             paths += "\n…"
         }
-        return "No \(RemoteFileService.trashDirectoryName) folder could be created beside "
-            + "\(items) on \(clusterName). Moving to trash will copy that data into "
+        let size = pending.bytes.map { " (\(FileDisplay.byteText($0)))" } ?? ""
+        var message = "No \(RemoteFileService.trashDirectoryName) folder could be created beside "
+            + "\(items)\(size) on \(clusterName). Moving to trash would copy that data into "
             + "\(RemoteFileService.homeTrashDisplayPath), which counts against your home quota — "
-            + "one quota shared by \(FileBrowserModel.sharedHomeClusterList). You can copy anyway, "
-            + "or skip the trash and delete permanently.\n\(paths)"
+            + "one quota shared by \(FileBrowserModel.sharedHomeClusterList)."
+        if let blocker = quotaCopyBlocker(pending) {
+            message += " \(blocker) You can skip the trash and delete permanently instead."
+        } else {
+            message += " You can copy anyway (it runs in the background and can be cancelled), "
+                + "or skip the trash and delete permanently."
+        }
+        return message + "\n\(paths)"
     }
 
     /// "home, scratch, and flash" for the first-visit hero: the spaces this
@@ -821,7 +992,15 @@ enum FileDisplay {
         guard let date else {
             return missingValuePlaceholder
         }
-        return relativeFormatter.localizedString(for: date, relativeTo: Date())
+        let now = Date()
+        // A file written moments ago on a login node whose clock runs a
+        // little ahead would read "in 0 sec"; small skews are "just now".
+        // A large future offset is real information and stays visible.
+        let age = now.timeIntervalSince(date)
+        if age < 5 && age > -300 {
+            return "just now"
+        }
+        return relativeFormatter.localizedString(for: date, relativeTo: now)
     }
 
     static func modifiedTooltip(_ date: Date?) -> String {
@@ -831,8 +1010,21 @@ enum FileDisplay {
         return date.formatted(date: .abbreviated, time: .standard)
     }
 
+    /// "just now" for the first minute, then "2 min. ago".
+    static func relativeText(_ date: Date, now: Date) -> String {
+        if now.timeIntervalSince(date) < 60 {
+            return "just now"
+        }
+        return relativeFormatter.localizedString(for: date, relativeTo: now)
+    }
+
     static func byteText(_ bytes: Int64) -> String {
         byteFormatter.string(fromByteCount: bytes)
+    }
+
+    /// "12.3 MB/s".
+    static func rateText(_ bytesPerSecond: Double) -> String {
+        byteFormatter.string(fromByteCount: Int64(bytesPerSecond.rounded())) + "/s"
     }
 }
 
@@ -840,6 +1032,8 @@ enum FileDisplay {
 
 private struct FileNameCell: View {
     let entry: RemoteFileEntry
+    /// A trash, delete, rename or new-folder operation is in flight here.
+    let isPending: Bool
 
     var body: some View {
         HStack(spacing: 7) {
@@ -852,14 +1046,26 @@ private struct FileNameCell: View {
                 .font(.callout)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if entry.nameIsLossy {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("This name is not valid UTF-8, so the app cannot act on it. Rename it in the Terminal.")
+            }
             if entry.kind == .symlink, let target = entry.linkTarget, !target.isEmpty {
                 Text("→ \(target)")
                     .font(.caption.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            if isPending {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel("Change in progress")
+            }
         }
+        .opacity(isPending ? 0.5 : 1)
         .accessibilityElement(children: .combine)
     }
 
@@ -1006,6 +1212,8 @@ private struct ShortcutChip: View {
 private struct FilesBanner: View {
     let message: String
     let isError: Bool
+    let actionTitle: String?
+    let onAction: () -> Void
     let onDismiss: () -> Void
 
     private var color: Color {
@@ -1016,11 +1224,18 @@ private struct FilesBanner: View {
         HStack(spacing: 8) {
             Image(systemName: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                 .foregroundStyle(color)
+                .accessibilityHidden(true)
             Text(message)
                 .font(.caption)
-                .lineLimit(2)
+                .lineLimit(4)
                 .textSelection(.enabled)
+                .help(message)
             Spacer(minLength: 6)
+            if let actionTitle {
+                Button(actionTitle, action: onAction)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
@@ -1037,71 +1252,7 @@ private struct FilesBanner: View {
                 .stroke(color.opacity(0.25), lineWidth: 1)
         )
         .transition(.opacity.combined(with: .move(edge: .top)))
-        .accessibilityElement(children: .combine)
-    }
-}
-
-// MARK: - Transfer chip
-
-private struct TransferChip: View {
-    let item: FileBrowserModel.TransferItem
-    let onDismiss: () -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: item.direction == .upload ? "arrow.up.circle" : "arrow.down.circle")
-                .foregroundStyle(item.direction == .upload ? Color.orange : AppTheme.gpu)
-            Text(item.filename)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 180)
-            statusView
-        }
-        .font(.caption)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.thinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilitySummary)
-        .help(accessibilitySummary)
-    }
-
-    @ViewBuilder
-    private var statusView: some View {
-        switch item.state {
-        case .running:
-            ProgressView()
-                .controlSize(.mini)
-        case .done:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-        case .failed(let message):
-            Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(.red)
-                .help(message)
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .accessibilityLabel("Dismiss failed transfer")
-        }
-    }
-
-    private var accessibilitySummary: String {
-        let direction = item.direction == .upload
-            ? "Upload of \(item.filename) to \(item.clusterName)"
-            : "Download of \(item.filename) from \(item.clusterName)"
-        switch item.state {
-        case .running:
-            return "\(direction) in progress"
-        case .done:
-            return "\(direction) finished"
-        case .failed(let message):
-            return "\(direction) failed: \(message)"
-        }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -1115,6 +1266,7 @@ private struct NameEntrySheet: View {
     let onSubmit: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
     @State private var name: String
 
     init(
@@ -1164,7 +1316,7 @@ private struct NameEntrySheet: View {
             if let validationMessage, !name.isEmpty {
                 Label(validationMessage, systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Color.orange.legibleText(in: colorScheme))
             }
 
             HStack {
@@ -1192,176 +1344,6 @@ private struct NameEntrySheet: View {
         }
         onSubmit(name.trimmingCharacters(in: .whitespacesAndNewlines))
         dismiss()
-    }
-}
-
-// MARK: - Preview sheet
-
-private struct FilePreviewSheet: View {
-    @ObservedObject var files: FileBrowserModel
-    /// The cluster the file was listed from: a path like /users/<u>/x is
-    /// valid on every cluster, so the sheet says whose copy it is showing.
-    let profile: ClusterProfile
-    let entry: RemoteFileEntry
-    var onOpenVim: (@MainActor (String) -> Void)?
-
-    @Environment(\.dismiss) private var dismiss
-
-    /// Renders from the live model (not the sheet item snapshot) so the
-    /// loading state flips to content in place.
-    private var content: FileBrowserModel.PreviewContent {
-        guard let preview = files.activePreview, preview.entry.path == entry.path else {
-            return .loading
-        }
-        return preview.content
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-            main
-            actions
-        }
-        .padding(18)
-        .background(DashboardBackdrop())
-        .frame(minWidth: 640, idealWidth: 780, minHeight: 440, idealHeight: 600)
-    }
-
-    private var header: some View {
-        HStack(alignment: .top, spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.orange.opacity(0.14))
-                Image(systemName: entry.systemIconName)
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.orange)
-            }
-            .frame(width: 46, height: 46)
-            .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(entry.name)
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                HStack(spacing: 6) {
-                    ClusterBadge(profile: profile, size: 15)
-                    Text(entry.path)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(entry.path) on \(profile.displayName)")
-            }
-
-            Spacer()
-
-            Button {
-                dismiss()
-            } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.bordered)
-            .keyboardShortcut(.cancelAction)
-            .accessibilityLabel("Close preview")
-        }
-    }
-
-    @ViewBuilder
-    private var main: some View {
-        switch content {
-        case .loading:
-            VStack(spacing: 10) {
-                ProgressView()
-                Text("Loading preview…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-        case .text(let text):
-            ScrollView {
-                Text(text.isEmpty ? "(empty file)" : text)
-                    .font(.callout.monospaced())
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-            }
-            .background(AppTheme.mutedFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(AppTheme.border, lineWidth: 1)
-            )
-
-        case .binary(let mimeType):
-            previewCard(
-                systemImage: "doc.badge.gearshape",
-                title: "Binary file",
-                subtitle: "\(mimeType) — no inline preview. Download it to open locally."
-            )
-
-        case .tooLarge(let bytes):
-            previewCard(
-                systemImage: "scalemass",
-                title: "Too large to preview",
-                subtitle: "\(FileDisplay.byteText(bytes)) — download the file or open it in the terminal instead."
-            )
-
-        case .failure(let message):
-            previewCard(
-                systemImage: "exclamationmark.triangle",
-                title: "Preview failed",
-                subtitle: message
-            )
-        }
-    }
-
-    private func previewCard(systemImage: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: systemImage)
-                .font(.system(size: 32, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(title)
-                .font(.headline)
-            Text(subtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
-                .textSelection(.enabled)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .dashboardCard(padding: 20, accent: .secondary)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var actions: some View {
-        HStack(spacing: 10) {
-            if case .text = content {
-                Button {
-                    dismiss()
-                    onOpenVim?(entry.path)
-                } label: {
-                    Label("Open in Terminal (vim)", systemImage: "terminal")
-                }
-                .buttonStyle(.bordered)
-                .disabled(onOpenVim == nil)
-                .help("Edit this file with vim over \(profile.displayName)'s live SSH session")
-            }
-
-            Button {
-                files.download(entries: [entry])
-            } label: {
-                Label("Download", systemImage: "arrow.down.circle")
-            }
-            .buttonStyle(.bordered)
-            .help("Download from \(profile.displayName) to your local Downloads folder")
-
-            Spacer()
-        }
     }
 }
 
@@ -1413,7 +1395,7 @@ private struct FilesHero: View {
 
                 Text(sharingNote)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 400)
 

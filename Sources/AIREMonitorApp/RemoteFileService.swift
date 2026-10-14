@@ -1,3 +1,5 @@
+import HPCCore
+import Darwin
 import Foundation
 
 // MARK: - Models
@@ -21,9 +23,39 @@ struct RemoteFileEntry: Identifiable, Hashable {
     let permissions: String?    // e.g. "rwxr-xr-x"
     let linkTarget: String?
     /// For symlinks: whether the link resolves to a directory (nil for
-    /// non-symlinks; false for broken links). Drives download gating —
-    /// scp-over-SFTP cannot fetch a directory through a link.
+    /// non-symlinks; false for broken links). Drives navigation, preview
+    /// and download gating — scp-over-SFTP cannot fetch a directory through
+    /// a link.
     let linkIsDir: Bool?
+    /// The remote name is not valid UTF-8. It is shown with U+FFFD, so
+    /// `path` does not spell the real file: acting on it could miss it — or
+    /// hit a different file whose name really contains U+FFFD — and the app
+    /// refuses every action except Copy Path.
+    let nameIsLossy: Bool
+
+    init(
+        name: String,
+        path: String,
+        kind: Kind,
+        size: Int64? = nil,
+        modifiedAt: Date? = nil,
+        owner: String? = nil,
+        permissions: String? = nil,
+        linkTarget: String? = nil,
+        linkIsDir: Bool? = nil,
+        nameIsLossy: Bool = false
+    ) {
+        self.name = name
+        self.path = path
+        self.kind = kind
+        self.size = size
+        self.modifiedAt = modifiedAt
+        self.owner = owner
+        self.permissions = permissions
+        self.linkTarget = linkTarget
+        self.linkIsDir = linkIsDir
+        self.nameIsLossy = nameIsLossy
+    }
 
     var id: String { path }
 }
@@ -31,78 +63,305 @@ struct RemoteFileEntry: Identifiable, Hashable {
 struct RemoteDirectoryListing {
     let requestedPath: String
     let resolvedPath: String    // after symlink/~ resolution
+    /// At most `RemoteFileService.entryCap` entries: the first ones in
+    /// folders-first natural name order, never an arbitrary subset.
     let entries: [RemoteFileEntry]
-    let truncated: Bool         // listing capped (cap at 4000 entries)
+    /// More entries matched than the cap allowed.
+    let truncated: Bool
+    /// Entries in the folder after the hidden-file rule, before `filter`.
+    let totalCount: Int
+    /// Entries that matched `filter` (equals `totalCount` without one).
+    let matchedCount: Int
+    /// The server-side, case-insensitive name filter this listing was made
+    /// with; "" for none.
+    let filter: String
+
+    init(
+        requestedPath: String,
+        resolvedPath: String,
+        entries: [RemoteFileEntry],
+        truncated: Bool = false,
+        totalCount: Int? = nil,
+        matchedCount: Int? = nil,
+        filter: String = ""
+    ) {
+        self.requestedPath = requestedPath
+        self.resolvedPath = resolvedPath
+        self.entries = entries
+        self.truncated = truncated
+        self.totalCount = totalCount ?? entries.count
+        self.matchedCount = matchedCount ?? totalCount ?? entries.count
+        self.filter = filter
+    }
 }
 
-enum RemoteFilePreview {
-    case text(String)
+/// Which end of a file a text preview shows.
+enum RemotePreviewMode: String, Sendable, CaseIterable {
+    case head
+    case tail
+
+    /// Logs are read from the end: what a job printed last is what matters,
+    /// and a Slurm log is routinely far larger than the preview window.
+    static func preferred(forFileName name: String) -> RemotePreviewMode {
+        let lowered = name.lowercased()
+        return [".out", ".err", ".log"].contains(where: lowered.hasSuffix) ? .tail : .head
+    }
+}
+
+/// A text preview and how much of the file it covers, so the sheet can say
+/// "Showing the last 256 KB of 912 KB" instead of silently cutting off.
+struct RemoteTextPreview: Equatable, Sendable {
+    let text: String
+    let totalBytes: Int64
+    let shownBytes: Int
+    let truncated: Bool
+    let fromEnd: Bool
+}
+
+enum RemoteFilePreview: Equatable {
+    case text(RemoteTextPreview)
     case binary(mimeType: String)
-    case tooLarge(bytes: Int64)
 }
 
-// MARK: - Wire payloads
+/// Bytes moved so far; `totalBytes` is nil when the size is unknown.
+struct TransferProgress: Sendable, Equatable {
+    let transferredBytes: Int64
+    let totalBytes: Int64?
+}
 
-/// JSON bridge for the remote python listing protocol. Directory contents are
-/// NEVER parsed from `ls` output: the remote script emits one JSON object and
-/// these structs decode it.
-private struct ListingPayload: Decodable {
-    struct Entry: Decodable {
-        let name: String
-        let kind: String
-        let size: Int64?
-        let mtime: Double?
-        let owner: String?
-        let mode: String?
-        let link: String?
-        let linkIsDir: Bool?
+typealias TransferProgressHandler = @Sendable (TransferProgress) -> Void
 
-        enum CodingKeys: String, CodingKey {
-            case name
-            case kind
-            case size
-            case mtime
-            case owner
-            case mode
-            case link
-            case linkIsDir = "link_is_dir"
-        }
+/// What an in-flight transfer has created so far: the local placeholder and
+/// `.part` file of a download, or the remote `.part` file of an upload.
+/// Readable from any thread, because the app's quit handler cleans up
+/// synchronously — the transfer's own async cleanup never gets to run once
+/// the process is exiting.
+final class TransferScratch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var localFiles: [URL] = []
+    private var remotePart: (settings: ConnectionSettings, path: String)?
+
+    func recordLocalFiles(_ urls: [URL]) {
+        lock.lock()
+        localFiles = urls
+        lock.unlock()
     }
 
-    let requested: String
-    let resolved: String
-    let truncated: Bool
-    let entries: [Entry]
+    func recordRemotePart(settings: ConnectionSettings, path: String) {
+        lock.lock()
+        remotePart = (settings, path)
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        localFiles = []
+        remotePart = nil
+        lock.unlock()
+    }
+
+    /// Quit-time cleanup: deletes local leftovers now and asks the login
+    /// node to delete a remote `.part` file without waiting for the answer.
+    func cleanUpForTermination() {
+        lock.lock()
+        let files = localFiles
+        let remote = remotePart
+        localFiles = []
+        remotePart = nil
+        lock.unlock()
+        for url in files {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let remote {
+            RemoteFileService.launchDetachedCleanup(
+                settings: remote.settings,
+                command: "rm -f -- \(RemoteFileService.shellQuote(remote.path))"
+            )
+        }
+    }
 }
 
-private struct RemoteErrorPayload: Decodable {
-    let error: String
+/// A long remote operation (permanent delete, or a confirmed quota copy
+/// into the home trash) running detached on the login node: it survives
+/// timeouts, a dropped connection and quitting the app, and is followed by
+/// polling `RemoteFileService.pollJob`.
+struct RemoteJob: Sendable, Hashable {
+    enum Kind: String, Sendable {
+        case delete
+        case copy
+    }
+
+    /// The job's private status folder on the login node (`mkdtemp`).
+    let directory: String
+    let pid: Int32
+    let kind: Kind
+    let paths: [String]
+    /// For `.copy`: the home-trash run folder receiving the items.
+    let destination: String?
 }
+
+struct RemoteJobStatus: Equatable {
+    enum State: Equatable {
+        case running
+        case finished
+        /// The worker died without finishing (killed, or the node rebooted).
+        case crashed
+        /// No status folder: already collected, or never started.
+        case missing
+    }
+
+    let state: State
+    let total: Int
+    let done: Int
+    let failed: [TrashOutcome.Failure]
+    let moved: [String]
+    let cancelled: Bool
+    let current: String?
+    let detail: String
+}
+
+/// What one Move to Trash did. Every group is attempted and reported, so a
+/// partial failure still says where the moved items went.
+struct TrashOutcome: Equatable {
+    struct Move: Equatable {
+        let directory: String
+        var paths: [String]
+    }
+
+    struct Failure: Equatable, Sendable {
+        let path: String
+        let reason: String
+    }
+
+    var moved: [Move] = []
+    var failed: [Failure] = []
+    /// A user-confirmed copy into the home trash, still running.
+    var copyJob: RemoteJob?
+
+    var movedCount: Int { moved.reduce(0) { $0 + $1.paths.count } }
+}
+
+/// One trash run folder (`…/.aire-trash/<timestamp>-<id>`).
+struct TrashRun: Identifiable, Equatable {
+    struct Item: Identifiable, Equatable {
+        let name: String
+        let path: String
+        let isDirectory: Bool
+        /// Where it came from (from the run's manifest); nil for items
+        /// trashed by older versions, which cannot be restored by the app.
+        let originalPath: String?
+        let nameIsLossy: Bool
+        var id: String { path }
+    }
+
+    enum Location: Equatable {
+        /// The shared home trash: the same folder on every cluster.
+        case home
+        /// Beside items on another filesystem (scratch, flash).
+        case beside(parent: String)
+    }
+
+    /// Whether the login node could reach a run the home trash's index
+    /// records (see `RemoteFileScripts.trashList`). A run that cannot be
+    /// reached is still listed, so trashed scratch data that keeps using
+    /// quota never silently drops out of the sheet; nothing can act on it
+    /// (its contents are unknown) until it is back.
+    enum Reachability: Equatable {
+        case reachable
+        /// The run folder is not at its path: it, its `.aire-trash` or the
+        /// folder that held them was renamed, moved or trashed (renaming it
+        /// back brings it back), or it was deleted outside the app. The
+        /// login node cannot tell these apart, so the entry is never dropped
+        /// on its own; `pointer` names the index entry, so the user can
+        /// forget it.
+        case missing(pointer: String)
+        /// The run folder could not be examined (an I/O error, a mount
+        /// missing on this login node); usually transient.
+        case unavailable
+    }
+
+    let directory: String
+    let location: Location
+    /// Cluster the items were trashed from, when the manifest records it.
+    let clusterID: String?
+    let createdAt: Date?
+    let itemCount: Int
+    /// The first items (capped); `itemCount` is the real count.
+    let items: [Item]
+    let hasManifest: Bool
+    let error: String?
+    var reachability: Reachability = .reachable
+
+    var id: String { directory }
+    var isReachable: Bool { reachability == .reachable }
+    var restorableItems: [Item] { items.filter { $0.originalPath != nil && !$0.nameIsLossy } }
+}
+
+struct RestoreOutcome: Equatable {
+    var restored: [String] = []
+    var failed: [TrashOutcome.Failure] = []
+    var removedRun = false
+}
+
+// MARK: - Runner
+
+/// The two process primitives the file manager needs. `MonitorService`
+/// provides them over the cluster's ControlMaster; tests substitute a fake
+/// that answers by script, so the destructive paths can be exercised
+/// without a cluster.
+protocol RemoteCommandRunning: Sendable {
+    func runRemoteCommand(
+        settings: ConnectionSettings,
+        command: String,
+        timeout: TimeInterval
+    ) async throws -> ProcessResult
+
+    func runTransfer(
+        settings: ConnectionSettings,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async throws -> ProcessResult
+}
+
+extension MonitorService: RemoteCommandRunning {}
 
 // MARK: - Service
 
 /// Remote file operations over the app's existing SSH session. Every remote
-/// path is untrusted data: all interpolation into shell commands goes through
-/// `shellQuote`, `--` precedes every path argument so leading-dash names can
-/// never become flags, and listings use a remote-python JSON protocol (the
-/// target path travels as a python argv element, never inside the script).
+/// path is untrusted data: shell interpolation goes through `shellQuote`,
+/// `--` precedes every path operand, and everything non-trivial runs as one
+/// of the `RemoteFileScripts` Python programs, which take paths in argv and
+/// answer in JSON.
 ///
 /// The service is stateless and cluster-agnostic: every call takes the
 /// `ConnectionSettings` of the cluster it targets, and all operations run
-/// through `MonitorService.runRemoteCommand` / `runTransfer` over THAT
-/// cluster's ControlMaster. Both pre-flight the master with `ssh -O check`,
-/// so a dead session throws "<Cluster> SSH session expired — …" instantly
-/// instead of hanging.
+/// through the runner (`MonitorService.runRemoteCommand` / `runTransfer`)
+/// over THAT cluster's ControlMaster. Both pre-flight the master with
+/// `ssh -O check`, so a dead session throws "<Cluster> SSH session expired"
+/// instantly instead of hanging.
+///
+/// Every remote command is bounded ON THE SERVER with `timeout -k 5 <s>`
+/// as well as locally. Killing the local ssh client alone does not stop a
+/// remote command without a pty — sshd only closes its pipes, and `du`,
+/// `rm -rf` or a cross-device `mv` print nothing until they finish — so
+/// without the remote bound a "timed out" operation would keep running on
+/// the login node. Work that may legitimately take hours (permanent delete,
+/// a confirmed copy into the home trash) is not bounded but detached
+/// instead, as a `RemoteJob` with progress and Cancel.
 ///
 /// Remote environment contract (holds on AIRE and on Calder's Rocky 9 login
-/// nodes): an sh-compatible login shell (bash is the Leeds default), GNU
-/// coreutils (`stat -c`, `du`, `head -c`, `mkdir`/`mv`/`rm` with `--`) and
-/// Python 3.6 or newer for the JSON listing (Calder ships 3.9). `file(1)` is
-/// optional: previews fall back to sniffing the content when it is missing.
+/// nodes): an sh-compatible login shell, GNU coreutils (`timeout`, `stat
+/// -c`, `du`, `mkdir`/`mv`/`ln`/`rm` with `--`) and Python 3.6 or newer.
+/// `file(1)` is optional: previews fall back to sniffing the content.
 struct RemoteFileService: Sendable {
-    private let monitor = MonitorService()
+    let runner: any RemoteCommandRunning
 
-    private static let entryCap = 4000
+    init(runner: any RemoteCommandRunning = MonitorService()) {
+        self.runner = runner
+    }
+
+    /// Most entries one listing returns.
+    static let entryCap = 4000
 
     /// Name of the server-side trash folder. It keeps the `.aire-trash`
     /// name from the single-cluster app so everything trashed by earlier
@@ -120,118 +379,16 @@ struct RemoteFileService: Sendable {
         "~/\(trashDirectoryName)"
     }
 
-    /// Exit status a POSIX shell reports when a command is not installed.
-    private static let commandNotFoundExitCode: Int32 = 127
+    /// Longest remote command line sent as-is. sshd hands the command to
+    /// the login shell as ONE argv string, which Linux caps at 128 KiB
+    /// (MAX_ARG_STRLEN); bigger argument lists — a select-all of thousands
+    /// of logs — are staged in a file instead (`stageArguments`).
+    static let commandBudget = 96_000
 
-    // MARK: Listing protocol
+    // MARK: Command plumbing
 
-    /// Runs remotely as `python3 -I -c <script> <path> <showHidden>` (see
-    /// `pythonCommand`). The target path and the hidden flag arrive via
-    /// sys.argv — they are never interpolated into the script body. Emits
-    /// exactly one JSON object on stdout; on failure emits {"error": "..."}
-    /// and exits 3. Names with invalid UTF-8 are sanitized (U+FFFD) so the
-    /// JSON always parses, and `json.dumps` escapes everything else to
-    /// ASCII, so the output is independent of the remote locale.
-    ///
-    /// Deliberately restricted to Python 3.6 features — no walrus (3.8),
-    /// `str.removeprefix` (3.9), `match` or `X | Y` unions (3.10), and no
-    /// f-strings either; `os.scandir` as a context manager (3.6) is the
-    /// newest construct — so it runs on Calder's system python3 3.9 and on
-    /// older login nodes alike. It is exercised against /usr/bin/python3 3.9
-    /// through bash, sh and zsh, including hostile path arguments, modules
-    /// planted in the working directory, and the entry cap.
-    private static let listingScript = """
-    import json, os, pwd, stat, sys
-
-    def clean(value):
-        if value is None:
-            return None
-        return os.fsencode(value).decode("utf-8", "replace")
-
-    def fail(message):
-        sys.stdout.write(json.dumps({"error": message}))
-        sys.exit(3)
-
-    raw = sys.argv[1]
-    show_hidden = sys.argv[2] == "1"
-    expanded = os.path.expanduser(raw)
-    if not os.path.isabs(expanded):
-        expanded = os.path.join(os.path.expanduser("~"), expanded)
-    resolved = os.path.realpath(expanded)
-    if not os.path.exists(resolved):
-        fail("No such directory: " + clean(resolved))
-    if not os.path.isdir(resolved):
-        fail("Not a directory: " + clean(resolved))
-    cap = \(entryCap)
-    entries = []
-    truncated = False
-    owner_names = {}
-    try:
-        with os.scandir(resolved) as it:
-            for entry in it:
-                name = entry.name
-                if not show_hidden and name.startswith("."):
-                    continue
-                if len(entries) >= cap:
-                    truncated = True
-                    break
-                try:
-                    st = os.lstat(entry.path)
-                except OSError:
-                    continue
-                mode = st.st_mode
-                if stat.S_ISLNK(mode):
-                    kind = "symlink"
-                elif stat.S_ISDIR(mode):
-                    kind = "directory"
-                elif stat.S_ISREG(mode):
-                    kind = "file"
-                else:
-                    kind = "other"
-                link = None
-                link_is_dir = None
-                if kind == "symlink":
-                    try:
-                        link = clean(os.readlink(entry.path))
-                    except OSError:
-                        link = None
-                    link_is_dir = os.path.isdir(entry.path)
-                owner = owner_names.get(st.st_uid)
-                if owner is None:
-                    try:
-                        owner = pwd.getpwuid(st.st_uid).pw_name
-                    except (KeyError, OSError):
-                        owner = str(st.st_uid)
-                    owner_names[st.st_uid] = owner
-                entries.append({
-                    "name": clean(name),
-                    "kind": kind,
-                    "size": st.st_size,
-                    "mtime": st.st_mtime,
-                    "owner": owner,
-                    "mode": stat.filemode(mode)[1:],
-                    "link": link,
-                    "link_is_dir": link_is_dir,
-                })
-    except PermissionError:
-        fail("Permission denied: " + clean(resolved))
-    except OSError as exc:
-        fail(clean(str(exc)))
-    entries.sort(key=lambda item: (item["kind"] != "directory", item["name"].lower()))
-    sys.stdout.write(json.dumps({
-        "requested": clean(raw),
-        "resolved": clean(resolved),
-        "truncated": truncated,
-        "entries": entries,
-    }))
-    """
-
-    private static let homeScript = """
-    import os, sys
-    sys.stdout.write(os.path.realpath(os.path.expanduser("~")))
-    """
-
-    /// Remote command running one of the embedded scripts.
+    /// Remote command running one of the embedded scripts, bounded on the
+    /// server by `seconds`.
     ///
     /// Prefers the system interpreter `/usr/bin/python3` (3.9 on Calder's
     /// Rocky 9 login nodes) over whatever `python3` a user's conda or module
@@ -240,64 +397,183 @@ struct RemoteFileService: Sendable {
     /// PYTHONPATH/PYTHONHOME and user site-packages and, crucially for `-c`,
     /// keeps the remote working directory — the home directory — off
     /// sys.path, so a stray ~/json.py or ~/stat.py can never shadow the
-    /// standard modules the scripts import. Arguments are shell-quoted here;
-    /// the script reads them from sys.argv.
-    private func pythonCommand(script: String, arguments: [String] = []) -> String {
+    /// standard modules the scripts import.
+    static func pythonCommand(script: String, arguments: [String], seconds: Int) -> String {
         let quotedArguments = arguments.map { " " + shellQuote($0) }.joined()
         return "hpc_python=python3; "
             + "if [ -x /usr/bin/python3 ]; then hpc_python=/usr/bin/python3; fi; "
-            + "\"$hpc_python\" -I -c \(shellQuote(script))\(quotedArguments)"
+            + "\(boundPrefix(seconds: seconds))\"$hpc_python\" -I -c \(shellQuote(script))\(quotedArguments)"
     }
 
-    // MARK: Public API
+    /// `timeout -k 5 <s> ` — GNU timeout sends TERM after `seconds` and KILL
+    /// five seconds later. The local watchdog is set beyond both
+    /// (`localTimeout`) so the server's verdict normally arrives first.
+    static func boundPrefix(seconds: Int) -> String {
+        "timeout -k 5 \(max(1, seconds)) "
+    }
+
+    static func bounded(_ command: String, seconds: Int) -> String {
+        boundPrefix(seconds: seconds) + command
+    }
+
+    static func localTimeout(forRemoteBound seconds: Int) -> TimeInterval {
+        TimeInterval(max(1, seconds) + 10)
+    }
+
+    /// GNU timeout's exit for TERM (124) and, after `-k`, KILL (137) — and
+    /// the local watchdog's 124.
+    static func isTimeout(_ result: ProcessResult) -> Bool {
+        result.exitCode == 124 || result.exitCode == 137
+    }
+
+    private func runScript(
+        _ script: String,
+        arguments: [String],
+        settings: ConnectionSettings,
+        seconds: Int
+    ) async throws -> ProcessResult {
+        var finalArguments = arguments
+        let length = Self.pythonCommand(script: script, arguments: arguments, seconds: seconds).utf8.count
+        if length > Self.commandBudget {
+            finalArguments = [try await stageArguments(arguments, settings: settings)]
+        }
+        return try await runner.runRemoteCommand(
+            settings: settings,
+            command: Self.pythonCommand(script: script, arguments: finalArguments, seconds: seconds),
+            timeout: Self.localTimeout(forRemoteBound: seconds)
+        )
+    }
+
+    private func runShell(
+        _ command: String,
+        settings: ConnectionSettings,
+        seconds: Int
+    ) async throws -> ProcessResult {
+        try await runner.runRemoteCommand(
+            settings: settings,
+            command: Self.bounded(command, seconds: seconds),
+            timeout: Self.localTimeout(forRemoteBound: seconds)
+        )
+    }
+
+    /// Uploads an oversized argument list as a NUL-separated file in the
+    /// login node's /tmp (a random name; the scripts accept it only as a
+    /// regular file owned by the user, and delete it once read) and returns
+    /// the `@<path>` argument that stands for it. Every later command of
+    /// the same operation runs over the same ControlMaster, so it reaches
+    /// the same login node.
+    private func stageArguments(_ arguments: [String], settings: ConnectionSettings) async throws -> String {
+        let token = UUID().uuidString.lowercased()
+        let local = FileManager.default.temporaryDirectory.appendingPathComponent("hpc-monitor-args-\(token)")
+        let remote = "/tmp/hpc-monitor-args-\(token)"
+        var data = Data()
+        for argument in arguments {
+            data.append(Data(argument.utf8))
+            data.append(0)
+        }
+        try data.write(to: local, options: .atomic)
+        defer {
+            try? FileManager.default.removeItem(at: local)
+        }
+        let result = try await runner.runTransfer(
+            settings: settings,
+            arguments: Self.scpArguments(
+                settings: settings,
+                remotePath: remote,
+                localPath: local.path,
+                direction: .upload
+            ),
+            timeout: 120
+        )
+        guard result.exitCode == 0 else {
+            throw Self.failure("Could not send the list of \(arguments.count) items to \(settings.clusterName)", result)
+        }
+        return "@\(remote)"
+    }
+
+    /// The first JSON object line of a script's output. Scripts print one
+    /// object per line; a chatty login shell (a .bashrc that echoes) may add
+    /// other lines, which are skipped rather than failing the decode.
+    private static func jsonObjects(_ output: String) -> [[String: Any]] {
+        output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { line -> [String: Any]? in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("{"), let data = trimmed.data(using: .utf8) else {
+                    return nil
+                }
+                return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            }
+    }
+
+    private static func decode<T: Decodable>(
+        _ type: T.Type,
+        from result: ProcessResult,
+        operation: String,
+        settings: ConnectionSettings
+    ) throws -> T {
+        let lines = result.stdout
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("{") }
+        for line in lines {
+            let data = Data(line.utf8)
+            if let error = try? JSONDecoder().decode(RemoteErrorPayload.self, from: data) {
+                throw MonitorError.processFailed(error.error)
+            }
+        }
+        if isTimeout(result) {
+            throw MonitorError.processFailed(
+                "\(operation) timed out on \(settings.clusterName) — the filesystem may be slow. Try again in a moment."
+            )
+        }
+        guard result.exitCode == 0 else {
+            throw failure(operation, result)
+        }
+        for line in lines {
+            if let value = try? JSONDecoder().decode(T.self, from: Data(line.utf8)) {
+                return value
+            }
+        }
+        throw MonitorError.invalidJSON("\(operation): the login node's reply could not be read.")
+    }
+
+    // MARK: Home & roots
+
+    /// realpath(~) and realpath of each given path on the login node.
+    func resolveHome(settings: ConnectionSettings, roots: [String] = []) async throws -> (home: String, roots: [String]) {
+        let result = try await runScript(
+            RemoteFileScripts.roots,
+            arguments: roots.filter { $0.hasPrefix("/") },
+            settings: settings,
+            seconds: 20
+        )
+        let payload = try Self.decode(RootsPayload.self, from: result, operation: "Finding your home directory", settings: settings)
+        guard payload.home.hasPrefix("/") else {
+            throw MonitorError.processFailed("Could not determine the remote home directory on \(settings.clusterName).")
+        }
+        return (payload.home, payload.roots)
+    }
 
     func homeDirectory(settings: ConnectionSettings) async throws -> String {
-        let command = pythonCommand(script: Self.homeScript)
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: command,
-            timeout: 20
-        )
-        let home = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard result.exitCode == 0, home.hasPrefix("/") else {
-            throw Self.failure("Could not determine the remote home directory", result)
-        }
-        return home
+        try await resolveHome(settings: settings).home
     }
+
+    // MARK: Listing
 
     func listDirectory(
         settings: ConnectionSettings,
         path: String,
-        showHidden: Bool
+        showHidden: Bool,
+        filter: String = ""
     ) async throws -> RemoteDirectoryListing {
         let target = path.isEmpty ? "~" : path
-        let command = pythonCommand(
-            script: Self.listingScript,
-            arguments: [target, showHidden ? "1" : "0"]
-        )
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: command,
-            timeout: 45
-        )
-        let data = Data(result.stdout.utf8)
-
-        if result.exitCode != 0 {
-            if let payload = try? JSONDecoder().decode(RemoteErrorPayload.self, from: data) {
-                throw MonitorError.processFailed(payload.error)
-            }
-            throw Self.failure("Could not list \(target)", result)
+        var arguments = [target, showHidden ? "1" : "0", String(Self.entryCap)]
+        if !filter.isEmpty {
+            arguments.append(filter)
         }
-
-        let payload: ListingPayload
-        do {
-            payload = try JSONDecoder().decode(ListingPayload.self, from: data)
-        } catch {
-            throw MonitorError.invalidJSON(
-                "Directory listing was not valid JSON: \(error.localizedDescription)"
-            )
-        }
-
+        let result = try await runScript(RemoteFileScripts.listing, arguments: arguments, settings: settings, seconds: 40)
+        let payload = try Self.decode(ListingPayload.self, from: result, operation: "Listing \(target)", settings: settings)
         let parent = payload.resolved == "/" ? "" : payload.resolved
         let entries = payload.entries.map { entry in
             RemoteFileEntry(
@@ -309,43 +585,57 @@ struct RemoteFileService: Sendable {
                 owner: entry.owner,
                 permissions: entry.mode,
                 linkTarget: entry.link,
-                linkIsDir: entry.linkIsDir
+                linkIsDir: entry.linkIsDir,
+                nameIsLossy: entry.lossy ?? false
             )
         }
         return RemoteDirectoryListing(
             requestedPath: payload.requested,
             resolvedPath: payload.resolved,
             entries: entries,
-            truncated: payload.truncated
+            truncated: payload.truncated,
+            totalCount: payload.total ?? entries.count,
+            matchedCount: payload.matched ?? entries.count,
+            filter: payload.filter ?? filter
         )
     }
 
+    // MARK: Simple mutations
+
+    /// Plain `mkdir` (no `-p`): the name was validated not to contain "/",
+    /// so `-p` would only turn "that name already exists" into a silent
+    /// success that looks like a new folder.
     func createDirectory(settings: ConnectionSettings, path: String) async throws {
-        let target = try requireNonEmptyPath(path, operation: "Create folder")
-        let result = try await monitor.runRemoteCommand(
+        let target = try Self.requireNonEmptyPath(path, operation: "Create folder")
+        // The existence test makes the answer independent of the remote
+        // locale's wording; "File exists" still covers a racing creation.
+        let script = "if [ -e \"$1\" ] || [ -L \"$1\" ]; then exit 41; fi; mkdir -- \"$1\""
+        let result = try await runShell(
+            "sh -c \(Self.shellQuote(script)) sh \(Self.shellQuote(target))",
             settings: settings,
-            command: "mkdir -p -- \(shellQuote(target))",
-            timeout: 20
+            seconds: 20
         )
         guard result.exitCode == 0 else {
+            if result.exitCode == 41 || result.stderr.contains("File exists") {
+                let name = (target as NSString).lastPathComponent
+                throw MonitorError.processFailed("A file or folder named “\(name)” already exists.")
+            }
+            if Self.isTimeout(result) {
+                throw MonitorError.processFailed("Creating \(target) timed out on \(settings.clusterName).")
+            }
             throw Self.failure("Could not create \(target)", result)
         }
     }
 
-    /// Renames/moves a single entry. Fails when the target already exists
-    /// (checked server-side with `test -e`/`test -L` in the same command, so
-    /// broken symlinks are also refused).
+    /// Renames a single entry within its folder. Fails when the target
+    /// already exists (checked server-side with `test -e`/`test -L` in the
+    /// same command, so broken symlinks are also refused).
     func rename(settings: ConnectionSettings, from: String, to: String) async throws {
-        let source = try requireNonEmptyPath(from, operation: "Rename")
-        let target = try requireNonEmptyPath(to, operation: "Rename")
-        let command = "if [ -e \(shellQuote(target)) ] || [ -L \(shellQuote(target)) ]; "
-            + "then exit 41; fi; "
-            + "mv -- \(shellQuote(source)) \(shellQuote(target))"
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: command,
-            timeout: 30
-        )
+        let source = try Self.requireNonEmptyPath(from, operation: "Rename")
+        let target = try Self.requireNonEmptyPath(to, operation: "Rename")
+        let script = "if [ -e \"$2\" ] || [ -L \"$2\" ]; then exit 41; fi; mv -- \"$1\" \"$2\""
+        let command = "sh -c \(Self.shellQuote(script)) sh \(Self.shellQuote(source)) \(Self.shellQuote(target))"
+        let result = try await runShell(command, settings: settings, seconds: 30)
         if result.exitCode == 41 {
             throw MonitorError.processFailed("Cannot rename: \(target) already exists.")
         }
@@ -354,14 +644,19 @@ struct RemoteFileService: Sendable {
         }
     }
 
+    // MARK: Trash
+
     /// Thrown by `moveToTrash` when cross-filesystem items cannot get a
     /// trash folder on their own filesystem: proceeding would COPY the data
     /// into the home trash, and home is a small quota (65 GiB) shared by
-    /// every cluster. Callers confirm with the user, then retry with
-    /// `allowQuotaCopy: true` — or offer permanent delete instead. Nothing
+    /// every cluster. Callers confirm with the user — showing `bytes`, and
+    /// only offering the copy when it fits — then retry with
+    /// `allowQuotaCopy: true`, or offer permanent delete instead. Nothing
     /// has been moved when this is thrown.
     struct QuotaCopyConfirmationRequired: Error, LocalizedError {
         let paths: [String]
+        /// Measured with a bounded `du`; nil when it did not finish in time.
+        let bytes: Int64?
 
         var errorDescription: String? {
             "Moving \(paths.count) item\(paths.count == 1 ? "" : "s") to trash "
@@ -369,229 +664,386 @@ struct RemoteFileService: Sendable {
         }
     }
 
-    /// Moves paths into fresh, per-operation server-side trash directories
-    /// (`<…>/<trashDirectoryName>/<timestamp>-<uuid8>/`) and returns every
-    /// trash directory used. This is the default "delete": recoverable with
-    /// a plain `mv` back.
+    /// Moves paths into fresh per-operation trash folders
+    /// (`<…>/<trashDirectoryName>/<timestamp>-<uuid8>/`). This is the
+    /// default "delete": recoverable from the Trash sheet or with `mv`.
     ///
-    /// Same-filesystem sources go to `~/<trashDirectoryName>` (atomic
-    /// rename) — the shared home, so the same folder on every cluster.
-    /// Cross-filesystem sources (AIRE /mnt/scratch, Calder /scratch-calder
-    /// and /flash-calder) get a trash directory next to the source
-    /// (`<parent>/<trashDirectoryName>/…`) so the `mv` is still a rename and
-    /// never copies data into the home quota. Trashed data therefore keeps
-    /// counting toward that filesystem's quota — on Calder a Lustre PROJECT
-    /// quota, which follows the files, not the folder name — until the user
-    /// empties it. Only when that directory cannot be created does the move
-    /// fall back to a copy into `~/<trashDirectoryName>` — gated on
-    /// `allowQuotaCopy` (see `QuotaCopyConfirmationRequired`) and run with a
-    /// size-scaled timeout.
+    /// Items on the home filesystem go to `~/<trashDirectoryName>` — the
+    /// shared home, so the same folder on every cluster. Items on another
+    /// filesystem (AIRE /mnt/scratch, Calder /scratch-calder and
+    /// /flash-calder) go to a trash folder beside them, so the move is
+    /// still a rename and never copies data into the home quota; they keep
+    /// counting toward that filesystem's quota until the trash is emptied.
+    /// Only when that folder cannot be created does the move fall back to a
+    /// copy into the home trash — gated on `allowQuotaCopy` (see
+    /// `QuotaCopyConfirmationRequired`) and run as a detached `RemoteJob`.
     ///
-    /// The source/home device comparison is made per call against the home
-    /// directory resolved over THIS cluster's session, so it is correct for
-    /// whichever cluster `settings` names.
+    /// Safety, in order: the app-side `validatedTargets` check; a refusal
+    /// to re-trash anything already inside a trash folder; a server-side
+    /// re-check against realpath'd roots; a fail-closed device probe (an
+    /// undeterminable filesystem moves nothing); a writable-parent check
+    /// (without it a cross-device `mv` copies everything and only then
+    /// fails to unlink). The moves themselves are `os.rename` calls, which
+    /// cannot copy across filesystems at all. Every group is attempted and
+    /// reported in the returned outcome, including partial failures.
     func moveToTrash(
         settings: ConnectionSettings,
         paths: [String],
+        protectedRoots: [String],
         allowQuotaCopy: Bool = false
-    ) async throws -> [String] {
-        let home = try await homeDirectory(settings: settings)
-        let targets = try validatedTargets(paths, home: home, operation: "Move to trash")
+    ) async throws -> TrashOutcome {
+        let targets = try Self.validatedTargets(paths, protectedRoots: protectedRoots, operation: "Move to trash")
+        try Self.refuseTrashingTrash(targets)
         let runName = Self.trashRunName()
-        let homeTrash = Self.joinPath(
-            Self.trimTrailingSlashes(home),
-            "\(Self.trashDirectoryName)/\(runName)"
+        let createdAt = Self.isoTimestamp()
+
+        let inspection = try await inspectTrash(
+            settings: settings,
+            targets: targets,
+            protectedRoots: protectedRoots,
+            runName: runName
         )
-
-        // The device of each source vs. the home filesystem decides whether
-        // `mv` into the home trash is an atomic rename (same device) or a
-        // copy+unlink (cross-device). When devices cannot be determined the
-        // sources are treated as same-device — prior behavior.
-        let devices = await deviceIDs(settings: settings, paths: [home] + targets)
-        let homeDevice = devices?.first ?? nil
-
-        var homeFilesystemTargets: [String] = []
-        var crossDeviceGroups: [String: [String]] = [:]     // parent dir -> targets
-        if let devices, devices.count == targets.count + 1, homeDevice != nil {
-            for (index, target) in targets.enumerated() {
-                let device = devices[index + 1]
-                if device == nil || device == homeDevice {
-                    homeFilesystemTargets.append(target)
-                } else {
-                    let parent = Self.parentDirectory(of: target)
-                    crossDeviceGroups[parent, default: []].append(target)
-                }
-            }
-        } else {
-            homeFilesystemTargets = targets
+        let plan: TrashPlan
+        do {
+            plan = try Self.planTrash(inspection, runName: runName)
+        } catch {
+            await removeEmptyDirectories(inspection.mountTrash.compactMap(\.createdDirectory), settings: settings)
+            throw error
         }
 
-        // Pre-flight the per-mount trash directories BEFORE moving anything
-        // so a needed quota-copy confirmation can be surfaced with zero
-        // partial state.
-        var perMountMoves: [(trashDirectory: String, targets: [String])] = []
-        var quotaCopyTargets: [String] = []
-        for (parent, group) in crossDeviceGroups.sorted(by: { $0.key < $1.key }) {
-            let trashDirectory = Self.joinPath(parent, "\(Self.trashDirectoryName)/\(runName)")
-            let mkdir = try await monitor.runRemoteCommand(
-                settings: settings,
-                command: "mkdir -p -- \(shellQuote(trashDirectory))",
-                timeout: 20
+        if !plan.quotaCopyTargets.isEmpty, !allowQuotaCopy {
+            let bytes = await totalSizeBytes(settings: settings, paths: plan.quotaCopyTargets)
+            await removeEmptyDirectories(plan.preparedDirectories, settings: settings)
+            throw QuotaCopyConfirmationRequired(paths: plan.quotaCopyTargets, bytes: bytes)
+        }
+
+        var outcome = TrashOutcome()
+        if !plan.groups.isEmpty || !plan.unusedDirectories.isEmpty {
+            outcome = try await executeTrash(
+                plan,
+                runName: runName,
+                createdAt: createdAt,
+                settings: settings
             )
-            if mkdir.exitCode == 0 {
-                perMountMoves.append((trashDirectory, group))
-            } else {
-                quotaCopyTargets.append(contentsOf: group)
+        }
+        if !plan.quotaCopyTargets.isEmpty {
+            do {
+                outcome.copyJob = try await startJob(
+                    kind: .copy,
+                    settings: settings,
+                    targets: plan.quotaCopyTargets,
+                    protectedRoots: protectedRoots,
+                    destination: plan.homeTrashDirectory,
+                    runName: runName,
+                    createdAt: createdAt
+                )
+            } catch {
+                // The renames above already happened: throwing now would
+                // drop the outcome that says where those items went, and the
+                // user would see "failed" while most of the selection has
+                // left the folder. Report the copy as failed items instead.
+                // With nothing renamed or reported yet, the plain error is
+                // the whole truth.
+                if outcome.moved.isEmpty, outcome.failed.isEmpty {
+                    throw error
+                }
+                let reason = "the copy into the home trash could not be started, so it is still in place: "
+                    + error.localizedDescription
+                outcome.failed += plan.quotaCopyTargets.map { TrashOutcome.Failure(path: $0, reason: reason) }
             }
         }
+        return outcome
+    }
 
-        if !quotaCopyTargets.isEmpty, !allowQuotaCopy {
-            // Best effort: remove the still-empty per-mount directories the
-            // pre-flight created; nothing has been moved yet.
-            if !perMountMoves.isEmpty {
-                let quoted = perMountMoves
-                    .map { shellQuote($0.trashDirectory) }
-                    .joined(separator: " ")
-                _ = try? await monitor.runRemoteCommand(
-                    settings: settings,
-                    command: "rmdir -- \(quoted) 2>/dev/null; true",
-                    timeout: 20
+    private func inspectTrash(
+        settings: ConnectionSettings,
+        targets: [String],
+        protectedRoots: [String],
+        runName: String
+    ) async throws -> TrashInspection {
+        let arguments = ["--run", runName, "--trash-name", Self.trashDirectoryName, "--roots"]
+            + protectedRoots.filter { $0.hasPrefix("/") }
+            + ["--targets"] + targets
+        let result = try await runScript(RemoteFileScripts.trashInspect, arguments: arguments, settings: settings, seconds: 45)
+        let payload = try Self.decode(
+            TrashInspectPayload.self,
+            from: result,
+            operation: "Preparing the trash",
+            settings: settings
+        )
+        if let refused = payload.refused?.first {
+            throw MonitorError.processFailed(
+                "Move to trash refused for \(refused.path): \(refused.reason). Nothing was moved."
+            )
+        }
+        return TrashInspection(
+            home: payload.home,
+            homeDevice: payload.homeDevice,
+            targets: (payload.targets ?? []).map {
+                TrashProbe(
+                    path: $0.path,
+                    device: $0.device,
+                    error: $0.error,
+                    parent: $0.parent,
+                    parentWritable: $0.parentWritable
+                )
+            },
+            mountTrash: (payload.mountTrash ?? []).map {
+                MountTrashDirectory(
+                    parent: $0.parent,
+                    directory: $0.directory,
+                    error: $0.error,
+                    createdBase: $0.createdBase ?? false
                 )
             }
-            throw QuotaCopyConfirmationRequired(paths: quotaCopyTargets)
-        }
-
-        var usedTrashDirectories: [String] = []
-
-        if !homeFilesystemTargets.isEmpty {
-            let quotedTargets = homeFilesystemTargets.map(shellQuote).joined(separator: " ")
-            let command = "mkdir -p -- \(shellQuote(homeTrash)) && "
-                + "mv -- \(quotedTargets) \(shellQuote(homeTrash + "/"))"
-            let result = try await monitor.runRemoteCommand(
-                settings: settings,
-                command: command,
-                timeout: 60
-            )
-            guard result.exitCode == 0 else {
-                throw Self.failure("Could not move items to trash", result)
-            }
-            usedTrashDirectories.append(homeTrash)
-        }
-
-        for move in perMountMoves {
-            let quotedTargets = move.targets.map(shellQuote).joined(separator: " ")
-            let command = "mv -- \(quotedTargets) \(shellQuote(move.trashDirectory + "/"))"
-            let result = try await monitor.runRemoteCommand(
-                settings: settings,
-                command: command,
-                timeout: 60
-            )
-            guard result.exitCode == 0 else {
-                throw Self.failure("Could not move items to trash", result)
-            }
-            usedTrashDirectories.append(move.trashDirectory)
-        }
-
-        if !quotaCopyTargets.isEmpty {
-            // User-confirmed cross-device copy into the home trash: `mv` is
-            // copy+unlink here, so scale the timeout with the data size the
-            // way transfers do instead of the flat 60s.
-            let bytes = await totalSizeBytes(settings: settings, paths: quotaCopyTargets)
-            let quotedTargets = quotaCopyTargets.map(shellQuote).joined(separator: " ")
-            let command = "mkdir -p -- \(shellQuote(homeTrash)) && "
-                + "mv -- \(quotedTargets) \(shellQuote(homeTrash + "/"))"
-            let result = try await monitor.runRemoteCommand(
-                settings: settings,
-                command: command,
-                timeout: Self.transferTimeout(forBytes: bytes)
-            )
-            guard result.exitCode == 0 else {
-                throw Self.failure("Could not move items to trash", result)
-            }
-            if !usedTrashDirectories.contains(homeTrash) {
-                usedTrashDirectories.append(homeTrash)
-            }
-        }
-
-        return usedTrashDirectories
-    }
-
-    /// Irreversible `rm -rf`. Callers must double-confirm in the UI; this
-    /// method independently refuses `/`, `~`, the home directory itself,
-    /// anything that is not an absolute path, and any path with `.`/`..`/
-    /// empty components (dot-segment aliases of protected locations) —
-    /// defense in depth.
-    func deletePermanently(settings: ConnectionSettings, paths: [String]) async throws {
-        let home = try await homeDirectory(settings: settings)
-        let targets = try validatedTargets(paths, home: home, operation: "Delete")
-        let quotedTargets = targets.map(shellQuote).joined(separator: " ")
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: "rm -rf -- \(quotedTargets)",
-            timeout: 120
         )
-        guard result.exitCode == 0 else {
-            throw Self.failure("Could not delete items", result)
-        }
     }
 
+    private func executeTrash(
+        _ plan: TrashPlan,
+        runName: String,
+        createdAt: String,
+        settings: ConnectionSettings
+    ) async throws -> TrashOutcome {
+        var arguments = [
+            "--run", runName,
+            "--cluster", settings.clusterID.rawValue,
+            "--created", createdAt,
+            "--trash-name", Self.trashDirectoryName
+        ]
+        for group in plan.groups {
+            arguments += ["--group", group.directory, group.isHome ? "home" : "mount"] + group.paths
+        }
+        if !plan.unusedDirectories.isEmpty {
+            arguments += ["--cleanup"] + plan.unusedDirectories
+        }
+        let allTargets = plan.groups.flatMap(\.paths)
+        // Renames are metadata operations; even thousands finish in
+        // seconds. The bound only guards a hung filesystem.
+        let seconds = 60 + allTargets.count / 20
+        let result = try await runScript(RemoteFileScripts.trashExecute, arguments: arguments, settings: settings, seconds: seconds)
+        return try Self.trashOutcome(from: result, targets: allTargets, settings: settings)
+    }
+
+    /// Builds the outcome from the execute script's per-item lines. When the
+    /// final `done` line is missing (the bound or the connection cut the
+    /// run short), every item not reported is listed as not attempted, so
+    /// the user is never told less than what happened.
+    static func trashOutcome(
+        from result: ProcessResult,
+        targets: [String],
+        settings: ConnectionSettings
+    ) throws -> TrashOutcome {
+        let objects = jsonObjects(result.stdout)
+        if let error = objects.first(where: { $0["error"] != nil && $0["failed"] == nil })?["error"] as? String {
+            throw MonitorError.processFailed(error)
+        }
+        var outcome = TrashOutcome()
+        var reported = Set<String>()
+        var finished = false
+        for object in objects {
+            if let source = object["moved"] as? String, let directory = object["directory"] as? String {
+                reported.insert(source)
+                if let index = outcome.moved.firstIndex(where: { $0.directory == directory }) {
+                    outcome.moved[index].paths.append(source)
+                } else {
+                    outcome.moved.append(TrashOutcome.Move(directory: directory, paths: [source]))
+                }
+            } else if let source = object["failed"] as? String {
+                reported.insert(source)
+                outcome.failed.append(TrashOutcome.Failure(path: source, reason: object["error"] as? String ?? "unknown error"))
+            } else if object["done"] as? Bool == true {
+                finished = true
+            }
+        }
+        if !finished {
+            if outcome.moved.isEmpty, outcome.failed.isEmpty, !isTimeout(result) {
+                throw failure("Could not move items to trash on \(settings.clusterName)", result)
+            }
+            let reason = isTimeout(result)
+                ? "not attempted — the trash operation timed out; refresh to check"
+                : "not attempted — the trash operation stopped early; refresh to check"
+            for target in targets where !reported.contains(target) {
+                outcome.failed.append(TrashOutcome.Failure(path: target, reason: reason))
+            }
+        }
+        return outcome
+    }
+
+    /// Best effort: removes still-empty per-mount trash folders created by
+    /// a pre-flight whose move did not happen (and their `.aire-trash`
+    /// parent when that is empty too).
+    private func removeEmptyDirectories(_ directories: [String], settings: ConnectionSettings) async {
+        guard !directories.isEmpty else {
+            return
+        }
+        let arguments = ["--run", "", "--trash-name", Self.trashDirectoryName, "--cleanup"] + directories
+        _ = try? await runScript(RemoteFileScripts.trashExecute, arguments: arguments, settings: settings, seconds: 20)
+    }
+
+    // MARK: Permanent delete & background jobs
+
+    /// Starts an irreversible `rm -rf` as a detached job and returns it for
+    /// polling. Callers must double-confirm in the UI; this method
+    /// independently refuses everything `validatedTargets` refuses, and the
+    /// job starter re-checks the targets against realpath'd roots on the
+    /// login node before anything is deleted.
+    func startPermanentDelete(
+        settings: ConnectionSettings,
+        paths: [String],
+        protectedRoots: [String]
+    ) async throws -> RemoteJob {
+        let targets = try Self.validatedTargets(paths, protectedRoots: protectedRoots, operation: "Delete")
+        return try await startJob(
+            kind: .delete,
+            settings: settings,
+            targets: targets,
+            protectedRoots: protectedRoots,
+            destination: nil,
+            runName: nil,
+            createdAt: nil
+        )
+    }
+
+    private func startJob(
+        kind: RemoteJob.Kind,
+        settings: ConnectionSettings,
+        targets: [String],
+        protectedRoots: [String],
+        destination: String?,
+        runName: String?,
+        createdAt: String?
+    ) async throws -> RemoteJob {
+        // Every job names the trash folder: a copy files into it, and a
+        // delete that removes a trash run folder (Empty) drops that run's
+        // index pointer, so an emptied run is not listed as missing.
+        var arguments = ["--worker", RemoteFileScripts.jobWorker, "--mode", kind.rawValue, "--roots"]
+            + protectedRoots.filter { $0.hasPrefix("/") }
+            + ["--targets"] + targets
+            + ["--trash-name", Self.trashDirectoryName]
+        if let destination {
+            arguments += [
+                "--destination", destination,
+                "--run", runName ?? "",
+                "--cluster", settings.clusterID.rawValue,
+                "--created", createdAt ?? ""
+            ]
+        }
+        let operation = kind == .delete ? "Starting the delete" : "Starting the copy into the home trash"
+        let result = try await runScript(RemoteFileScripts.jobStart, arguments: arguments, settings: settings, seconds: 30)
+        let payload = try Self.decode(JobStartPayload.self, from: result, operation: operation, settings: settings)
+        if let refused = payload.refused?.first {
+            let verb = kind == .delete ? "Delete" : "Move to trash"
+            throw MonitorError.processFailed("\(verb) refused for \(refused.path): \(refused.reason). Nothing was changed.")
+        }
+        guard let directory = payload.job, let pid = payload.pid else {
+            throw MonitorError.invalidJSON("\(operation): the login node's reply could not be read.")
+        }
+        return RemoteJob(directory: directory, pid: pid, kind: kind, paths: targets, destination: destination)
+    }
+
+    func pollJob(settings: ConnectionSettings, job: RemoteJob) async throws -> RemoteJobStatus {
+        let result = try await runScript(
+            RemoteFileScripts.jobPoll,
+            arguments: [job.directory, String(job.pid), "poll"],
+            settings: settings,
+            seconds: 20
+        )
+        let payload = try Self.decode(JobPollPayload.self, from: result, operation: "Checking progress", settings: settings)
+        let state: RemoteJobStatus.State
+        switch payload.state {
+        case "running":
+            state = .running
+        case "finished":
+            state = .finished
+        case "crashed":
+            state = .crashed
+        default:
+            state = .missing
+        }
+        let status = payload.status
+        return RemoteJobStatus(
+            state: state,
+            total: status?.total ?? job.paths.count,
+            done: status?.done ?? 0,
+            failed: (status?.failed ?? []).map { TrashOutcome.Failure(path: $0.path, reason: $0.error) },
+            moved: status?.moved ?? [],
+            cancelled: status?.cancelled ?? false,
+            current: status?.current,
+            detail: payload.detail ?? ""
+        )
+    }
+
+    /// Sends SIGTERM to the job's process group (verified to be this job's
+    /// worker first). The next poll reports the job as cancelled.
+    func cancelJob(settings: ConnectionSettings, job: RemoteJob) async throws {
+        let result = try await runScript(
+            RemoteFileScripts.jobPoll,
+            arguments: [job.directory, String(job.pid), "cancel"],
+            settings: settings,
+            seconds: 20
+        )
+        _ = try Self.decode(JobPollPayload.self, from: result, operation: "Cancelling", settings: settings)
+    }
+
+    // MARK: Preview
+
+    /// One round trip: type, size and up to `maxBytes` from the head or the
+    /// tail. Text is anything `file(1)` gives a non-binary charset (so JSON
+    /// and notebooks count) — re-checked on the bytes themselves whenever
+    /// the type is not text/* — or, without file(1), anything that sniffs
+    /// as text.
     func preview(
         settings: ConnectionSettings,
         path: String,
-        maxBytes: Int
+        maxBytes: Int,
+        mode: RemotePreviewMode
     ) async throws -> RemoteFilePreview {
-        let target = try requireNonEmptyPath(path, operation: "Preview")
-        let cap = max(1, maxBytes)
-
-        // `file(1)` is not part of coreutils and may be absent from a
-        // minimal login-node image. The shell then reports 127 and the
-        // preview decides text vs. binary from the bytes themselves.
-        let mimeResult = try await monitor.runRemoteCommand(
+        let target = try Self.requireNonEmptyPath(path, operation: "Preview")
+        let result = try await runScript(
+            RemoteFileScripts.preview,
+            arguments: [target, String(max(1, maxBytes)), mode.rawValue],
             settings: settings,
-            command: "file -b --mime-type -- \(shellQuote(target))",
-            timeout: 20
+            seconds: 30
         )
-        let sniffContent = mimeResult.exitCode == Self.commandNotFoundExitCode
-        if !sniffContent {
-            guard mimeResult.exitCode == 0 else {
-                throw Self.failure("Could not inspect \(target)", mimeResult)
-            }
-            let mime = mimeResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard mime.hasPrefix("text/") || mime == "inode/x-empty" else {
-                return .binary(mimeType: mime.isEmpty ? "application/octet-stream" : mime)
-            }
-        }
-
-        let size = try await fileSize(settings: settings, path: target)
-        if let size, size > Int64(cap) * 4 {
-            return .tooLarge(bytes: size)
-        }
-
-        let headResult = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: "head -c \(cap) -- \(shellQuote(target))",
-            timeout: 30
-        )
-        guard headResult.exitCode == 0 else {
-            throw Self.failure("Could not read \(target)", headResult)
-        }
-        var text = headResult.stdout
-        if sniffContent, Self.looksBinary(text) {
-            return .binary(mimeType: "application/octet-stream")
-        }
-        // When the byte cap truncated the file mid-codepoint, the lossy
-        // decode ends the text with a replacement character that is purely a
-        // truncation artifact — drop it. Untruncated files keep theirs.
-        if let size, size > Int64(cap), text.hasSuffix("\u{FFFD}") {
-            text.removeLast()
-        }
-        return .text(text)
+        let payload = try Self.decode(PreviewPayload.self, from: result, operation: "Preview of \(target)", settings: settings)
+        let data = Data(base64Encoded: payload.data) ?? Data()
+        return Self.classifyPreview(payload: payload, data: data)
     }
 
-    /// Content sniff used only when `file(1)` is unavailable: NUL bytes, or
-    /// more than one in twenty characters failing UTF-8 decoding (they
-    /// arrive as U+FFFD from the lossy stdout decode), mean binary.
-    private static func looksBinary(_ text: String) -> Bool {
+    static func classifyPreview(payload: PreviewPayload, data: Data) -> RemoteFilePreview {
+        var text = String(decoding: data, as: UTF8.self)
+        let mime = payload.mime?.lowercased()
+        if payload.hasFile, let mime {
+            let isEmpty = mime == "inode/x-empty"
+            let charsetSaysText = payload.charset.map { $0 != "binary" } ?? false
+            guard isEmpty || charsetSaysText else {
+                return .binary(mimeType: mime)
+            }
+            if !isEmpty, !mime.hasPrefix("text/"), looksBinary(text) {
+                return .binary(mimeType: mime)
+            }
+        } else if looksBinary(text) {
+            return .binary(mimeType: mime ?? "application/octet-stream")
+        }
+        // A head cut mid-codepoint ends in a replacement character that is
+        // purely a truncation artifact — drop it. Untruncated files keep
+        // theirs.
+        if payload.truncated, !payload.fromEnd, text.hasSuffix("\u{FFFD}") {
+            text.removeLast()
+        }
+        return .text(RemoteTextPreview(
+            text: text,
+            totalBytes: payload.size,
+            shownBytes: data.count,
+            truncated: payload.truncated,
+            fromEnd: payload.fromEnd
+        ))
+    }
+
+    /// NUL bytes, or more than one in twenty characters failing UTF-8
+    /// decoding (they arrive as U+FFFD), mean binary.
+    static func looksBinary(_ text: String) -> Bool {
         var scalars = 0
         var replacements = 0
         for scalar in text.unicodeScalars {
@@ -606,14 +1058,25 @@ struct RemoteFileService: Sendable {
         return replacements > max(8, scalars / 20)
     }
 
-    /// Human-readable recursive size, e.g. "1.2G".
+    // MARK: Folder size
+
+    /// Human-readable recursive size, e.g. "1.2G". Bounded on the server so
+    /// an abandoned Folder Size never leaves a `du` loading the Lustre
+    /// metadata server.
+    ///
+    /// `-H` follows the path itself when it is a symlink — Folder Size is
+    /// offered for links to folders, above all the `~/scratch` link into
+    /// scratch, and plain `du -s` (GNU and BSD alike) would measure the link
+    /// (0) — but not the links inside the tree, which `-L` would also follow
+    /// (counting other trees, or looping).
     func diskUsage(settings: ConnectionSettings, path: String) async throws -> String {
-        let target = try requireNonEmptyPath(path, operation: "Disk usage")
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: "du -sh -- \(shellQuote(target))",
-            timeout: 180
-        )
+        let target = try Self.requireNonEmptyPath(path, operation: "Disk usage")
+        let result = try await runShell("du -shH -- \(Self.shellQuote(target))", settings: settings, seconds: 170)
+        if Self.isTimeout(result) {
+            throw MonitorError.processFailed(
+                "This folder is too large to measure quickly — run du -sh in the terminal instead."
+            )
+        }
         // du can exit non-zero on partially unreadable trees while still
         // printing a usable total; accept output whenever it parses.
         let firstLine = result.stdout
@@ -630,12 +1093,49 @@ struct RemoteFileService: Sendable {
         return size
     }
 
+    /// Total size in bytes of the given paths via a bounded `du -sk`. du
+    /// prints each argument's total as it finishes, so a timeout still
+    /// yields the totals measured so far — but then the sum is incomplete,
+    /// and nil is returned rather than an underestimate.
+    func totalSizeBytes(settings: ConnectionSettings, paths: [String]) async -> Int64? {
+        guard !paths.isEmpty else {
+            return nil
+        }
+        let quoted = paths.map(Self.shellQuote).joined(separator: " ")
+        guard let result = try? await runShell("du -sk -- \(quoted)", settings: settings, seconds: 60),
+              !Self.isTimeout(result) else {
+            return nil
+        }
+        let totals = Self.parseDiskUsageKiB(result.stdout)
+        guard !totals.isEmpty else {
+            return nil
+        }
+        return totals.values.reduce(0, +)
+    }
+
+    /// `du -sk` lines ("<KiB>\t<path>") as bytes by path.
+    static func parseDiskUsageKiB(_ output: String) -> [String: Int64] {
+        var totals: [String: Int64] = [:]
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, let kibibytes = Int64(parts[0].trimmingCharacters(in: .whitespaces)) else {
+                continue
+            }
+            totals[String(parts[1]), default: 0] += kibibytes * 1024
+        }
+        return totals
+    }
+
+    // MARK: Transfers
+
     func download(
         settings: ConnectionSettings,
         remotePath: String,
-        toLocalDirectory: URL
+        toLocalDirectory: URL,
+        scratch: TransferScratch? = nil,
+        progress: TransferProgressHandler? = nil
     ) async throws -> URL {
-        var source = try requireNonEmptyPath(remotePath, operation: "Download")
+        var source = try Self.requireNonEmptyPath(remotePath, operation: "Download")
         if source.hasPrefix("~") {
             source = try await expandTilde(source, settings: settings)
         }
@@ -646,36 +1146,71 @@ struct RemoteFileService: Sendable {
         guard !name.isEmpty, name != ".", name != ".." else {
             throw MonitorError.processFailed("Cannot download \(source): not a file path.")
         }
+        let size = try await remoteRegularFileSize(settings: settings, path: source)
 
-        try FileManager.default.createDirectory(
-            at: toLocalDirectory,
-            withIntermediateDirectories: true
-        )
-        let destination = Self.uniquifiedURL(in: toLocalDirectory, preferredName: name)
+        try FileManager.default.createDirectory(at: toLocalDirectory, withIntermediateDirectories: true)
+        // The final name is reserved (created empty, O_EXCL) before scp
+        // starts, so two downloads of "results.csv" can never pick — and
+        // write into — the same file; scp writes a hidden sibling that is
+        // renamed over the placeholder only once complete, so a partial
+        // file never sits under the real name.
+        let reserved = try Self.reserveLocalURL(in: toLocalDirectory, preferredName: name)
+        let part = toLocalDirectory.appendingPathComponent(Self.partName(for: reserved.lastPathComponent))
+        scratch?.recordLocalFiles([part, reserved])
+        progress?(TransferProgress(transferredBytes: 0, totalBytes: size))
 
-        let remoteSize = try? await fileSize(settings: settings, path: source)
-        let result = try await monitor.runTransfer(
-            settings: settings,
-            arguments: scpArguments(
+        do {
+            let result = try await runWatchedTransfer(
                 settings: settings,
-                remotePath: source,
-                localPath: destination.path,
-                direction: .download
-            ),
-            timeout: Self.transferTimeout(forBytes: remoteSize ?? nil)
-        )
-        guard result.exitCode == 0 else {
-            // A failed scp can leave a zero-byte placeholder behind.
-            try? FileManager.default.removeItem(at: destination)
-            throw Self.failure("Download of \(name) failed", result)
+                arguments: Self.scpArguments(
+                    settings: settings,
+                    remotePath: source,
+                    localPath: part.path,
+                    direction: .download
+                ),
+                name: name,
+                totalBytes: size,
+                pollInterval: 1,
+                sample: { Self.localFileSize(part) ?? 0 },
+                progress: progress
+            )
+            guard result.exitCode == 0 else {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                throw Self.failure("Download of \(name) failed", result)
+            }
+            guard Darwin.rename(part.path, reserved.path) == 0 else {
+                throw MonitorError.processFailed(
+                    "Downloaded \(name), but could not move it into place: \(String(cString: strerror(errno)))"
+                )
+            }
+            scratch?.clear()
+            let finalSize = Self.localFileSize(reserved) ?? size ?? 0
+            progress?(TransferProgress(transferredBytes: finalSize, totalBytes: size ?? finalSize))
+            return reserved
+        } catch {
+            try? FileManager.default.removeItem(at: part)
+            try? FileManager.default.removeItem(at: reserved)
+            scratch?.clear()
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw error
         }
-        return destination
     }
 
+    /// Uploads into `<dir>/.<name>.part-<id>` and only then links the part
+    /// to the real name with `ln`, which fails atomically if that name
+    /// appeared meanwhile — a failed or cancelled upload never leaves a
+    /// truncated file under the real name for a job to read as complete,
+    /// and never replaces someone's file.
     func upload(
         settings: ConnectionSettings,
         localFile: URL,
-        toRemoteDirectory: String
+        toRemoteDirectory: String,
+        scratch: TransferScratch? = nil,
+        progress: TransferProgressHandler? = nil
     ) async throws {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: localFile.path, isDirectory: &isDirectory) else {
@@ -686,149 +1221,346 @@ struct RemoteFileService: Sendable {
                 "Uploading folders is not supported — compress \(localFile.lastPathComponent) first."
             )
         }
-
-        var target = try requireNonEmptyPath(toRemoteDirectory, operation: "Upload")
-        if target.hasPrefix("~") {
-            target = try await expandTilde(target, settings: settings)
+        var directory = try Self.requireNonEmptyPath(toRemoteDirectory, operation: "Upload")
+        if directory.hasPrefix("~") {
+            directory = try await expandTilde(directory, settings: settings)
         }
-        if !target.hasSuffix("/") {
-            target += "/"
-        }
+        directory = Self.trimTrailingSlashes(directory)
+        let name = localFile.lastPathComponent
+        let destination = Self.joinPath(directory, name)
+        let part = Self.joinPath(directory, Self.partName(for: name))
+        let localSize = Self.localFileSize(localFile)
 
-        // scp opens the destination create+truncate, silently replacing an
-        // existing remote file — refuse first (same `test -e`/`test -L`
-        // pattern as rename, so broken symlinks are also caught). The
-        // check-then-scp window is acceptable for an interactive app.
-        let destination = target + localFile.lastPathComponent
-        let existsCheck = try await monitor.runRemoteCommand(
+        // Fail before sending gigabytes: the folder must exist and be
+        // writable, and the name must be free (`-L` catches broken links).
+        let precheck = "if [ ! -d \"$1\" ]; then exit 43; fi; "
+            + "if [ -e \"$2\" ] || [ -L \"$2\" ]; then exit 41; fi; "
+            + "if [ ! -w \"$1\" ]; then exit 42; fi"
+        let check = try await runShell(
+            "sh -c \(Self.shellQuote(precheck)) sh \(Self.shellQuote(directory)) \(Self.shellQuote(destination))",
             settings: settings,
-            command: "if [ -e \(shellQuote(destination)) ] || [ -L \(shellQuote(destination)) ]; "
-                + "then exit 41; fi",
-            timeout: 20
+            seconds: 20
         )
-        if existsCheck.exitCode == 41 {
-            throw MonitorError.processFailed(
-                "Cannot upload: \(localFile.lastPathComponent) already exists in "
-                    + "\(Self.trimTrailingSlashes(target))."
-            )
-        }
-        guard existsCheck.exitCode == 0 else {
-            throw Self.failure("Could not check \(destination) before upload", existsCheck)
+        switch check.exitCode {
+        case 0:
+            break
+        case 41:
+            throw MonitorError.processFailed("Cannot upload: \(name) already exists in \(directory).")
+        case 42:
+            throw MonitorError.processFailed("Cannot upload: you don't have permission to write to \(directory).")
+        case 43:
+            throw MonitorError.processFailed("Cannot upload: \(directory) no longer exists.")
+        default:
+            throw Self.failure("Could not check \(destination) before upload", check)
         }
 
-        let attributes = try? FileManager.default.attributesOfItem(atPath: localFile.path)
-        let localSize = (attributes?[.size] as? NSNumber)?.int64Value
-        let result = try await monitor.runTransfer(
-            settings: settings,
-            arguments: scpArguments(
+        scratch?.recordRemotePart(settings: settings, path: part)
+        progress?(TransferProgress(transferredBytes: 0, totalBytes: localSize))
+        do {
+            let result = try await runWatchedTransfer(
                 settings: settings,
-                remotePath: target,
-                localPath: localFile.path,
-                direction: .upload
-            ),
-            timeout: Self.transferTimeout(forBytes: localSize)
-        )
+                arguments: Self.scpArguments(
+                    settings: settings,
+                    remotePath: part,
+                    localPath: localFile.path,
+                    direction: .upload
+                ),
+                name: name,
+                totalBytes: localSize,
+                pollInterval: 10,
+                sample: { [self] in await self.remoteFileSize(settings: settings, path: part) },
+                progress: progress
+            )
+            guard result.exitCode == 0 else {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                throw Self.failure("Upload of \(name) failed", result)
+            }
+            // `ln` refuses an existing name atomically. Where hard links are
+            // not supported, `mv -n` (no-clobber) is the fallback, and the
+            // part file still being there afterwards tells "the name was
+            // taken" (41) from any other failure (44).
+            let finalize = "if ln -- \"$1\" \"$2\" 2>/dev/null; then rm -f -- \"$1\"; exit 0; fi; "
+                + "if [ -e \"$2\" ] || [ -L \"$2\" ]; then rm -f -- \"$1\"; exit 41; fi; "
+                + "mv -n -- \"$1\" \"$2\"; "
+                + "if [ -e \"$1\" ]; then "
+                + "if [ -e \"$2\" ] || [ -L \"$2\" ]; then rm -f -- \"$1\"; exit 41; fi; exit 44; fi"
+            let finished = try await runShell(
+                "sh -c \(Self.shellQuote(finalize)) sh \(Self.shellQuote(part)) \(Self.shellQuote(destination))",
+                settings: settings,
+                seconds: 30
+            )
+            if finished.exitCode == 41 {
+                scratch?.clear()
+                throw MonitorError.processFailed(
+                    "Uploaded \(name), but a file of that name appeared in \(directory) meanwhile — the upload was discarded."
+                )
+            }
+            guard finished.exitCode == 0 else {
+                throw Self.failure("Uploaded \(name), but could not move it into place", finished)
+            }
+            scratch?.clear()
+            progress?(TransferProgress(transferredBytes: localSize ?? 0, totalBytes: localSize))
+        } catch {
+            // Detached from this task: a cancelled task would SIGTERM the
+            // cleanup's own ssh at launch.
+            let service = self
+            await Task {
+                _ = try? await service.runShell("rm -f -- \(Self.shellQuote(part))", settings: settings, seconds: 20)
+            }.value
+            scratch?.clear()
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw error
+        }
+    }
+
+    /// No data for this long ends a transfer. A stall check rather than a
+    /// size-scaled deadline: a slow link through rash is fine as long as
+    /// bytes keep moving.
+    static let transferStallTimeout: TimeInterval = 120
+
+    struct TransferStalled: Error, LocalizedError {
+        let name: String
+        var errorDescription: String? {
+            "Transfer of \(name) stopped: no data moved for "
+                + "\(Int(RemoteFileService.transferStallTimeout / 60)) minutes. Check the connection and try again."
+        }
+    }
+
+    /// Runs scp with a generous absolute ceiling plus a stall watchdog that
+    /// samples progress every `pollInterval`. A failed sample (nil) never
+    /// counts as a stall: it only means the probe could not tell.
+    private func runWatchedTransfer(
+        settings: ConnectionSettings,
+        arguments: [String],
+        name: String,
+        totalBytes: Int64?,
+        pollInterval: TimeInterval,
+        sample: @escaping @Sendable () async -> Int64?,
+        progress: TransferProgressHandler?
+    ) async throws -> ProcessResult {
+        let runner = self.runner
+        let ceiling = Self.transferCeiling(forBytes: totalBytes)
+        let stallLimit = Duration.seconds(Self.transferStallTimeout)
+        return try await withThrowingTaskGroup(of: WatchedTransferOutcome.self) { group in
+            group.addTask {
+                .finished(try await runner.runTransfer(settings: settings, arguments: arguments, timeout: ceiling))
+            }
+            group.addTask {
+                var best: Int64 = -1
+                var lastAdvance = ContinuousClock.now
+                while true {
+                    try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+                    let now = ContinuousClock.now
+                    guard let value = await sample() else {
+                        lastAdvance = now
+                        continue
+                    }
+                    if value > best {
+                        best = value
+                        lastAdvance = now
+                        progress?(TransferProgress(transferredBytes: value, totalBytes: totalBytes))
+                    } else if now - lastAdvance > stallLimit {
+                        return .stalled
+                    }
+                }
+            }
+            while let outcome = try await group.next() {
+                group.cancelAll()
+                switch outcome {
+                case .finished(let result):
+                    return result
+                case .stalled:
+                    throw TransferStalled(name: name)
+                }
+            }
+            throw CancellationError()
+        }
+    }
+
+    private enum WatchedTransferOutcome: Sendable {
+        case finished(ProcessResult)
+        case stalled
+    }
+
+    /// Size of a remote regular file (following links). Throws a readable
+    /// error for folders, FIFOs, sockets and devices — scp would block on a
+    /// FIFO until killed — and for paths that do not exist.
+    private func remoteRegularFileSize(settings: ConnectionSettings, path: String) async throws -> Int64? {
+        let result = try await runShell("stat -L -c '%s %F' -- \(Self.shellQuote(path))", settings: settings, seconds: 20)
         guard result.exitCode == 0 else {
-            throw Self.failure("Upload of \(localFile.lastPathComponent) failed", result)
+            if Self.isTimeout(result) {
+                throw MonitorError.processFailed("Checking \(path) timed out on \(settings.clusterName).")
+            }
+            throw Self.failure("Could not find \(path)", result)
         }
+        let line = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+        let type = parts.count > 1 ? parts[1] : ""
+        if type == "directory" {
+            throw MonitorError.processFailed("\(path) is a folder — compress it on the cluster first to download it.")
+        }
+        if !type.isEmpty, !type.contains("regular") {
+            throw MonitorError.processFailed("\(path) is not a regular file (\(type)), so it cannot be downloaded.")
+        }
+        return parts.first.flatMap { Int64($0) }
     }
 
-    // MARK: Quoting & validation
-
-    /// Wraps a value in single quotes for safe interpolation into a remote
-    /// shell command (`'` becomes `'\''`) — same algorithm as
-    /// `SSHTerminalCommand.shellQuote`. EVERY remote path interpolation in
-    /// this file must go through it.
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    /// Size of a remote file for upload progress: 0 when it does not exist
+    /// yet, nil when the probe itself failed.
+    private func remoteFileSize(settings: ConnectionSettings, path: String) async -> Int64? {
+        let script = "if [ -e \"$1\" ]; then stat -c %s -- \"$1\"; else echo 0; fi"
+        guard let result = try? await runShell(
+            "sh -c \(Self.shellQuote(script)) sh \(Self.shellQuote(path))",
+            settings: settings,
+            seconds: 10
+        ), result.exitCode == 0 else {
+            return nil
+        }
+        return Int64(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Rejects blank paths but returns the path UNCHANGED. Remote names may
-    /// legitimately be, start with, or end in whitespace or a newline
-    /// (Linux allows any byte but "/" and NUL): trimming "/users/u/proj/ "
-    /// would turn "delete the file named ' '" into "delete /users/u/proj".
-    /// Names the user types are trimmed and validated by the callers.
-    private func requireNonEmptyPath(_ path: String, operation: String) throws -> String {
-        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw MonitorError.processFailed("\(operation): no path given.")
-        }
-        return path
+    static func localFileSize(_ url: URL) -> Int64? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
     }
 
-    /// Shared guard for trash/delete: expands a leading `~`, then refuses
-    /// `/`, `~`, the home directory itself, anything not absolute, and any
-    /// path containing `.`/`..`/empty components — so dot-segment and
-    /// double-slash aliases (`/users/u/../u`, `//users/u`) can never dodge
-    /// the protected-location checks.
-    private func validatedTargets(
-        _ paths: [String],
-        home: String,
-        operation: String
-    ) throws -> [String] {
-        guard !paths.isEmpty else {
-            throw MonitorError.processFailed("\(operation): no items selected.")
-        }
-        let normalizedHome = Self.trimTrailingSlashes(home)
-        return try paths.map { raw in
-            let trimmed = try requireNonEmptyPath(raw, operation: operation)
-            let expanded = Self.expandLeadingTilde(trimmed, home: normalizedHome)
-            let normalized = Self.trimTrailingSlashes(expanded)
-            // Defense in depth for destructive operations: normalisation may
-            // only ever drop trailing "/" characters. Anything else means the
-            // command would act on a different path than the one selected.
-            guard expanded.hasPrefix(normalized),
-                  expanded.dropFirst(normalized.count).allSatisfy({ $0 == "/" }) else {
-                throw MonitorError.processFailed(
-                    "\(operation) refused for \(trimmed): the path does not normalise safely."
-                )
-            }
-            guard normalized.contains("/") else {
-                throw MonitorError.processFailed(
-                    "\(operation) refused for \(trimmed): not an absolute path."
-                )
-            }
-            guard normalized.hasPrefix("/") else {
-                throw MonitorError.processFailed(
-                    "\(operation) refused for \(trimmed): only absolute paths are allowed."
-                )
-            }
-            guard normalized != "/", normalized != normalizedHome else {
-                throw MonitorError.processFailed(
-                    "\(operation) refused for \(trimmed): protected location."
-                )
-            }
-            // Segment-wise check: the first component of an absolute path is
-            // the empty string before the leading "/" — every later one must
-            // be a real name (this correctly allows names like "..foo").
-            let components = normalized
-                .split(separator: "/", omittingEmptySubsequences: false)
-                .dropFirst()
-            guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
-                throw MonitorError.processFailed(
-                    "\(operation) refused for \(trimmed): "
-                        + "paths with '.', '..', or empty components are not allowed."
-                )
-            }
-            return normalized
-        }
+    /// Fire-and-forget remote command for quit time, when nothing can be
+    /// awaited: the shared `SSHMuxOptions` (never prompt, never become a
+    /// master, this cluster's socket only), but the app does not wait for
+    /// it. The ssh child outlives the app and exits on its own.
+    static func launchDetachedCleanup(settings: ConnectionSettings, command: String) {
+        try? detachedCleanupProcess(settings: settings, command: command).run()
     }
 
-    private static func expandLeadingTilde(_ path: String, home: String) -> String {
-        if path == "~" {
-            return home
-        }
-        if path.hasPrefix("~/") {
-            return home + path.dropFirst(1)
-        }
-        return path
+    /// The quit-time cleanup's ssh, configured but not started. Like every
+    /// child, it gets `MonitorService.childEnvironment()`, so a password
+    /// exported for the old command-line helpers never reaches it.
+    static func detachedCleanupProcess(settings: ConnectionSettings, command: String) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = SSHMuxOptions.sshArguments(settings: settings)
+            + [settings.hostname, bounded(command, seconds: 20)]
+        process.environment = MonitorService.childEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        return process
     }
 
-    private static func trimTrailingSlashes(_ path: String) -> String {
-        var trimmed = path
-        while trimmed.count > 1 && trimmed.hasSuffix("/") {
-            trimmed.removeLast()
+    // MARK: Trash management
+
+    /// Every trash run of this cluster. `storageRoots` lets the login node
+    /// tell a run on a filesystem that is not mounted there ("unavailable")
+    /// from one whose folder was renamed ("missing"). `forgetting` names
+    /// index entries of missing runs (`TrashRun.Reachability.missing`) to
+    /// remove first; the script drops one only if its run is still missing
+    /// at that moment.
+    func listTrash(
+        settings: ConnectionSettings,
+        storageRoots: [String] = [],
+        forgetting pointers: [String] = []
+    ) async throws -> [TrashRun] {
+        var arguments = [
+            "--cluster", settings.clusterID.rawValue,
+            "--trash-name", Self.trashDirectoryName,
+            "--item-cap", "300"
+        ]
+        let roots = storageRoots.filter { $0.hasPrefix("/") }
+        if !roots.isEmpty {
+            arguments += ["--roots"] + roots
         }
-        return trimmed
+        if !pointers.isEmpty {
+            arguments += ["--forget"] + pointers
+        }
+        let result = try await runScript(RemoteFileScripts.trashList, arguments: arguments, settings: settings, seconds: 40)
+        let payload = try Self.decode(TrashListPayload.self, from: result, operation: "Listing the trash", settings: settings)
+        return payload.runs
+            .map { run in
+                let parent = ((run.directory as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+                let reachability: TrashRun.Reachability
+                switch run.state {
+                case "missing":
+                    // Without its index entry's name the user could not
+                    // forget it; it is still listed as unreachable.
+                    reachability = run.pointer.map { .missing(pointer: $0) } ?? .unavailable
+                case "unavailable":
+                    reachability = .unavailable
+                default:
+                    reachability = .reachable
+                }
+                return TrashRun(
+                    directory: run.directory,
+                    location: run.location == "home" ? .home : .beside(parent: parent),
+                    clusterID: run.cluster,
+                    createdAt: Self.parseTrashDate(created: run.created, directory: run.directory)
+                        ?? run.modified.map { Date(timeIntervalSince1970: $0) },
+                    itemCount: run.count,
+                    items: run.entries.map { entry in
+                        TrashRun.Item(
+                            name: entry.name,
+                            path: Self.joinPath(run.directory, entry.name),
+                            isDirectory: entry.isDir,
+                            originalPath: entry.original,
+                            nameIsLossy: entry.lossy ?? false
+                        )
+                    },
+                    hasManifest: run.hasManifest ?? false,
+                    error: run.error,
+                    reachability: reachability
+                )
+            }
+            .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+    }
+
+    /// Bytes per trash run folder, from one bounded `du -sk`.
+    func trashSizes(settings: ConnectionSettings, directories: [String]) async throws -> [String: Int64] {
+        guard !directories.isEmpty else {
+            return [:]
+        }
+        let quoted = directories.map(Self.shellQuote).joined(separator: " ")
+        let result = try await runShell("du -sk -- \(quoted)", settings: settings, seconds: 60)
+        let totals = Self.parseDiskUsageKiB(result.stdout)
+        if totals.isEmpty, Self.isTimeout(result) {
+            throw MonitorError.processFailed("Measuring the trash timed out on \(settings.clusterName) — it may be very large.")
+        }
+        return totals
+    }
+
+    func restore(settings: ConnectionSettings, run: TrashRun, items: [TrashRun.Item]) async throws -> RestoreOutcome {
+        let pairs = items.compactMap { item -> [String]? in
+            guard let original = item.originalPath, !item.nameIsLossy else {
+                return nil
+            }
+            return [item.path, original]
+        }
+        guard !pairs.isEmpty else {
+            throw MonitorError.processFailed("Nothing to restore: these items have no recorded original location.")
+        }
+        let arguments = ["--run", run.directory, "--trash-name", Self.trashDirectoryName, "--pairs"] + pairs.flatMap { $0 }
+        let result = try await runScript(RemoteFileScripts.trashRestore, arguments: arguments, settings: settings, seconds: 60)
+        let objects = Self.jsonObjects(result.stdout)
+        if let error = objects.first(where: { $0["error"] != nil && $0["failed"] == nil })?["error"] as? String {
+            throw MonitorError.processFailed(error)
+        }
+        var outcome = RestoreOutcome()
+        var finished = false
+        for object in objects {
+            if let source = object["restored"] as? String {
+                outcome.restored.append(source)
+            } else if let source = object["failed"] as? String {
+                outcome.failed.append(TrashOutcome.Failure(path: source, reason: object["error"] as? String ?? "unknown error"))
+            } else if object["done"] as? Bool == true {
+                finished = true
+                outcome.removedRun = object["removed_run"] as? Bool ?? false
+            }
+        }
+        if !finished, outcome.restored.isEmpty, outcome.failed.isEmpty {
+            throw Self.failure("Could not restore from \(run.directory)", result)
+        }
+        return outcome
     }
 
     // MARK: Helpers
@@ -837,200 +1569,177 @@ struct RemoteFileService: Sendable {
         let home = try await homeDirectory(settings: settings)
         return Self.expandLeadingTilde(path, home: Self.trimTrailingSlashes(home))
     }
+}
 
-    /// Size in bytes via GNU `stat -L` (dereferences symlinks — plain `stat`
-    /// would report the link string's own length, wrecking transfer-timeout
-    /// scaling for symlinked files). Returns nil when the output is not a
-    /// number; throws for broken symlinks (`stat -L` fails), which callers
-    /// treat as unknown size via `try?`.
-    private func fileSize(settings: ConnectionSettings, path: String) async throws -> Int64? {
-        let result = try await monitor.runRemoteCommand(
-            settings: settings,
-            command: "stat -Lc %s -- \(shellQuote(path))",
-            timeout: 20
-        )
-        guard result.exitCode == 0 else {
-            throw Self.failure("Could not stat \(path)", result)
+// MARK: - Wire payloads
+
+private struct RemoteErrorPayload: Decodable {
+    let error: String
+}
+
+private struct RootsPayload: Decodable {
+    let home: String
+    let roots: [String]
+}
+
+/// JSON bridge for the remote listing protocol. Directory contents are
+/// NEVER parsed from `ls` output.
+private struct ListingPayload: Decodable {
+    struct Entry: Decodable {
+        let name: String
+        let kind: String
+        let size: Int64?
+        let mtime: Double?
+        let owner: String?
+        let mode: String?
+        let link: String?
+        let linkIsDir: Bool?
+        let lossy: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case name, kind, size, mtime, owner, mode, link, lossy
+            case linkIsDir = "link_is_dir"
         }
-        return Int64(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Filesystem device id (`stat -c %d`, lstat semantics — for a symlink
-    /// the link itself, matching what `mv` moves) for each path, in order.
-    /// A nil element means that path could not be statted; a nil return
-    /// means the device probe as a whole failed and callers should fall
-    /// back to same-device behavior.
-    private func deviceIDs(
-        settings: ConnectionSettings,
-        paths: [String]
-    ) async -> [String?]? {
-        guard !paths.isEmpty else {
-            return []
-        }
-        let command = paths
-            .map { "stat -c %d -- \(shellQuote($0)) 2>/dev/null || echo '?'" }
-            .joined(separator: "; ")
-        guard let result = try? await monitor.runRemoteCommand(
-            settings: settings,
-            command: command,
-            timeout: 30
-        ) else {
-            return nil
-        }
-        let lines = result.stdout
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard lines.count == paths.count else {
-            return nil
-        }
-        return lines.map { $0 == "?" || $0.isEmpty ? nil : $0 }
+    let requested: String
+    let resolved: String
+    let truncated: Bool
+    let total: Int?
+    let matched: Int?
+    let filter: String?
+    let entries: [Entry]
+}
+
+struct PreviewPayload: Decodable {
+    let mime: String?
+    let charset: String?
+    let hasFile: Bool
+    let size: Int64
+    let truncated: Bool
+    let fromEnd: Bool
+    let data: String
+
+    enum CodingKeys: String, CodingKey {
+        case mime, charset, size, truncated, data
+        case hasFile = "has_file"
+        case fromEnd = "from_end"
     }
 
-    /// Total size in bytes of the given paths via `du -sk` (KiB blocks).
-    /// Used only to scale the cross-filesystem trash-copy timeout, so it
-    /// tolerates partial failures (du exits non-zero on unreadable subtrees
-    /// while still printing usable totals) and returns nil when nothing
-    /// parses.
-    private func totalSizeBytes(
-        settings: ConnectionSettings,
-        paths: [String]
-    ) async -> Int64? {
-        guard !paths.isEmpty else {
-            return nil
+    init(mime: String?, charset: String?, hasFile: Bool, size: Int64, truncated: Bool, fromEnd: Bool, data: String) {
+        self.mime = mime
+        self.charset = charset
+        self.hasFile = hasFile
+        self.size = size
+        self.truncated = truncated
+        self.fromEnd = fromEnd
+        self.data = data
+    }
+}
+
+private struct RefusalPayload: Decodable {
+    let path: String
+    let reason: String
+}
+
+private struct TrashInspectPayload: Decodable {
+    struct Target: Decodable {
+        let path: String
+        let device: String?
+        let error: String?
+        let parent: String
+        let parentWritable: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case path, device, error, parent
+            case parentWritable = "parent_writable"
         }
-        let quoted = paths.map(shellQuote).joined(separator: " ")
-        guard let result = try? await monitor.runRemoteCommand(
-            settings: settings,
-            command: "du -sk -- \(quoted)",
-            timeout: 180
-        ) else {
-            return nil
+    }
+
+    struct Mount: Decodable {
+        let parent: String
+        let directory: String
+        let createdBase: Bool?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case parent, directory, error
+            case createdBase = "created_base"
         }
-        var total: Int64 = 0
-        var parsedAny = false
-        for line in result.stdout.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let first = line.split(whereSeparator: { $0 == "\t" || $0 == " " }).first,
-                  let kibibytes = Int64(first) else {
-                continue
+    }
+
+    let home: String
+    let homeDevice: String?
+    let refused: [RefusalPayload]?
+    let targets: [Target]?
+    let mountTrash: [Mount]?
+
+    enum CodingKeys: String, CodingKey {
+        case home, refused, targets
+        case homeDevice = "home_device"
+        case mountTrash = "mount_trash"
+    }
+}
+
+private struct JobStartPayload: Decodable {
+    let job: String?
+    let pid: Int32?
+    let refused: [RefusalPayload]?
+}
+
+private struct JobPollPayload: Decodable {
+    struct Status: Decodable {
+        struct Failure: Decodable {
+            let path: String
+            let error: String
+        }
+
+        let total: Int?
+        let done: Int?
+        let failed: [Failure]?
+        let moved: [String]?
+        let current: String?
+        let cancelled: Bool?
+    }
+
+    let state: String
+    let status: Status?
+    let detail: String?
+}
+
+private struct TrashListPayload: Decodable {
+    struct Run: Decodable {
+        struct Entry: Decodable {
+            let name: String
+            let isDir: Bool
+            let original: String?
+            let lossy: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case name, original, lossy
+                case isDir = "is_dir"
             }
-            total += kibibytes * 1024
-            parsedAny = true
         }
-        return parsedAny ? total : nil
-    }
 
-    private static func parentDirectory(of path: String) -> String {
-        let parent = (path as NSString).deletingLastPathComponent
-        return parent.isEmpty ? "/" : parent
-    }
+        let directory: String
+        let location: String
+        let cluster: String?
+        let created: String?
+        let modified: Double?
+        let hasManifest: Bool?
+        let count: Int
+        let entries: [Entry]
+        let error: String?
+        /// "present" (or absent), "missing" or "unavailable".
+        let state: String?
+        /// Index entry name, sent only for a missing run.
+        let pointer: String?
 
-    /// Joins without doubling the slash when `directory` is the root.
-    private static func joinPath(_ directory: String, _ relative: String) -> String {
-        directory == "/" ? "/\(relative)" : "\(directory)/\(relative)"
-    }
-
-    private enum TransferDirection {
-        case download
-        case upload
-    }
-
-    /// scp argv. scp-over-SFTP (OpenSSH 9+) does NOT shell-expand remote
-    /// paths, so the remote spec travels as ONE argv element with no shell
-    /// quoting layer — spaces and shell metacharacters are safe as-is. It
-    /// DOES glob the source of a download (remote_glob with GLOB_NOCHECK), so
-    /// for downloads `\ * ? [` are backslash-escaped: otherwise fetching
-    /// "data[1].csv" would silently deliver data1.csv under that name.
-    private func scpArguments(
-        settings: ConnectionSettings,
-        remotePath: String,
-        localPath: String,
-        direction: TransferDirection
-    ) -> [String] {
-        // BatchMode, matching runRemoteCommand's no-prompt contract: a dead
-        // master must fail fast instead of prompting for a password/Duo push
-        // (or stalling on SSH_ASKPASS). ControlMaster=no, also as there:
-        // a stray `ControlMaster auto` in ~/.ssh/config must never let scp
-        // spawn a second master for this cluster. The ControlPath and host
-        // both come from the target cluster's settings, so a transfer can
-        // only ever ride that cluster's authenticated session. `--` ends
-        // option parsing before the (absolute, untrusted) path operands.
-        var arguments = [
-            "-q",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=\(settings.controlPath)",
-            "-o", "ControlMaster=no",
-            "-o", "ConnectTimeout=5",
-            "-o", "User=\(settings.username)",
-            "--"
-        ]
-        switch direction {
-        case .download:
-            let escaped = remotePath
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "*", with: "\\*")
-                .replacingOccurrences(of: "?", with: "\\?")
-                .replacingOccurrences(of: "[", with: "\\[")
-            arguments.append(contentsOf: ["\(settings.hostname):\(escaped)", localPath])
-        case .upload:
-            // Upload targets are not globbed.
-            arguments.append(contentsOf: [localPath, "\(settings.hostname):\(remotePath)"])
+        enum CodingKeys: String, CodingKey {
+            case directory, location, cluster, created, modified, count, entries, error, state, pointer
+            case hasManifest = "has_manifest"
         }
-        return arguments
     }
 
-    /// Min 60s, +1s per MB, capped at one hour; 10 minutes when the size is
-    /// unknown.
-    private static func transferTimeout(forBytes bytes: Int64?) -> TimeInterval {
-        guard let bytes, bytes >= 0 else {
-            return 600
-        }
-        let megabytes = Double(bytes) / 1_048_576
-        return min(3600, max(60, 60 + megabytes.rounded(.up)))
-    }
-
-    /// "name.ext" -> "name (2).ext" -> "name (3).ext" until free.
-    private static func uniquifiedURL(in directory: URL, preferredName: String) -> URL {
-        let manager = FileManager.default
-        var candidate = directory.appendingPathComponent(preferredName)
-        guard manager.fileExists(atPath: candidate.path) else {
-            return candidate
-        }
-        let base = (preferredName as NSString).deletingPathExtension
-        let ext = (preferredName as NSString).pathExtension
-        var counter = 2
-        repeat {
-            let name = ext.isEmpty ? "\(base) (\(counter))" : "\(base) (\(counter)).\(ext)"
-            candidate = directory.appendingPathComponent(name)
-            counter += 1
-        } while manager.fileExists(atPath: candidate.path)
-        return candidate
-    }
-
-    private static func trashTimestamp(_ date: Date = Date()) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: date)
-    }
-
-    /// Trash directory name: time-sortable for manual recovery, with a UUID
-    /// suffix so two trash operations in the same second (or the repeated
-    /// DST hour) can never share a directory and silently overwrite each
-    /// other's same-named files.
-    private static func trashRunName(_ date: Date = Date()) -> String {
-        "\(trashTimestamp(date))-\(UUID().uuidString.prefix(8).lowercased())"
-    }
-
-    /// User-readable error carrying trimmed remote stderr (falling back to
-    /// stdout). Never includes the command line itself — paths only.
-    private static func failure(_ operation: String, _ result: ProcessResult) -> MonitorError {
-        let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        let stdout = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let detail = stderr.isEmpty ? stdout : stderr
-        if detail.isEmpty {
-            return .processFailed("\(operation) (exit \(result.exitCode)).")
-        }
-        return .processFailed("\(operation): \(detail)")
-    }
+    let runs: [Run]
 }

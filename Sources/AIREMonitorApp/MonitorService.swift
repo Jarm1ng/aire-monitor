@@ -1,10 +1,11 @@
+import HPCCore
 import CryptoKit
 import Foundation
 import Darwin
 
 /// Everything needed to reach one cluster over SSH. Built by `ClusterSession`
 /// from the shared sign-in configuration plus the cluster's own profile.
-struct ConnectionSettings: Sendable {
+struct ConnectionSettings: Sendable, Equatable {
     let clusterID: ClusterID
     let clusterName: String
     var username: String
@@ -19,7 +20,7 @@ struct ConnectionSettings: Sendable {
     var useJumpHost: Bool { route == .rashJump }
 
     /// Per-cluster runtime directory: snapshot cache, history, login logs,
-    /// master/keepalive pid files. Nothing in it is shared between clusters.
+    /// the master's pid file. Nothing in it is shared between clusters.
     var runtimeDirectory: String {
         "\(projectRoot)/.runtime/clusters/\(clusterID.rawValue)"
     }
@@ -58,7 +59,7 @@ struct ConnectionSettings: Sendable {
     }
 }
 
-struct ProcessResult {
+struct ProcessResult: Sendable {
     let stdout: String
     let stderr: String
     let exitCode: Int32
@@ -75,6 +76,22 @@ enum MonitorError: LocalizedError {
     /// queued cluster would retry the same rash authentication, so the
     /// coordinator stops the queue.
     case jumpHostFailed(String)
+    /// A login helper hit the caller's watchdog: nobody answered the Duo
+    /// push in time (or the network stalled). The coordinator stops the
+    /// queue rather than pushing the next cluster at an absent user.
+    case loginTimedOut(String)
+    /// A login helper exited 15 (either leg): the password was ACCEPTED,
+    /// then the one Duo push was declined, timed out on the phone, or the
+    /// connection dropped while waiting. Nothing is wrong with the saved
+    /// password, so it must never be flagged as rejected; the coordinator
+    /// still stops the queue, since the next push would go unanswered too.
+    case duoNotApproved(String)
+    /// The target starter exited 5 on a plain sign-in: a master answers on
+    /// the cluster's socket but did not run the check command in time. It
+    /// was left running — it may be slow rather than dead, and still carry
+    /// terminals — so only the confirmed Reconnect may replace it. No
+    /// password was sent.
+    case existingSessionUnresponsive(String)
     case invalidJSON(String)
 
     var errorDescription: String? {
@@ -82,7 +99,9 @@ enum MonitorError: LocalizedError {
         case .missingFile(let path):
             return "Missing file: \(path)"
         case .processFailed(let message), .passwordRejected(let message),
-             .passwordExpired(let message), .jumpHostFailed(let message):
+             .passwordExpired(let message), .jumpHostFailed(let message),
+             .loginTimedOut(let message), .duoNotApproved(let message),
+             .existingSessionUnresponsive(let message):
             return message
         case .invalidJSON(let message):
             return "Could not parse snapshot JSON: \(message)"
@@ -253,27 +272,92 @@ private final class ProcessSignalState: @unchecked Sendable {
     }
 }
 
+/// What `MonitorService.stopMaster` did, read from the stop helper's
+/// `HPC-STATUS:` lines.
+struct StopMasterReport: Sendable, Equatable {
+    /// e.g. "stopped the AIRE session", "no Calder session was running",
+    /// "kept the shared jump-host session (rash.leeds.ac.uk): another
+    /// connection still uses it".
+    var statusLines: [String] = []
+
+    /// HPC_STOP_JUMP_IF_UNUSED was asked for, but another tunnel, sign-in
+    /// or collector still rides the shared jump master, so the helper kept
+    /// it. Expected whenever another cluster is live on the rash route: an
+    /// ordinary outcome, never an error.
+    var keptSharedJumpSession: Bool {
+        statusLines.contains { $0.hasPrefix("kept the shared jump-host session") }
+    }
+
+    var stoppedSharedJumpSession: Bool {
+        statusLines.contains { $0.hasPrefix("stopped the shared jump-host session") }
+    }
+}
+
+/// What a successful `MonitorService.login` did.
+struct LoginResult: Sendable, Equatable {
+    /// Both legs' stdout (HPC-STATUS lines and the `auth_ok|…` line).
+    var output: String
+    /// A server checked the password during this sign-in and accepted it:
+    /// at least one leg authenticated afresh. False when every leg reused
+    /// a master that was already up (the starter's "reusing the existing
+    /// <cluster> session", the expect helper's "reusing the shared
+    /// jump-host session"): then the password was never sent anywhere, and
+    /// a typed one must not be saved, nor clear a "rejected" flag, as if it
+    /// had worked.
+    var passwordVerified: Bool
+}
+
+/// What the reuse-only starter run (`HPC_REUSE_ONLY=1`) found. See
+/// `MonitorService.adoptMaster(settings:)`.
+enum MasterAdoption: Sendable, Equatable {
+    /// A healthy master was there; anything an older release left next to
+    /// it (keepalive, permanent remote `sleep` session) has been ended.
+    case adopted
+    /// Exit 4: no healthy master on this path, so nothing to adopt.
+    case nothingToAdopt
+    /// The helper is missing, timed out or failed. Logged only: adoption is
+    /// housekeeping, and the session works either way.
+    case unavailable(String)
+}
+
 struct MonitorService: Sendable {
     static let statusLinePrefix = "HPC-STATUS: "
 
     static let loginHelperScript = "scripts/hpc_ssh_login.expect"
     static let targetStarterScript = "scripts/hpc_start_target_master.zsh"
     static let collectorScript = "scripts/hpc_snapshot.py"
+    static let stopMasterScript = "scripts/hpc_stop_master.zsh"
+    /// Exit code `runProcess` reports when its watchdog killed the child
+    /// (the same convention as coreutils `timeout`).
+    static let processTimedOutExitCode: Int32 = 124
 
-    /// Authenticates one cluster: on the rash route the expect helper first
-    /// makes sure the shared jump master is up (reusing a healthy one, so
-    /// logging into a second cluster never tears down the first), then the
-    /// target starter launches this cluster's own ControlMaster. The
-    /// password travels only as the first line of each helper's stdin.
-    func login(
-        settings: ConnectionSettings,
-        password: String,
-        onStatus: (@Sendable (String) -> Void)? = nil
-    ) async throws -> String {
-        try requireFile("\(settings.projectRoot)/\(Self.targetStarterScript)")
-        try prepareRuntime(settings: settings)
+    /// The environment for every child process (login helpers, collector,
+    /// remote commands, transfers, terminals): the app's own, minus any
+    /// password a user may have exported for the old command-line helpers.
+    /// The helpers read the password from stdin; an inherited HPC_PASSWORD
+    /// would otherwise reach every ssh and every terminal's shell.
+    static func childEnvironment() -> [String: String] {
+        childEnvironment(from: ProcessInfo.processInfo.environment)
+    }
 
-        var environment = ProcessInfo.processInfo.environment
+    /// `environment` minus the password variables (testable form).
+    static func childEnvironment(from environment: [String: String]) -> [String: String] {
+        var environment = environment
+        for name in passwordEnvironmentNames {
+            environment.removeValue(forKey: name)
+        }
+        return environment
+    }
+
+    /// Every name a password was ever exported under, current and legacy.
+    static let passwordEnvironmentNames = ["HPC_PASSWORD", "HPC_ASKPASS_PASSWORD", "AIRE_PASSWORD", "AIRE_ASKPASS_PASSWORD"]
+
+    /// The environment both login helpers (and the reuse-only adoption run)
+    /// share: the scrubbed app environment plus this identity. Mode flags an
+    /// old shell might have exported (HPC_FORCE_RELOGIN, HPC_REUSE_ONLY) are
+    /// always set explicitly by the callers, never inherited.
+    private func helperEnvironment(settings: ConnectionSettings) -> [String: String] {
+        var environment = Self.childEnvironment()
         environment["HPC_PROJECT_ROOT"] = settings.projectRoot
         environment["HPC_RUNTIME_DIR"] = settings.runtimeDirectory
         environment["HPC_TARGET_LABEL"] = settings.clusterName
@@ -283,12 +367,45 @@ struct MonitorService: Sendable {
         environment["HPC_JUMP_HOSTNAME"] = settings.jumpHostname
         environment["HPC_DUO_OPTION"] = settings.duoOption
         environment["HPC_CONTROL_PATH"] = settings.controlPath
+        environment.removeValue(forKey: "HPC_JUMP_CONTROL_PATH")
         if !settings.jumpControlPath.isEmpty {
             environment["HPC_JUMP_CONTROL_PATH"] = settings.jumpControlPath
         }
-        environment["HPC_FORCE_RELOGIN"] = "1"
+        environment["HPC_FORCE_RELOGIN"] = "0"
+        environment["HPC_REUSE_ONLY"] = "0"
         environment["HPC_LOGIN_DEBUG_LOG"] = "\(settings.runtimeDirectory)/login_debug.log"
-        environment["HPC_TIMEOUT"] = "180"
+        // Per-prompt expect timeout; the watchdogs below derive from it.
+        environment["HPC_TIMEOUT"] = String(HPCDefaults.loginPromptTimeout)
+        return environment
+    }
+
+    /// Authenticates one cluster: on the rash route the expect helper first
+    /// makes sure the shared jump master is up (reusing a healthy one, so
+    /// logging into a second cluster never tears down the first), then the
+    /// target starter brings up this cluster's own ControlMaster. The
+    /// password travels only as the first line of each helper's stdin.
+    ///
+    /// By default the starter reuses a healthy master: no teardown, no Duo
+    /// push, the terminals riding on it survive; one that answers its
+    /// socket but not a command is left running too (exit 5,
+    /// `existingSessionUnresponsive`). `forceReplace` (the confirmed
+    /// Reconnect only) sets HPC_FORCE_RELOGIN=1, which tears the existing
+    /// master down and authenticates afresh.
+    ///
+    /// The result says whether any leg actually had the password checked
+    /// (`LoginResult.passwordVerified`): a sign-in that only reused masters
+    /// succeeds without ever sending it.
+    func login(
+        settings: ConnectionSettings,
+        password: String,
+        forceReplace: Bool = false,
+        onStatus: (@Sendable (String) -> Void)? = nil
+    ) async throws -> LoginResult {
+        try requireFile("\(settings.projectRoot)/\(Self.targetStarterScript)")
+        try prepareRuntime(settings: settings)
+
+        var environment = helperEnvironment(settings: settings)
+        environment["HPC_FORCE_RELOGIN"] = forceReplace ? "1" : "0"
 
         var statusLineHandler: (@Sendable (String) -> Void)?
         if let onStatus {
@@ -305,6 +422,7 @@ struct MonitorService: Sendable {
         }
 
         var transcript = ProcessResult(stdout: "", stderr: "", exitCode: 0)
+        var jumpLegOutput: String?
         if settings.useJumpHost {
             let helper = "\(settings.projectRoot)/\(Self.loginHelperScript)"
             try requireFile(helper)
@@ -318,13 +436,14 @@ struct MonitorService: Sendable {
                 currentDirectory: settings.projectRoot,
                 environment: jumpEnvironment,
                 stdin: password + "\n",
-                timeout: 190,
+                timeout: HPCDefaults.loginWatchdog,
                 onOutputLine: statusLineHandler
             )
             transcript = helperResult
+            jumpLegOutput = helperResult.stdout
             if helperResult.exitCode != 0 {
                 let message = helperResult.stderr.isEmpty ? helperResult.stdout : helperResult.stderr
-                try? writeLoginDebug(settings: settings, result: helperResult)
+                recordLoginDebug(settings: settings, result: helperResult)
                 // This helper only handles the shared jump leg, so its
                 // failures (including a rejected password) belong to rash,
                 // not to the cluster being signed in to.
@@ -348,7 +467,7 @@ struct MonitorService: Sendable {
             currentDirectory: settings.projectRoot,
             environment: environment,
             stdin: password + "\n",
-            timeout: 190,
+            timeout: HPCDefaults.loginWatchdog,
             onOutputLine: statusLineHandler
         )
         let combinedResult = ProcessResult(
@@ -360,32 +479,144 @@ struct MonitorService: Sendable {
                 .joined(separator: "\n"),
             exitCode: targetResult.exitCode
         )
-        try? writeLoginDebug(settings: settings, result: combinedResult)
+        recordLoginDebug(settings: settings, result: combinedResult)
         if targetResult.exitCode != 0 {
             let message = targetResult.stderr.isEmpty ? targetResult.stdout : targetResult.stderr
             throw Self.loginError(message, exitCode: targetResult.exitCode, clusterName: settings.clusterName)
         }
-        return combinedResult.stdout
+        return LoginResult(
+            output: combinedResult.stdout,
+            passwordVerified: Self.passwordWasVerified(
+                jumpLegOutput: jumpLegOutput,
+                targetLegOutput: targetResult.stdout,
+                clusterName: settings.clusterName
+            )
+        )
     }
 
-    private static func loginError(
+    /// Whether a SUCCESSFUL sign-in had the password checked by a server.
+    /// Each leg announces the moment it hands the password over — the
+    /// starter "password sent (<cluster>)", the expect helper "password
+    /// sent (jump host)" — and a leg that then exits 0 got it accepted
+    /// (both legs fail with 13 when it is not). A leg that reused its
+    /// master prints "reusing …" instead and never sends it. Positive
+    /// evidence on purpose: if a line ever went missing, the cost is a
+    /// typed password not being saved, never an unchecked one being saved
+    /// over a good one.
+    static func passwordWasVerified(jumpLegOutput: String?, targetLegOutput: String, clusterName: String) -> Bool {
+        if statusLines(in: targetLegOutput).contains("password sent (\(clusterName))") {
+            return true
+        }
+        guard let jumpLegOutput else {
+            return false
+        }
+        return statusLines(in: jumpLegOutput).contains("password sent (jump host)")
+    }
+
+    /// Exit status of the target starter when a plain sign-in finds a
+    /// master that answers on its socket but did not run the check command
+    /// within 15 s. It is left running; see `existingSessionUnresponsive`.
+    static let existingSessionUnresponsiveExitCode: Int32 = 5
+
+    /// Maps a helper's exit code to the error the session classifies by.
+    static func loginError(
         _ message: String,
         exitCode: Int32,
         clusterName: String,
         isJumpLeg: Bool = false
     ) -> MonitorError {
+        if exitCode == existingSessionUnresponsiveExitCode, !isJumpLeg {
+            return .existingSessionUnresponsive(
+                existingSessionUnresponsiveExplanation(message, clusterName: clusterName)
+            )
+        }
         let explanation = explainSSHFailure(message, exitCode: exitCode, clusterName: clusterName)
         switch exitCode {
         case 13:
             return .passwordRejected(explanation)
         case 14:
             return .passwordExpired(explanation)
+        case 15:
+            // Both legs: on the jump leg `clusterName` already reads
+            // "<jump host> (jump host)", so the message names the right host.
+            return .duoNotApproved(explanation)
+        case processTimedOutExitCode:
+            return .loginTimedOut(explanation)
         default:
             return isJumpLeg ? .jumpHostFailed(explanation) : .processFailed(explanation)
         }
     }
 
-    func collectSnapshot(settings: ConnectionSettings) async throws -> ClusterSnapshot {
+    /// The message for the starter's exit 5. Kept out of
+    /// `explainSSHFailure`, which also explains collector and `scancel`
+    /// failures: a remote command exiting 5 means nothing of the sort.
+    /// Says what was (not) done — nothing closed, no password sent — and
+    /// the two ways on: the confirmed Reconnect, or waiting for a dead
+    /// connection to close itself.
+    static func existingSessionUnresponsiveExplanation(_ rawMessage: String, clusterName: String) -> String {
+        let prefix = """
+        The existing \(clusterName) session did not answer in time, so it was left running.
+
+        It still answers on this Mac, but a quick check command through it did not come back within 15 seconds: the login node may be slow, or the connection may have died. Nothing on it was closed and no password was sent. Choose Reconnect… to replace it now (one Duo push; terminals open there close), or wait: a dead connection closes by itself within about five minutes, and Connect then signs in normally.
+        """
+        let raw = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? prefix : "\(prefix)\n\nRaw SSH output:\n\(raw)"
+    }
+
+    /// Exit status of the starter's reuse-only mode when no healthy master
+    /// exists on the path.
+    static let nothingToAdoptExitCode: Int32 = 4
+
+    /// Adopts a ControlMaster the app found alive but did not start (one
+    /// from the previous run, the command line, or an older release): runs
+    /// the target starter once in reuse-only mode (HPC_REUSE_ONLY=1) with
+    /// an EMPTY stdin and no password anywhere. The starter verifies the
+    /// master, ends what older releases left beside it — the 5 s keepalive
+    /// and the permanent remote `sleep` session that kept ControlPersist
+    /// from ever expiring — and exits 0, or exits 4 when nothing healthy is
+    /// there. Reuse-only never tears down, never prompts and never pushes
+    /// Duo. Bounded: the starter's own health check is capped at 15 s.
+    func adoptMaster(settings: ConnectionSettings) async -> MasterAdoption {
+        let starter = "\(settings.projectRoot)/\(Self.targetStarterScript)"
+        guard FileManager.default.fileExists(atPath: starter) else {
+            return .unavailable("\(Self.targetStarterScript) is missing")
+        }
+        var environment = helperEnvironment(settings: settings)
+        environment["HPC_REUSE_ONLY"] = "1"
+        environment["HPC_FORCE_RELOGIN"] = "0"
+        do {
+            let result = try await runProcess(
+                executable: "/bin/zsh",
+                arguments: [starter],
+                currentDirectory: settings.projectRoot,
+                environment: environment,
+                // Closed at once: the starter reads EOF, so there is
+                // nothing it could ever send as a password.
+                stdin: "",
+                timeout: 40
+            )
+            switch result.exitCode {
+            case 0:
+                return .adopted
+            case Self.nothingToAdoptExitCode:
+                return .nothingToAdopt
+            default:
+                let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return .unavailable("exit \(result.exitCode)" + (detail.isEmpty ? "" : ": \(detail)"))
+            }
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+
+    /// The flag that makes the collector leave out the storage section
+    /// (df, quota, lfs). The app passes it on most refreshes; it is never
+    /// part of `collectorArguments`, which collector.json hands to the
+    /// widget verbatim — the widget would otherwise never collect storage.
+    static let skipStorageFlag = "--skip-storage"
+
+    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool = false) async throws -> ClusterSnapshot {
         // Check the script first: the project root is a free-text field, and
         // creating runtime directories under a half-typed path would litter
         // the disk (and turn "missing file" into a confusing mkdir error).
@@ -395,12 +626,24 @@ struct MonitorService: Sendable {
 
         let result = try await runProcess(
             executable: "/usr/bin/python3",
-            arguments: [script] + Self.collectorArguments(settings: settings),
+            arguments: [script] + Self.collectorArguments(settings: settings, skipStorage: skipStorage),
             currentDirectory: settings.projectRoot,
-            environment: ProcessInfo.processInfo.environment,
+            environment: Self.childEnvironment(),
             stdin: nil,
-            timeout: 40
+            // Always above the collector's own --timeout budget, so a
+            // healthy (if slow) collection is never killed.
+            timeout: HPCDefaults.collectorWatchdog
         )
+
+        if result.exitCode == Self.processTimedOutExitCode,
+           result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // The watchdog, not ssh: explainSSHFailure's timeout wording is
+            // about signing in, which this is not.
+            throw MonitorError.processFailed(
+                "Collecting the \(settings.clusterName) snapshot took longer than \(Int(HPCDefaults.collectorWatchdog)) s and was stopped. The login node or a filesystem may be slow; the app keeps retrying."
+                    + (result.stderr.isEmpty ? "" : "\n\n\(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+            )
+        }
 
         guard !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let detail = result.stderr.isEmpty
@@ -438,29 +681,22 @@ struct MonitorService: Sendable {
         timeout: TimeInterval = 30
     ) async throws -> ProcessResult {
         try await requireLiveMaster(settings: settings)
-        let arguments = [
-            "-o", "BatchMode=yes",
-            "-S", settings.controlPath,
-            "-o", "User=\(settings.username)",
-            "-o", "PasswordAuthentication=no",
-            "-o", "KbdInteractiveAuthentication=no",
-            // Defense in depth behind the pre-flight: if ssh still falls
-            // back to a direct connection, fail within seconds instead of
-            // hanging into the watchdog timeout, and never let a stray
-            // ~/.ssh/config ControlMaster=auto spawn a new master.
-            "-o", "ConnectTimeout=5",
-            "-o", "ControlMaster=no",
-            settings.hostname,
-            command
-        ]
         return try await runProcess(
             executable: "/usr/bin/ssh",
-            arguments: arguments,
+            arguments: Self.remoteCommandArguments(settings: settings, command: command),
             currentDirectory: settings.projectRoot,
-            environment: ProcessInfo.processInfo.environment,
+            environment: Self.childEnvironment(),
             stdin: nil,
             timeout: timeout
         )
+    }
+
+    /// The ssh argv for `runRemoteCommand`. The client options come from
+    /// SSHMuxOptions, the one place that encodes "never prompt, never
+    /// become a master, fail fast" for every client riding a master (the
+    /// terminal and scp use the same helper).
+    static func remoteCommandArguments(settings: ConnectionSettings, command: String) -> [String] {
+        SSHMuxOptions.sshArguments(settings: settings) + [settings.hostname, command]
     }
 
     /// File-transfer entry point for `RemoteFileService`: executes
@@ -479,7 +715,7 @@ struct MonitorService: Sendable {
             executable: "/usr/bin/scp",
             arguments: arguments,
             currentDirectory: settings.projectRoot,
-            environment: ProcessInfo.processInfo.environment,
+            environment: Self.childEnvironment(),
             stdin: nil,
             timeout: timeout
         )
@@ -495,7 +731,7 @@ struct MonitorService: Sendable {
             executable: "/usr/bin/ssh",
             arguments: ["-S", settings.controlPath, "-O", "check", settings.hostname],
             currentDirectory: settings.projectRoot,
-            environment: ProcessInfo.processInfo.environment,
+            environment: Self.childEnvironment(),
             stdin: nil,
             timeout: 5
         )
@@ -506,10 +742,111 @@ struct MonitorService: Sendable {
         }
     }
 
+    /// True when `ssh -O check` finds a usable master for this identity.
+    func isMasterAlive(settings: ConnectionSettings) async -> Bool {
+        do {
+            try await requireLiveMaster(settings: settings)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Closes one identity's ControlMaster: the master the starter recorded
+    /// for this control path (and any keepalive an older release left
+    /// beside it), nothing else — never another cluster's master. Used when
+    /// the identity a session was signed in under stops being the one in
+    /// use (route, username or host change) and for an explicit Disconnect.
+    ///
+    /// Runs scripts/hpc_stop_master.zsh (contract 2), which also kills the
+    /// verified master pids and removes their pid files; exit 0 means
+    /// stopped or nothing was running. The shared rash jump master is left
+    /// alone unless `stopJumpIfUnused` (HPC_STOP_JUMP_IF_UNUSED=1): then the
+    /// helper also closes it, but only when no other tunnel, sign-in or
+    /// collector rides on it — otherwise it reports that it kept it.
+    ///
+    /// If the script is not there (an older checkout), `ssh -O exit` on the
+    /// socket still closes the master.
+    func stopMaster(settings: ConnectionSettings, stopJumpIfUnused: Bool = false) async throws -> StopMasterReport {
+        let script = "\(settings.projectRoot)/\(Self.stopMasterScript)"
+        let result: ProcessResult
+        if FileManager.default.fileExists(atPath: script) {
+            result = try await runProcess(
+                executable: "/bin/zsh",
+                arguments: [script],
+                currentDirectory: settings.projectRoot,
+                environment: Self.stopMasterEnvironment(settings: settings, stopJumpIfUnused: stopJumpIfUnused),
+                stdin: nil,
+                // `-O exit` is capped at 10 s and the verified kill waits
+                // about 3 s before SIGKILL; the optional jump-master step
+                // has its own 10 s caps.
+                timeout: 30
+            )
+        } else {
+            guard FileManager.default.fileExists(atPath: settings.controlPath) else {
+                return StopMasterReport()
+            }
+            result = try await runProcess(
+                executable: "/usr/bin/ssh",
+                arguments: ["-S", settings.controlPath, "-O", "exit", settings.hostname],
+                currentDirectory: settings.projectRoot,
+                environment: Self.childEnvironment(),
+                stdin: nil,
+                timeout: 10
+            )
+        }
+        guard result.exitCode == 0 else {
+            let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw MonitorError.processFailed(
+                "Could not close the \(settings.clusterName) SSH session (exit \(result.exitCode))"
+                    + (detail.isEmpty ? "." : ": \(detail)")
+            )
+        }
+        return StopMasterReport(statusLines: Self.statusLines(in: result.stdout))
+    }
+
+    /// hpc_stop_master.zsh's environment (contract 2). Internal for tests.
+    static func stopMasterEnvironment(settings: ConnectionSettings, stopJumpIfUnused: Bool) -> [String: String] {
+        var environment = childEnvironment()
+        environment["HPC_PROJECT_ROOT"] = settings.projectRoot
+        environment["HPC_RUNTIME_DIR"] = settings.runtimeDirectory
+        environment["HPC_CONTROL_PATH"] = settings.controlPath
+        environment["HPC_HOSTNAME"] = settings.hostname
+        environment["HPC_USERNAME"] = settings.username
+        environment["HPC_TARGET_LABEL"] = settings.clusterName
+        environment["HPC_USE_JUMP_HOST"] = settings.useJumpHost ? "1" : "0"
+        environment["HPC_JUMP_HOSTNAME"] = settings.jumpHostname
+        environment.removeValue(forKey: "HPC_JUMP_CONTROL_PATH")
+        if !settings.jumpControlPath.isEmpty {
+            // A guard first: the script refuses to treat the shared jump
+            // master as this cluster's. It stops the jump master only on
+            // explicit request, below.
+            environment["HPC_JUMP_CONTROL_PATH"] = settings.jumpControlPath
+        }
+        // Never inherited from a shell the app was launched from.
+        environment["HPC_STOP_JUMP_IF_UNUSED"] = stopJumpIfUnused && settings.useJumpHost ? "1" : "0"
+        return environment
+    }
+
+    /// The `HPC-STATUS:` payloads in a helper's stdout, in order.
+    static func statusLines(in output: String) -> [String] {
+        output.split(separator: "\n").compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix(statusLinePrefix) else {
+                return nil
+            }
+            let message = String(trimmed.dropFirst(statusLinePrefix.count)).trimmingCharacters(in: .whitespaces)
+            return message.isEmpty ? nil : message
+        }
+    }
+
     /// The collector's argument list (without the script path). Also written,
     /// password-free, to the cluster's runtime directory so the desktop
     /// widget can run the identical collection when the app is not running.
-    static func collectorArguments(settings: ConnectionSettings) -> [String] {
+    /// `skipStorage` is for the app's own runs only; collector.json is
+    /// always written from the default (storage collected).
+    static func collectorArguments(settings: ConnectionSettings, skipStorage: Bool = false) -> [String] {
         var arguments = [
             "--cluster-id", settings.clusterID.rawValue,
             "--cluster-name", settings.clusterName,
@@ -519,10 +856,13 @@ struct MonitorService: Sendable {
             settings.useJumpHost ? "--use-jump-host" : "--no-jump-host",
             "--control-path", settings.controlPath,
             "--storage-spec", storageSpecJSON(settings.storage),
-            "--timeout", "30"
+            "--timeout", String(HPCDefaults.collectorTimeout)
         ]
         if !settings.jumpControlPath.isEmpty {
             arguments.append(contentsOf: ["--jump-control-path", settings.jumpControlPath])
+        }
+        if skipStorage {
+            arguments.append(skipStorageFlag)
         }
         return arguments
     }
@@ -553,6 +893,19 @@ struct MonitorService: Sendable {
     private func requireFile(_ path: String) throws {
         if !FileManager.default.fileExists(atPath: path) {
             throw MonitorError.missingFile(path)
+        }
+    }
+
+    /// Appends the helpers' transcript (never the password: it only travels
+    /// on stdin) to the cluster's login_debug.log; a failure to do so is
+    /// logged, never fatal to the sign-in.
+    private func recordLoginDebug(settings: ConnectionSettings, result: ProcessResult) {
+        do {
+            try writeLoginDebug(settings: settings, result: result)
+        } catch {
+            Log.login.error(
+                "\(settings.clusterID.rawValue, privacy: .public): could not write login_debug.log: \(String(describing: error), privacy: .public)"
+            )
         }
     }
 
@@ -593,7 +946,26 @@ struct MonitorService: Sendable {
         let lower = raw.lowercased()
         let prefix: String
 
-        if exitCode == 13 {
+        if exitCode == 15 {
+            // First: the helpers exit 15 only after the password was
+            // accepted and the server asked for Duo. Any wording about a
+            // wrong password or a lockout here would send the user to
+            // retype a correct password.
+            prefix = """
+            \(clusterName): the Duo push was declined or timed out. Your password was accepted. Approve the push on your phone and connect again.
+
+            Each sign-in sends one push; nothing else arrives until you connect again.
+            """
+        } else if exitCode == processTimedOutExitCode {
+            // The helpers' own deadline (before Duo) and the app's watchdog
+            // both exit 124. Matched on the code, not on whatever partial
+            // ssh output preceded it.
+            prefix = """
+            The \(clusterName) login timed out.
+
+            This usually means the app was waiting for a password, Duo prompt, Duo approval, or SSH banner. Nothing was rejected. Try again and watch for a Duo push notification.
+            """
+        } else if exitCode == 13 {
             prefix = """
             Password was rejected by \(clusterName) — re-enter it (and check for a pending Duo lockout).
 
@@ -605,10 +977,20 @@ struct MonitorService: Sendable {
 
             Change it through the University's password service, then sign in again with the new password. The app never answers password-change prompts.
             """
+        } else if isSessionRefusal(raw) {
+            // Checked before the "closed before authentication" markers: a
+            // mux refusal is the existing, authenticated master declining
+            // one more channel (sshd's MaxSessions, 10 by default, is shared
+            // by every terminal, transfer, file listing and the collector),
+            // not the server turning the connection away.
+            prefix = """
+            \(clusterName) refused to open another session on the existing connection.
+
+            Too many terminals or file transfers may be open at once — each one uses one of the connection's limited sessions. Close some and try again. If none are open, the login node itself is refusing new sessions: wait a minute and connect again, and if it persists report the time and the raw output below to Research Computing.
+            """
         } else if lower.contains("not allowed at this time")
             || lower.contains("kex_exchange_identification")
-            || lower.contains("connection reset by")
-            || lower.contains("session open refused by peer") {
+            || lower.contains("connection reset by") {
             // Checked before the "UNKNOWN port 65535" tunnel case: through
             // rash OpenSSH has no peer address, so a login node refusing us
             // ALSO reads "... by UNKNOWN port 65535". These markers prove
@@ -673,6 +1055,19 @@ struct MonitorService: Sendable {
         return "\(prefix)\n\nRaw SSH output:\n\(raw)"
     }
 
+    /// The server-side refusal of a new channel on a healthy master, as
+    /// OpenSSH's mux client reports it ("mux_client_request_session: session
+    /// request failed: Session open refused by peer", "channel 1: open
+    /// failed: administratively prohibited: open failed"). The master is
+    /// alive, so this must never count as a lost connection.
+    static func isSessionRefusal(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("session open refused")
+            || lower.contains("administratively prohibited")
+            || lower.contains("session request failed")
+            || (lower.contains("channel") && lower.contains("open failed"))
+    }
+
     private func runProcess(
         executable: String,
         arguments: [String],
@@ -696,6 +1091,11 @@ struct MonitorService: Sendable {
         let stdinPipe = Pipe()
         if stdin != nil {
             process.standardInput = stdinPipe
+        } else {
+            // Never the app's own stdin: launched from a terminal (the run
+            // script's fallback), that is a tty, and ssh would forward the
+            // user's keystrokes to a remote command.
+            process.standardInput = FileHandle.nullDevice
         }
 
         let stdoutCollector = PipeCollector(onLine: onOutputLine)
@@ -789,7 +1189,7 @@ struct MonitorService: Sendable {
             return ProcessResult(
                 stdout: stdout,
                 stderr: stderr + "\nProcess timed out after \(Int(timeout))s: \(executable)",
-                exitCode: 124
+                exitCode: Self.processTimedOutExitCode
             )
         }
         return ProcessResult(stdout: stdout, stderr: stderr, exitCode: process.terminationStatus)

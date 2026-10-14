@@ -34,20 +34,27 @@ let package = Package(
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0")
     ],
     targets: [
+        // Foundation-only domain logic shared by the app, the desktop widget
+        // and the tests: the snapshot schema, Slurm job/node state rules, gres
+        // and GPU pool accounting, durations and timestamps, defaults and
+        // cluster identities. One implementation, so the surfaces can never
+        // disagree about what "idle GPU" or "available node" means.
+        .target(name: "HPCCore"),
         .executableTarget(
             name: "AIREMonitorApp",
             dependencies: [
+                "HPCCore",
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ]
         ),
-        .executableTarget(name: "AIREDesktopWidget"),
+        .executableTarget(name: "AIREDesktopWidget", dependencies: ["HPCCore"]),
         // Deterministic unit tests for the multi-cluster foundation:
         // connection settings and control-socket names, collector argv,
         // SSH failure wording, snapshot/cache decoding, preference migration.
         // No network, Keychain or ~/.ssh access; files go to temp dirs.
         .testTarget(
             name: "AIREMonitorAppTests",
-            dependencies: ["AIREMonitorApp"],
+            dependencies: ["AIREMonitorApp", "HPCCore"],
             exclude: ["run_tests.sh"],
             swiftSettings: [
                 .unsafeFlags(["-Xfrontend", "-disable-cross-import-overlays"])

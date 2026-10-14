@@ -1,4 +1,4 @@
-import Charts
+import HPCCore
 import SwiftUI
 
 // MARK: - Headers and titles
@@ -36,6 +36,14 @@ struct SectionHeader: View {
     }
 }
 
+/// The card at the top of every tab: icon, title, subtitle and the tab's
+/// own controls.
+///
+/// Sized for the narrowest detail column (`ContentView.minimumDetailSize`):
+/// the trailing controls keep their ideal width, so an action label never
+/// truncates to "New Fol…"; the title block takes what is left — at least
+/// 160 pt, and before the spacer — with a one-line title and a subtitle
+/// that wraps to a second line before it truncates.
 struct PageHeader<Trailing: View>: View {
     let title: String
     let subtitle: String
@@ -72,13 +80,20 @@ struct PageHeader<Trailing: View>: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.title3.weight(.semibold))
+                    .lineLimit(1)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
             }
+            .frame(minWidth: 160, alignment: .leading)
+            .layoutPriority(1)
+            .help(subtitle)
 
             Spacer(minLength: 12)
             trailing
+                .fixedSize()
         }
         .dashboardCard(padding: 12, accent: accent)
     }
@@ -86,6 +101,9 @@ struct PageHeader<Trailing: View>: View {
 
 // MARK: - Chips and badges
 
+/// Label-and-value capsule. Only the icon and the value carry the tint; the
+/// label is neutral. A tinted label on a tint-washed capsule measured about
+/// 1.4:1 contrast in light mode — readable only by its colour.
 struct InfoChip: View {
     let label: String
     let value: String
@@ -98,81 +116,27 @@ struct InfoChip: View {
         HStack(spacing: 6) {
             Image(systemName: systemImage)
                 .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
             Text(label)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.primary.opacity(0.72))
             Text(value)
                 .fontWeight(.semibold)
                 .monospacedDigit()
+                .foregroundStyle(color.legibleText(in: colorScheme))
         }
         .font(.caption)
+        .lineLimit(1)
         .padding(.horizontal, 9)
         .padding(.vertical, 6)
-        .background(color.opacity(0.10))
-        .foregroundStyle(color)
-        .clipShape(Capsule())
+        .background(color.opacity(colorScheme == .dark ? 0.12 : 0.10), in: Capsule())
         .overlay(
             Capsule()
-                .stroke(AppTheme.chipStroke(for: colorScheme), lineWidth: 1)
+                .stroke(color.opacity(colorScheme == .dark ? 0.28 : 0.30), lineWidth: 1)
         )
         .animation(AppTheme.smoothEase, value: value)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .accessibilityValue(value)
-    }
-}
-
-struct StatusBadge: View {
-    let isConnected: Bool
-    let isCached: Bool
-
-    private var label: String {
-        if isConnected {
-            return "Connected"
-        }
-        if isCached {
-            return "Cached"
-        }
-        return "Offline"
-    }
-
-    private var color: Color {
-        if isConnected {
-            return .green
-        }
-        if isCached {
-            return .orange
-        }
-        return .gray
-    }
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-            Text(label)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(isConnected || isCached ? color : .secondary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background {
-            Capsule()
-                .fill(.thinMaterial)
-                .overlay {
-                    Capsule()
-                        .fill(color.opacity(0.11))
-                }
-        }
-        .overlay {
-            Capsule()
-                .stroke(color.opacity(0.18), lineWidth: 1)
-        }
-        .clipShape(Capsule())
-        .animation(AppTheme.softSpring, value: label)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Connection status")
-        .accessibilityValue(label)
     }
 }
 
@@ -189,6 +153,8 @@ struct StalenessBadge: View {
         }
     }
 
+    @Environment(\.colorScheme) private var colorScheme
+
     @MainActor
     private func badge(reference: Date) -> some View {
         let text = SlurmTimestamp.relativeText(collectedAt, reference: reference)
@@ -199,6 +165,7 @@ struct StalenessBadge: View {
             Text(text)
                 .font(.caption2.weight(.medium))
                 .monospacedDigit()
+                .foregroundStyle(color.legibleText(in: colorScheme))
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -216,6 +183,8 @@ struct StalenessBadge: View {
         )
         .clipShape(Capsule())
         .foregroundStyle(color)
+        .lineLimit(1)
+        .fixedSize()
         .animation(AppTheme.smoothEase, value: text)
         .help("Snapshot collected \(SlurmTimestamp.absoluteText(collectedAt))")
         .accessibilityElement(children: .ignore)
@@ -232,43 +201,207 @@ struct StalenessBadge: View {
         if age < 60 {
             return .green
         }
-        if age < 3600 {
+        if age < HPCDefaults.snapshotOldAfter {
             return .orange
         }
         return .red
     }
 }
 
+/// A Slurm state as a plain-language pill: "Running", "Mixed",
+/// "Drained" — never the raw code ("MIX-", "DRAIN*", "down$"), whose
+/// suffixes mean something but explain nothing. Node flags show as a small
+/// glyph, and the tooltip carries the raw code and what each flag means.
 struct StatePill: View {
-    let state: String
+    /// Which Slurm vocabulary `state` comes from. `.automatic` reads exact
+    /// job states first (they are long upper-case words such as RUNNING),
+    /// then anything else as a node state — right for every existing caller,
+    /// but a caller that knows should say so.
+    enum Kind {
+        case automatic
+        case job
+        case node
+    }
 
-    private var slurmState: SlurmState {
-        SlurmState(parsing: state)
+    let state: String
+    var kind: Kind = .automatic
+    /// Set by `init(job:)`: the whole job, so a held one can read "Held".
+    private var job: Job?
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(state: String, kind: Kind = .automatic) {
+        self.state = state
+        self.kind = kind
+    }
+
+    /// A job's pill with the Jobs tab's held rule (`StatePillPresentation(job:)`).
+    init(job: Job) {
+        self.state = job.state
+        self.kind = .job
+        self.job = job
     }
 
     var body: some View {
-        Text(state.uppercased())
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background {
-                Capsule()
-                    .fill(.thinMaterial)
-                    .overlay {
-                        Capsule()
-                            .fill(slurmState.color.opacity(0.14))
-                    }
+        let presentation = job.map(StatePillPresentation.init(job:)) ?? StatePillPresentation(raw: state, kind: kind)
+        HStack(spacing: 4) {
+            if let glyph = presentation.flagGlyph {
+                Image(systemName: glyph)
+                    .font(.caption2.weight(.bold))
+                    .accessibilityHidden(true)
             }
-            .foregroundStyle(slurmState.color)
-            .overlay(
-                Capsule()
-                    .stroke(slurmState.color.opacity(0.20), lineWidth: 1)
-            )
-            .clipShape(Capsule())
-            .animation(AppTheme.smoothEase, value: state)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("State")
-            .accessibilityValue(state)
+            Text(presentation.label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(presentation.color.legibleText(in: colorScheme))
+        }
+        .foregroundStyle(presentation.color)
+        .lineLimit(1)
+        .fixedSize()
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background {
+            Capsule()
+                .fill(.thinMaterial)
+                .overlay {
+                    Capsule()
+                        .fill(presentation.color.opacity(0.14))
+                }
+        }
+        .overlay(
+            Capsule()
+                .stroke(presentation.color.opacity(0.24), lineWidth: 1)
+        )
+        .clipShape(Capsule())
+        .animation(AppTheme.smoothEase, value: state)
+        .help(presentation.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("State")
+        .accessibilityValue(presentation.accessibilityValue)
+    }
+}
+
+/// What a StatePill shows for one raw state. Separate from the view so the
+/// wording is unit-testable.
+struct StatePillPresentation: Equatable {
+    private(set) var label: String
+    let flagGlyph: String?
+    private(set) var help: String
+    private(set) var accessibilityValue: String
+    let slurmState: SlurmState
+    /// Read as a job state (true) or a node / partition state.
+    let readsAsJob: Bool
+    /// Replaces the state colour where the pill shows a derived state (a
+    /// held job's grey).
+    private var colorOverride: Color?
+
+    /// A job that ended badly (FAILED, TIMEOUT…) is `.failed`, red; a node
+    /// that accepts no work is `.unavailable`, grey.
+    var color: Color {
+        colorOverride ?? slurmState.color
+    }
+
+    /// A job's pill. Slurm's state, except that a pending job held by the
+    /// user or an administrator reads "Held" in grey, exactly as on the
+    /// Jobs tab (`JobRow.statusText`/`statusColor`): it will not start
+    /// however much capacity frees up, so it must never look like an
+    /// ordinary orange "Pending" job.
+    init(job: Job) {
+        self.init(raw: job.state, kind: .job)
+        guard let reason = job.pendingReason, reason.isHeld else {
+            return
+        }
+        label = "Held"
+        colorOverride = .gray
+        help = "\(job.state) — \(reason.explanation)"
+        accessibilityValue = "Held, \(reason.explanation)"
+    }
+
+    init(raw: String, kind: StatePill.Kind) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let jobState = JobState(trimmed)
+        let readsAsJob: Bool
+        switch kind {
+        case .job:
+            readsAsJob = true
+        case .node:
+            readsAsJob = false
+        case .automatic:
+            if case .other = jobState {
+                readsAsJob = false
+            } else {
+                readsAsJob = true
+            }
+        }
+
+        self.readsAsJob = readsAsJob
+        if readsAsJob {
+            label = jobState.label
+            flagGlyph = nil
+            slurmState = SlurmState(job: trimmed)
+            help = trimmed.isEmpty ? "No state reported" : "Slurm job state \(trimmed.uppercased())"
+            accessibilityValue = label
+            return
+        }
+
+        // Partition availability ("up"/"down") also arrives here.
+        if trimmed.lowercased() == "up" {
+            label = "Up"
+            flagGlyph = nil
+            slurmState = .idle
+            help = "Partition is up and accepting jobs"
+            accessibilityValue = label
+            return
+        }
+
+        let info = NodeStateInfo(trimmed)
+        label = info.displayLabel
+        slurmState = SlurmState(node: trimmed)
+        flagGlyph = Self.glyph(for: info)
+        var explanation = info.flagDescriptions
+        switch info.base {
+        case .mixed:
+            explanation.insert("some of the node's CPUs are allocated", at: 0)
+        case .allocated:
+            explanation.insert("every CPU on the node is allocated", at: 0)
+        case .idle, .planned:
+            explanation.insert("no CPUs allocated", at: 0)
+        case .draining:
+            explanation.insert("finishing its jobs; accepts no new work", at: 0)
+        case .drained:
+            explanation.insert("accepts no new work", at: 0)
+        default:
+            break
+        }
+        let details = explanation.joined(separator: ", ")
+        if trimmed.isEmpty {
+            help = "No state reported"
+        } else {
+            help = details.isEmpty ? "Slurm node state \(trimmed)" : "Slurm node state \(trimmed) — \(details)"
+        }
+        accessibilityValue = info.flagDescriptions.isEmpty
+            ? label
+            : "\(label), \(info.flagDescriptions.joined(separator: ", "))"
+    }
+
+    /// The most important flag gets the glyph: a node that is not
+    /// responding matters more than one that is merely planned.
+    private static func glyph(for info: NodeStateInfo) -> String? {
+        if info.notResponding {
+            return "exclamationmark.circle"
+        }
+        if info.maintenanceReservation {
+            return "wrench.and.screwdriver"
+        }
+        if info.rebootPending {
+            return "arrow.clockwise"
+        }
+        if info.poweringDown || info.powerSaving {
+            return "moon.zzz"
+        }
+        if info.plannedByBackfill {
+            return "calendar.badge.clock"
+        }
+        return nil
     }
 }
 
@@ -280,6 +413,11 @@ struct MetricView: View {
     var subtitle: String?
     var systemImage: String?
     var accent: Color = .accentColor
+    /// Tooltip for the tile; the subtitle when nil, so a caption cut short
+    /// in the narrowest column can still be read in full on hover.
+    var help: String? = nil
+
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -292,11 +430,17 @@ struct MetricView: View {
                 Text(title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    // One line, so a long title ("Idle H200 GPUs") never
+                    // makes one tile taller than its neighbours.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
                 Spacer(minLength: 0)
             }
             Text(value)
                 .font(.title3.monospacedDigit().weight(.semibold))
-                .foregroundStyle(accent)
+                .foregroundStyle(accent.legibleText(in: colorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             if let subtitle {
                 Text(subtitle)
                     .font(.caption2)
@@ -306,6 +450,7 @@ struct MetricView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .dashboardCard(accent: accent)
+        .help(help ?? subtitle ?? "")
         .animation(AppTheme.softSpring, value: value)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
@@ -422,7 +567,10 @@ struct SegmentedMeter: View {
 }
 
 struct RingMeter: View {
-    let value: Double
+    /// Fraction 0…1, or nil when it is not known: the ring then shows only
+    /// its track and the missing-value placeholder, never an empty "0%"
+    /// that would read as nothing in use.
+    let value: Double?
     let color: Color
     let label: String
 
@@ -430,13 +578,15 @@ struct RingMeter: View {
         ZStack {
             Circle()
                 .stroke(Color.primary.opacity(0.10), lineWidth: 9)
-            Circle()
-                .trim(from: 0, to: min(max(value, 0), 1))
-                .stroke(color, style: StrokeStyle(lineWidth: 9, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(AppTheme.softSpring, value: value)
+            if let value {
+                Circle()
+                    .trim(from: 0, to: min(max(value, 0), 1))
+                    .stroke(color, style: StrokeStyle(lineWidth: 9, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(AppTheme.softSpring, value: value)
+            }
             VStack(spacing: 2) {
-                Text("\(Int((value * 100).rounded()))%")
+                Text(value.map { "\(Int(($0 * 100).rounded()))%" } ?? missingValuePlaceholder)
                     .font(.headline.monospacedDigit())
                 Text(label)
                     .font(.caption2)
@@ -445,7 +595,7 @@ struct RingMeter: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
-        .accessibilityValue("\(Int((value * 100).rounded())) percent")
+        .accessibilityValue(value.map { "\(Int(($0 * 100).rounded())) percent" } ?? "unknown")
     }
 }
 
@@ -477,182 +627,25 @@ struct EmptyVisual: View {
 
 // MARK: - Controls
 
+/// Show/Hide Details. Always at its full size: a "Show…" stub explains
+/// nothing, and PageHeader leaves the title at least 160 pt beside it even
+/// in the narrowest detail column.
 struct DetailsToggleButton: View {
     @Binding var showDetails: Bool
+
+    private var title: String { showDetails ? "Hide Details" : "Show Details" }
+    private var systemImage: String { showDetails ? "tablecells.badge.ellipsis" : "tablecells" }
 
     var body: some View {
         Button {
             showDetails.toggle()
         } label: {
-            Label(showDetails ? "Hide Details" : "Show Details", systemImage: showDetails ? "tablecells.badge.ellipsis" : "tablecells")
-        }
-        .buttonStyle(.bordered)
-    }
-}
-
-// MARK: - Trend charts (Swift Charts)
-
-struct TrendChartCard: View {
-    let title: String
-    let subtitle: String
-    let value: String
-    let systemImage: String
-    let color: Color
-    let values: [Double]
-    var isPercentage: Bool = false
-    var threshold: Double?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Label(title, systemImage: systemImage)
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(color)
-                Spacer()
-                Text(value)
-                    .font(.headline.monospacedDigit().weight(.semibold))
-            }
-
-            TrendChart(values: values, color: color, isPercentage: isPercentage, threshold: threshold)
-                .frame(height: 118)
-
-            Text(subtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Label(title, systemImage: systemImage)
                 .lineLimit(1)
         }
-        .dashboardCard(accent: color)
-        .accessibilityElement(children: .ignore)
+        .buttonStyle(.bordered)
+        .fixedSize()
+        .help(showDetails ? "Hide the detail table" : "Show every row in a sortable detail table")
         .accessibilityLabel(title)
-        .accessibilityValue(value)
-    }
-}
-
-/// Swift Charts trend line with an area gradient, sensible fixed domains
-/// (0–100 for percentages, 0-anchored for counts) and a hover value readout.
-struct TrendChart: View {
-    let values: [Double]
-    let color: Color
-    var isPercentage: Bool = false
-    var threshold: Double?
-
-    @State private var hoverIndex: Int?
-
-    private struct Sample: Identifiable {
-        let index: Int
-        let value: Double
-        var id: Int { index }
-    }
-
-    private var samples: [Sample] {
-        values.enumerated()
-            .filter { $0.element.isFinite }
-            .map { Sample(index: $0.offset, value: $0.element) }
-    }
-
-    private var yDomain: ClosedRange<Double> {
-        if isPercentage {
-            return 0...100
-        }
-        let maxValue = samples.map(\.value).max() ?? 1
-        return 0...max(maxValue * 1.15, 1)
-    }
-
-    var body: some View {
-        let data = samples
-        Chart {
-            ForEach(data) { sample in
-                AreaMark(
-                    x: .value("Point", sample.index),
-                    y: .value("Value", sample.value)
-                )
-                .interpolationMethod(.monotone)
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [color.opacity(0.26), color.opacity(0.02)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-
-                LineMark(
-                    x: .value("Point", sample.index),
-                    y: .value("Value", sample.value)
-                )
-                .interpolationMethod(.monotone)
-                .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                .foregroundStyle(color)
-            }
-
-            if let threshold {
-                RuleMark(y: .value("Threshold", threshold))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .foregroundStyle(Color.red.opacity(0.45))
-            }
-
-            if let hoverIndex, let sample = data.first(where: { $0.index == hoverIndex }) {
-                RuleMark(x: .value("Point", sample.index))
-                    .lineStyle(StrokeStyle(lineWidth: 1))
-                    .foregroundStyle(Color.secondary.opacity(0.35))
-                PointMark(
-                    x: .value("Point", sample.index),
-                    y: .value("Value", sample.value)
-                )
-                .symbolSize(46)
-                .foregroundStyle(color)
-                .annotation(position: .top, alignment: .center) {
-                    Text(valueText(sample.value))
-                        .font(.caption2.monospacedDigit().weight(.semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                }
-            }
-        }
-        .chartYScale(domain: yDomain)
-        .chartXAxis(.hidden)
-        .chartYAxis {
-            AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { _ in
-                AxisGridLine()
-                    .foregroundStyle(Color.primary.opacity(0.06))
-                AxisValueLabel()
-                    .font(.caption2)
-                    .foregroundStyle(Color.secondary)
-            }
-        }
-        .chartOverlay { proxy in
-            GeometryReader { geometry in
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        switch phase {
-                        case .active(let location):
-                            let plotOrigin = geometry[proxy.plotAreaFrame].origin
-                            let x = location.x - plotOrigin.x
-                            if let position: Double = proxy.value(atX: x) {
-                                hoverIndex = nearestIndex(to: position, in: data)
-                            }
-                        case .ended:
-                            hoverIndex = nil
-                        }
-                    }
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
-    private func nearestIndex(to position: Double, in data: [Sample]) -> Int? {
-        data.min { abs(Double($0.index) - position) < abs(Double($1.index) - position) }?.index
-    }
-
-    private func valueText(_ value: Double) -> String {
-        if isPercentage {
-            return "\(Int(value.rounded()))%"
-        }
-        if value.rounded() == value {
-            return "\(Int(value))"
-        }
-        return String(format: "%.1f", value)
     }
 }

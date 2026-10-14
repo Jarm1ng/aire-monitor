@@ -1,3 +1,4 @@
+import HPCCore
 import Foundation
 import Testing
 @testable import AIREMonitorApp
@@ -260,6 +261,39 @@ struct SnapshotCacheTests {
 
         #expect(history.count == 1)
         #expect(cache.loadHistory().count == 1)
+    }
+
+    @Test("History records GPUs of unknown allocation as unknown, not as 0 allocated; older lines still decode")
+    func historyRecordsUnknownGPUs() throws {
+        let root = try TemporaryProjectRoot()
+        defer { root.remove() }
+        // node_details was cut: the GPU nodes have no allocation record.
+        let unknownNodes = [
+            NodeSummary(node: "gpu001", partitions: ["gpu"], state: "mixed", gres: "gpu:nvidia_h200:4", gpuTotal: 4),
+            NodeSummary(node: "gpu002", partitions: ["gpu"], state: "idle", gres: "gpu:nvidia_h200:4", gpuTotal: 4)
+        ]
+        let point = TrendPoint(snapshot: makeSnapshot(cluster: .calder, nodes: unknownNodes))
+        #expect(point.gpuTotal == 8)
+        #expect(point.gpuUnknown == 8)
+        #expect(point.gpuAllocated == 0 && point.gpuIdle == 0, "unknown is neither allocated nor idle")
+
+        let known = TrendPoint(snapshot: makeSnapshot(cluster: .calder, nodes: [
+            NodeSummary(node: "gpu003", partitions: ["gpu"], state: "mixed", gres: "gpu:nvidia_h200:4", gpuTotal: 4, gpuAllocated: 3)
+        ]))
+        #expect(known.gpuUnknown == 0)
+        #expect(known.gpuAllocated == 3)
+
+        // A line written before the field existed, then a new point.
+        let legacyLine = #"{"collectedAt":"2026-10-12T09:00:00Z","totalJobs":3,"runningJobs":1,"pendingJobs":2,"gpuTotal":56,"gpuAllocated":40,"gpuIdle":16,"unavailableGpuNodes":0,"homeUsedPercent":41.5}"#
+        try root.write(legacyLine + "\n", to: ".runtime/clusters/calder/snapshot_history.jsonl")
+        let cache = SnapshotCache(projectRoot: root.path, clusterID: .calder)
+        try cache.appendHistory(point)
+
+        let history = cache.loadHistory()
+        #expect(history.count == 2)
+        #expect(history.first?.gpuAllocated == 40)
+        #expect(history.first?.gpuUnknown == nil)
+        #expect(history.last?.gpuUnknown == 8)
     }
 
     @Test("Job-state baselines are separate per cluster")

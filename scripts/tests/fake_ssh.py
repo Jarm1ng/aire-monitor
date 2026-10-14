@@ -13,11 +13,17 @@ It emulates just enough OpenSSH behaviour for the multi-cluster login flow:
   * `-O check` / `-O exit` against a control path, printing
     "Master running (pid=N)" to stderr like OpenSSH.
   * Interactive ControlMaster creation (ControlMaster=yes, -f, optional -N):
-    prompts "Password:" then a Duo menu, on the tty (expect leg) or through
+    prompts the real keyboard-interactive "(user@host) Password: " and then
+    the real multi-line Duo menu ("Duo two-factor login for ..." ...
+    "Passcode or option (1-2): "), on the tty (expect leg) or through
     $SSH_ASKPASS when SSH_ASKPASS_REQUIRE=force (zsh/askpass leg). A wrong
     password is rejected with "Permission denied"; the daemonized master's
     process title starts with "ssh " and its FIRST ControlPath= option is its
-    own socket, so the scripts' kill_verified_pid / pgrep logic works on it.
+    own socket, so the scripts' verified-kill / pgrep logic works on it.
+  * A tunnelled master keeps a `-W` proxy child alive (its ProxyCommand, run
+    for real through this fake), exactly as OpenSSH does; the child names the
+    jump control path in its argv, which is how hpc_stop_master.zsh sees that
+    the jump master is still in use. The child exits with its master.
   * A target master whose ProxyCommand references a jump control path refuses
     to start when that jump master is dead. It records the PID of the jump
     master it rode in on (--jump-pid=) and EXITS when that very process dies —
@@ -49,6 +55,32 @@ by writing one word to <HPC_FAKE_HOME>/w_mode/<host>:
 A Duo push that takes a while to approve is simulated by writing a number of
 seconds to <HPC_FAKE_HOME>/duo_delay/<host>: the fake then waits that long
 after answering the Duo prompt (the prompt is recorded before the wait).
+
+Other per-host knobs (one word or number in <HPC_FAKE_HOME>/<knob>/<host>):
+
+  duo_mode     how the push ends, like pam_duo:
+                 deny     "Login request denied." then the menu AGAIN (up to
+                          duo_prompts times), then "Permission denied"
+                 timeout  waits duo_delay, "Login timed out." then the menu
+                          again, as above
+                 grace    waits duo_delay, then the server closes the
+                          connection (sshd LoginGraceTime): no Permission
+                          denied, just "Connection closed by ..."
+                 hang     the push is never answered (until killed)
+  duo_prompts  pam_duo's `prompts` option (default 3)
+  pw_change    the password is expired: "after" (pam_sss after Duo:
+               "Password expired. Change your password now." + "Current
+               Password: "), "before" (the same, before Duo), or "rhel7"
+               (pam_unix: "(current) UNIX password: ")
+  password_delay  seconds before the server asks for the password (a slow
+               or silent server)
+
+pam_duo is free to treat an EMPTY answer to its menu as "use the default
+factor"; the fake assumes the worst and sends another push for it, so a
+script that merely refuses a repeated Duo prompt (instead of ending ssh)
+shows up as an extra push. Every answer to a password-change prompt is
+recorded in <HPC_FAKE_HOME>/logs/pw_change/<host>.log as "refused" (empty)
+or "answered" — never the text itself.
 
 Every invocation's argv is appended to <HPC_FAKE_HOME>/logs/invocations.log,
 and every answered Duo prompt is appended to
@@ -185,6 +217,29 @@ def _delay_setting(kind, host):
         return 0.0
 
 
+def knob(kind, host):
+    """One-word per-host test knob (see the module docstring)."""
+    if not HOME or not host:
+        return ""
+    try:
+        with open(os.path.join(HOME, kind, host.replace("/", "_"))) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def record_line(kind, host, line):
+    if not HOME:
+        return
+    d = os.path.join(_logs_dir(), kind)
+    os.makedirs(d, exist_ok=True)
+    try:
+        with open(os.path.join(d, host.replace("/", "_") + ".log"), "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
 def duo_delay(host):
     """Seconds the simulated user takes to approve the Duo push."""
     return _delay_setting("duo_delay", host)
@@ -220,6 +275,7 @@ class Args:
         self.host = None
         self.command = []        # trailing remote command
         self.master_mode = False # internal re-exec marker
+        self.argv = []           # the argv exactly as received
 
     @property
     def control_path(self):
@@ -236,6 +292,7 @@ class Args:
 
 def parse_args(argv):
     a = Args()
+    a.argv = list(argv)
     i = 0
     takes_value = set("bcDEeFIiLlmOopQRSWw")  # OpenSSH flags that take an argument
     while i < len(argv):
@@ -355,21 +412,59 @@ def prompt_tty(text):
     return line.rstrip("\n")
 
 
+def duo_menu(user, host):
+    """The real pam_duo menu as ONE keyboard-interactive prompt (digits are
+    made up), exactly what askpass receives as its argument and what the tty
+    leg sees printed."""
+    u = user or "user"
+    return (
+        "(%s@%s) Duo two-factor login for %s@leeds.ac.uk\n"
+        "\n"
+        "Enter a passcode or select one of the following options:\n"
+        "\n"
+        "1. Duo Push to +XX XXXX XX1234\n"
+        "2. SMS passcodes to +XX XXXX XX1234 (next code starts with: 1)\n"
+        "\n"
+        "Passcode or option (1-2): " % (u, host, u)
+    )
+
+
+def ask(prompt, via_askpass):
+    """One keyboard-interactive prompt. None means askpass refused (ssh then
+    sends the server an empty answer)."""
+    if via_askpass:
+        return ask_via_askpass(prompt)
+    return prompt_tty(prompt)
+
+
+def password_change(host, user, via_askpass, variant):
+    """chauthtok inside keyboard-interactive. Our scripts must never answer
+    it; whatever arrives is recorded (as a kind, never the text)."""
+    if variant == "rhel7":
+        text = ("You are required to change your password immediately "
+                "(administrator enforced)\nChanging password for user %s.\n"
+                "(current) UNIX password: " % (user or "user"))
+    else:
+        text = "Password expired. Change your password now.\nCurrent Password: "
+    answer = ask(text, via_askpass)
+    record_line("pw_change", host, "answered" if answer else "refused")
+    sys.stderr.write("%s@%s: Permission denied (keyboard-interactive).\n"
+                     % (user or "user", host))
+    sys.stderr.flush()
+    return False
+
+
 def authenticate(host, user):
     """Run the password + Duo exchange on whichever channel the caller set up.
-    Returns True on success; prints OpenSSH-shaped rejection text and returns
-    False on a wrong password."""
-    pw_prompt = "%s@%s's password: " % (user or "user", host)
-    duo_prompt = "Passcode or option (1-3): "
+    Returns True on success; prints OpenSSH-shaped failure text and returns
+    False otherwise."""
+    pw_prompt = "(%s@%s) Password: " % (user or "user", host)
     via_askpass = use_askpass()
 
     delay = password_delay(host)
     if delay > 0:
         time.sleep(delay)
-    if via_askpass:
-        answer = ask_via_askpass(pw_prompt)
-    else:
-        answer = prompt_tty(pw_prompt)
+    answer = ask(pw_prompt, via_askpass)
 
     if answer != expected_password():
         # NumberOfPasswordPrompts=1 on the askpass leg: fail immediately.
@@ -392,25 +487,51 @@ def authenticate(host, user):
         sys.stderr.flush()
         return False
 
-    # Correct password -> Duo. A real push would block here until approved;
-    # the fake "approves" instantly but still records the prompt so the
-    # harness can assert one Duo per fresh authentication.
-    sys.stderr.write("Duo two-factor login for %s\n" % (user or "user"))
-    sys.stderr.write("Select one of the following options:\n")
-    sys.stderr.write(" 1. Duo Push\n 2. Phone call\n 3. SMS passcodes\n")
+    change = knob("pw_change", host)
+    if change in ("before", "rhel7"):
+        return password_change(host, user, via_askpass, change)
+
+    # Correct password -> Duo, the way pam_duo runs it: one menu prompt per
+    # attempt, each answer (even an empty one, see the docstring) is a push,
+    # and a failed push re-prompts with the reason prefixed, up to
+    # `duo_prompts` times.
+    mode = knob("duo_mode", host)
+    try:
+        prompts = max(1, int(knob("duo_prompts", host) or 3))
+    except ValueError:
+        prompts = 3
+    reason = ""
+    for _attempt in range(prompts):
+        ask(reason + duo_menu(user, host), via_askpass)
+        record_duo(host)
+        delay = duo_delay(host)
+        if mode == "deny":
+            reason = "Login request denied.\n\n"
+            continue
+        if mode == "timeout":
+            time.sleep(delay)
+            reason = "Login timed out.\n\n"
+            continue
+        if mode == "grace":
+            time.sleep(delay or 0.5)
+            sys.stderr.write("Connection closed by 10.0.0.1 port 22\n")
+            sys.stderr.flush()
+            return False
+        if mode == "hang":
+            time.sleep(600)
+            return False
+        if delay > 0:
+            # The user has not approved the push yet.
+            time.sleep(delay)
+        sys.stderr.write("Success. Logging you in...\n")
+        sys.stderr.flush()
+        if change == "after":
+            return password_change(host, user, via_askpass, change)
+        return True
+    sys.stderr.write("%s@%s: Permission denied (keyboard-interactive).\n"
+                     % (user or "user", host))
     sys.stderr.flush()
-    if via_askpass:
-        ask_via_askpass(duo_prompt)
-    else:
-        prompt_tty(duo_prompt)
-    record_duo(host)
-    delay = duo_delay(host)
-    if delay > 0:
-        # The user has not approved the push yet.
-        time.sleep(delay)
-    sys.stderr.write("Success. Logging you in...\n")
-    sys.stderr.flush()
-    return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -521,8 +642,11 @@ def do_proxy_W(a):
     # long as that one master process does).
     sys.stdout.write(BANNER + "\r\n")
     sys.stdout.flush()
+    parent = os.getppid()
     try:
-        while pid_alive(jump_pid):
+        # A real ProxyCommand child also ends when the master it serves goes
+        # away (its stdin pipe closes), even if that master was SIGKILLed.
+        while pid_alive(jump_pid) and os.getppid() == parent:
             time.sleep(0.3)
     except KeyboardInterrupt:
         pass
@@ -612,14 +736,22 @@ def do_master_create(a):
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
 
-    kind = "jump" if a.want_N else "target"
+    # A tunnelled master keeps its ProxyCommand child (a `-W` client of the
+    # jump master) for its whole life, as OpenSSH does.
+    proxy_pid = None
+    if jump_cp is not None:
+        proxy_pid = spawn_proxy_child(a.options.get("ProxyCommand", ""), a.host)
     write_state(cp, {
         "pid": os.getpid(),
-        "kind": kind,
+        "kind": "tunnelled" if jump_cp else "direct",
         "control_path": cp,
         "jump_control_path": jump_cp,
         "host": a.host,
         "user": user,
+        "no_command": a.want_N,
+        "command": a.command,
+        "control_persist": a.options.get("ControlPersist", ""),
+        "proxy_pid": proxy_pid,
         "wedged": False,
     })
     # Marker socket file so `-O check` and `[ -e ]`/`file exists` see a master.
@@ -652,25 +784,56 @@ def do_master_create(a):
     maxfd = min(max(maxfd, 1024), 8192)
     os.closerange(3, maxfd)
 
-    # Re-exec through the interpreter but with argv[0] = "ssh" so the master's
-    # process title begins with "ssh " (what the scripts' ^ssh match needs),
-    # while its FIRST ControlPath= option is its own socket. The jump socket,
-    # when present, travels as --jump-ctl= and so is never mistaken for a
-    # ControlPath= by the scripts' first-occurrence check.
+    # Re-exec through the interpreter as the master loop, titled the way a
+    # real detached OpenSSH master is, so the scripts' verified-kill and
+    # jump-rider rules meet the shape they meet in real life:
+    #   * -N (every master the hpc_* scripts start): with ControlPersist and
+    #     no session or stdio forward to hand over, OpenSSH daemonizes
+    #     WITHOUT control_persist_detach() and never retitles itself, so ps
+    #     shows the master's original argv. That argv names its own socket
+    #     (first ControlPath=), carries ControlMaster=yes and, for a
+    #     tunnelled master, the jump socket inside its ProxyCommand — the
+    #     same shape as a master still authenticating.
+    #   * with a remote command: control_persist_detach() forks the master
+    #     away from the session client and retitles it "ssh: <socket> [mux]".
+    # The loop's own markers (--state= and friends) come first and never
+    # spell "ControlPath=", so the first ControlPath= ps shows is the
+    # master's real one.
     self_path = os.path.realpath(__file__)
-    tail = [
-        self_path, "--__master__",
-        "-o", "ControlMaster=yes",
-        "-o", "ControlPath=" + cp,
-        "--state=" + cp,
-    ]
-    if jump_cp:
-        tail.append("--jump-ctl=" + jump_cp)
+    markers = ["--state=" + cp]
     if jump_pid:
-        tail.append("--jump-pid=%d" % jump_pid)
-    tail.append(a.host or "host")
-    os.execv(sys.executable, ["ssh"] + tail)
+        markers.append("--jump-pid=%d" % jump_pid)
+    if proxy_pid:
+        markers.append("--proxy-pid=%d" % proxy_pid)
+    if a.want_N and not a.command:
+        os.execv(sys.executable,
+                 ["ssh", self_path, "--__master__"] + markers + ["--"] + a.argv)
+    os.execv(sys.executable,
+             ["ssh: %s [mux]" % cp, self_path, "--__master__"] + markers
+             + ["-o", "ControlMaster=yes", "-o", "ControlPath=" + cp, a.host or "host"])
     # execv replaces this process; control never returns here.
+
+
+def spawn_proxy_child(proxy_command, host):
+    """Run the master's ProxyCommand (with %h/%p expanded) through this fake,
+    detached from our stdio. Returns its pid, or None."""
+    import shlex
+    import subprocess
+    if not proxy_command:
+        return None
+    try:
+        argv = shlex.split(proxy_command.replace("%h", host or "host").replace("%p", "22"))
+    except ValueError:
+        return None
+    if not argv or argv[0] != "ssh":
+        return None
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError:
+        return None
+    return proc.pid
 
 
 def run_master_loop(argv):
@@ -683,6 +846,7 @@ def run_master_loop(argv):
     harness exists to catch."""
     cp = None
     jump_pid = None
+    proxy_pid = None
     for tok in argv:
         if tok.startswith("--state="):
             cp = tok.split("=", 1)[1]
@@ -691,6 +855,11 @@ def run_master_loop(argv):
                 jump_pid = int(tok.split("=", 1)[1])
             except ValueError:
                 jump_pid = -1
+        elif tok.startswith("--proxy-pid="):
+            try:
+                proxy_pid = int(tok.split("=", 1)[1])
+            except ValueError:
+                proxy_pid = None
 
     running = {"go": True}
 
@@ -711,11 +880,33 @@ def run_master_loop(argv):
             time.sleep(0.2)
     finally:
         _remove_master_files(cp)
+        if proxy_pid:
+            try:
+                os.kill(proxy_pid, signal.SIGTERM)
+                os.waitpid(proxy_pid, 0)
+            except OSError:
+                pass
     return 0
 
 
 # --------------------------------------------------------------------------
+REEXEC_MARK = "--__as_ssh__"
+
+
 def main(argv):
+    if argv and argv[0] == REEXEC_MARK:
+        argv = argv[1:]
+    else:
+        a = parse_args(argv)
+        if a.control_master == "yes" and not a.master_mode and not a.control_cmd:
+            # An authenticating master must look like `ssh ... ControlPath=<own>
+            # ... ControlMaster=yes ...` in ps, as a real one does (the
+            # scripts may have to kill one abandoned at a Duo prompt), not
+            # like `python3 .../bin/ssh ...`.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable,
+                     ["ssh", os.path.realpath(__file__), REEXEC_MARK] + argv)
     log_invocation(argv)
     a = parse_args(argv)
 

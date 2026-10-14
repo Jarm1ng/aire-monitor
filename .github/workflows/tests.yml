@@ -1,0 +1,40 @@
+# Runs every suite (Swift unit and layout tests, collector self-tests, the
+# login-flow harness against a fake ssh) through scripts/test_all.sh.
+# Nothing here reaches the Leeds clusters or needs credentials.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # swift-tools-version 6.0 and swift-testing need Xcode 16 or newer, the
+    # default on this image. The runner has a logged-in GUI session, so the
+    # minimum-window layout suite runs here too.
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swift --version
+          python3 --version
+
+      - name: Run every suite
+        env:
+          # The `runner` context is only available at step level.
+          HPC_TEST_BUILD_DIR: ${{ runner.temp }}/hpc-tests-build
+        run: scripts/test_all.sh

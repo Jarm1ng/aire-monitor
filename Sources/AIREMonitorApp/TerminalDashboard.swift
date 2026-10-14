@@ -1,3 +1,4 @@
+import HPCCore
 import AppKit
 import SwiftTerm
 import SwiftUI
@@ -49,6 +50,17 @@ struct TerminalDashboard: View {
                 sessionStrip
             }
 
+            if case .sessionLimit(let limit) = manager.notice {
+                SessionLimitBanner(
+                    clusterName: clusterName,
+                    limit: limit,
+                    runningTailCount: manager.runningTailSessions.count,
+                    onCloseTails: { manager.closeRunningTails() },
+                    onDismiss: { manager.dismissNotice() }
+                )
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             if let terminal = manager.activeSession {
                 TerminalSessionPane(session: terminal, accent: accent) {
                     // Fresh settings, so a restart follows a route or host
@@ -59,8 +71,7 @@ struct TerminalDashboard: View {
                 TerminalHero(
                     clusterName: clusterName,
                     accent: accent,
-                    connectionState: session.connectionState,
-                    isLoggedIn: session.isLoggedIn
+                    presentation: session.presentation
                 ) {
                     manager.openShell(settings: session.settings)
                 }
@@ -70,6 +81,7 @@ struct TerminalDashboard: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .animation(AppTheme.smoothEase, value: manager.sessions.isEmpty)
+        .animation(AppTheme.smoothEase, value: manager.notice)
         // Keyed by cluster: the same view slot is reused when the sidebar
         // switches clusters, so plain onAppear would miss that switch and
         // leave this cluster's terminals at a stale text size.
@@ -89,7 +101,7 @@ struct TerminalDashboard: View {
                         accent: accent,
                         isActive: manager.activeSession?.id == terminal.id,
                         onSelect: { manager.activeSessionID = terminal.id },
-                        onClose: { manager.close(terminal) }
+                        onClose: { requestClose(terminal) }
                     )
                 }
             }
@@ -97,6 +109,22 @@ struct TerminalDashboard: View {
         }
         .animation(AppTheme.softSpring, value: manager.sessions.count)
         .accessibilityLabel("\(clusterName) terminal sessions")
+    }
+
+    /// Closing a connected shell or command ends whatever runs in it — an
+    /// unsaved vim buffer, an `srun --pty` allocation that queued for hours —
+    /// so it asks first (unless the person opted out). Tails, finished and
+    /// never-connected tabs close at once: nothing is lost.
+    private func requestClose(_ terminal: TerminalSession) {
+        guard terminal.closingEndsWork, !TerminalCloseConfirmation.isSuppressed else {
+            manager.close(terminal)
+            return
+        }
+        TerminalCloseConfirmation.confirm(sessionTitle: terminal.title, clusterName: clusterName) { confirmed in
+            if confirmed {
+                manager.close(terminal)
+            }
+        }
     }
 
     /// One-line hint shown in place of the session strip while no session
@@ -155,8 +183,9 @@ struct TerminalDashboard: View {
                         systemImage: item.systemImage,
                         accent: accent,
                         accessibilityHint: item.opensDedicatedSession
-                            ? "Opens in its own \(clusterName) session"
-                            : "Runs in the active \(clusterName) shell, or in a new session"
+                            ? "Opens in its own \(clusterName) tab"
+                            : "Types into the active \(clusterName) shell unless a full-screen program "
+                                + "is open there; otherwise runs in its own tab"
                     ) {
                         manager.runQuickCommand(
                             item.command,
@@ -182,68 +211,91 @@ private struct TerminalSessionPane: View {
     let onRestart: () -> Void
 
     var body: some View {
-        TerminalHostView(session: session)
-            .id(session.id)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // Round the dark terminal surface itself so its corners never
-            // poke square into the card's rounded chrome.
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay(alignment: .bottom) {
-                switch session.status {
-                case .running:
-                    EmptyView()
-                case .exited(let exitStatus):
-                    statusBar(
-                        systemImage: "bolt.slash.fill",
-                        text: exitStatus?.label ?? "exited",
-                        buttonTitle: "Restart",
-                        accessibilityText: exitStatus.map { "Session \($0.label)" } ?? "Session exited"
-                    )
-                case .sessionUnavailable:
-                    // ssh never ran: the pre-flight found no live master.
-                    // "Retry" rather than "Restart" — after Connect in the
-                    // sidebar the same session simply tries again.
-                    statusBar(
-                        systemImage: "bolt.horizontal.circle",
-                        text: "\(session.clusterName) not connected",
-                        buttonTitle: "Retry",
-                        accessibilityText: "\(session.clusterName) SSH session is not running"
-                    )
-                }
+        // The status bar sits BELOW the terminal, never over it: the last
+        // rows are exactly where ssh prints its final error ("Shared
+        // connection to … closed.") and where the not-connected message
+        // appears. SwiftTerm keeps the cursor row visible as it shrinks.
+        VStack(spacing: 8) {
+            TerminalHostView(session: session)
+                .id(session.id)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Round the dark terminal surface itself so its corners never
+                // poke square into the card's rounded chrome.
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+            if let bar = statusBarContent {
+                statusBar(bar)
             }
-            // Terminals want space: minimal padding, but still glass chrome.
-            .dashboardCard(padding: 8, accent: accent)
-            .animation(AppTheme.smoothEase, value: session.status)
+        }
+        // Terminals want space: minimal padding, but still glass chrome.
+        .dashboardCard(padding: 8, accent: accent)
+        .animation(AppTheme.smoothEase, value: session.status)
+        .animation(AppTheme.smoothEase, value: session.isConnectionStalled)
     }
 
-    private func statusBar(
-        systemImage: String,
-        text: String,
-        buttonTitle: String,
-        accessibilityText: String
-    ) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: systemImage)
-                .foregroundStyle(.orange)
-                .accessibilityHidden(true)
-            Text(text)
-                .font(.caption.monospacedDigit().weight(.medium))
-            Button(buttonTitle, action: onRestart)
-                .buttonStyle(.borderedProminent)
-                .tint(accent)
-                .controlSize(.small)
-                .accessibilityLabel("\(buttonTitle) \(session.title) on \(session.clusterName)")
+    private struct StatusBarContent {
+        let presentation: TerminalStatusPresentation
+        let text: String
+        let showsAction: Bool
+    }
+
+    /// nil while the session is healthy. A normal connect takes well under a
+    /// second, so "connecting" only earns a bar once it has stalled.
+    private var statusBarContent: StatusBarContent? {
+        let presentation = session.statusPresentation
+        switch session.status {
+        case .running:
+            return nil
+        case .connecting:
+            guard session.isConnectionStalled else {
+                return nil
+            }
+            return StatusBarContent(
+                presentation: TerminalStatusPresentation(
+                    label: "no response",
+                    tone: .warning,
+                    systemImage: "hourglass",
+                    actionTitle: nil,
+                    help: presentation.help
+                ),
+                text: "No response from \(session.clusterName) yet — its SSH session may be stale after a sleep "
+                    + "or network change. Use Connect for \(session.clusterName) in the sidebar.",
+                showsAction: false
+            )
+        case .exited, .sessionUnavailable:
+            return StatusBarContent(presentation: presentation, text: presentation.label, showsAction: true)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(AppTheme.border, lineWidth: 1))
-        .padding(.bottom, 12)
+    }
+
+    private func statusBar(_ content: StatusBarContent) -> some View {
+        let presentation = content.presentation
+        return HStack(spacing: 10) {
+            Image(systemName: presentation.systemImage)
+                .foregroundStyle(presentation.tone.color)
+                .accessibilityHidden(true)
+            Text(content.text)
+                .font(.caption.monospacedDigit().weight(.medium))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if content.showsAction, let actionTitle = presentation.actionTitle {
+                Button(actionTitle, action: onRestart)
+                    .buttonStyle(.borderedProminent)
+                    .tint(accent)
+                    .controlSize(.small)
+                    .accessibilityLabel("\(actionTitle) \(session.title) on \(session.clusterName)")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(presentation.tone.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .help(presentation.help)
         .transition(.opacity.combined(with: .move(edge: .bottom)))
         // .contain (not .combine) keeps the button its own element, so
         // VoiceOver can reach Restart/Retry directly.
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(accessibilityText)
+        .accessibilityLabel("\(session.title): \(content.text). \(presentation.help)")
     }
 }
 
@@ -253,7 +305,7 @@ private struct TerminalSessionPane: View {
 private struct TerminalHostView: NSViewRepresentable {
     let session: TerminalSession
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
+    func makeNSView(context: Context) -> HPCTerminalView {
         let view = session.terminalView
         DispatchQueue.main.async {
             view.window?.makeFirstResponder(view)
@@ -261,7 +313,7 @@ private struct TerminalHostView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {}
+    func updateNSView(_ nsView: HPCTerminalView, context: Context) {}
 }
 
 // MARK: - Session pill
@@ -276,33 +328,21 @@ private struct SessionPill: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var isHovered = false
 
-    private var statusColor: Color {
-        switch session.status {
-        case .running:
-            return .green
-        case .exited:
-            return .red
-        case .sessionUnavailable:
-            return .orange
-        }
-    }
-
-    private var statusText: String {
-        switch session.status {
-        case .running:
-            return "running"
-        case .exited(let exitStatus):
-            return exitStatus?.label ?? "exited"
-        case .sessionUnavailable:
-            return "not connected"
-        }
-    }
-
     var body: some View {
+        let presentation = session.statusPresentation
         HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 7, height: 7)
+            Group {
+                if session.status == .connecting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 9, height: 9)
+                } else {
+                    Circle()
+                        .fill(presentation.tone.color)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .accessibilityHidden(true)
             Text(session.title)
                 .font(.caption.weight(isActive ? .semibold : .regular))
                 .foregroundStyle(isActive ? Color.primary : Color.secondary)
@@ -310,13 +350,18 @@ private struct SessionPill: View {
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
+                    // The glyph stays small; the hit area does not.
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            .help(session.closingEndsWork ? "Close (asks first: the session is still running)" : "Close")
             .accessibilityLabel("Close \(session.title) on \(session.clusterName)")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.leading, 10)
+        .padding(.trailing, 5)
+        .padding(.vertical, 4)
         .background {
             Capsule()
                 .fill(.regularMaterial)
@@ -336,12 +381,112 @@ private struct SessionPill: View {
         .contentShape(Capsule())
         .onTapGesture(perform: onSelect)
         .onHover { isHovered = $0 }
-        .help("\(session.title) on \(session.clusterName) — \(statusText)")
+        .help("\(session.title) on \(session.clusterName) — \(presentation.label). \(presentation.help)")
         .animation(AppTheme.smoothEase, value: isActive)
         .animation(AppTheme.smoothEase, value: isHovered)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Session \(session.title) on \(session.clusterName), \(statusText)")
+        .accessibilityLabel("Session \(session.title) on \(session.clusterName), \(presentation.label)")
         .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+// MARK: - Session limit
+
+/// Shown instead of starting ssh when the cluster already has
+/// `TerminalManager.maxConcurrentSessions` running tabs. Without it the new
+/// tab would die with "exited (255)" and the collector, sharing the same
+/// connection, would be refused alongside it.
+private struct SessionLimitBanner: View {
+    let clusterName: String
+    let limit: Int
+    let runningTailCount: Int
+    let onCloseTails: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "rectangle.stack.badge.minus")
+                .foregroundStyle(StatusTone.warning.color)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Close a tab first")
+                    .font(.caption.weight(.semibold))
+                Text(
+                    "\(clusterName) already has \(limit) terminal sessions open. Each tab uses one of the "
+                        + "cluster connection's limited sessions, which the monitor and file transfers need too."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if runningTailCount > 0 {
+                Button(runningTailCount == 1 ? "Close 1 log tail" : "Close \(runningTailCount) log tails", action: onCloseTails)
+                    .controlSize(.small)
+                    .help("Log tails never end on their own; the logs stay on \(clusterName).")
+            }
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(10)
+        .background(StatusTone.warning.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(StatusTone.warning.color.opacity(0.25), lineWidth: 1)
+        )
+        .accessibilityElement(children: .contain)
+    }
+}
+
+// MARK: - Close confirmation
+
+/// Asks before a tab's running session is ended. AppKit's alert (not a
+/// SwiftUI dialog) for its "Don't ask again" checkbox on macOS 13.
+@MainActor
+enum TerminalCloseConfirmation {
+    static let suppressionDefaultsKey = "TerminalSkipCloseConfirmation"
+
+    static var isSuppressed: Bool {
+        UserDefaults.standard.bool(forKey: suppressionDefaultsKey)
+    }
+
+    static func confirm(
+        sessionTitle: String,
+        clusterName: String,
+        completion: @escaping @MainActor (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Close “\(sessionTitle)” on \(clusterName)?"
+        alert.informativeText = "Its SSH session and anything running in it — an editor, an interactive job — will end."
+        let closeButton = alert.addButton(withTitle: "Close")
+        closeButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don’t ask again"
+        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            let confirmed = response == .alertFirstButtonReturn
+            if confirmed, alert.suppressionButton?.state == .on {
+                UserDefaults.standard.set(true, forKey: suppressionDefaultsKey)
+            }
+            completion(confirmed)
+        }
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            alert.beginSheetModal(for: window) { response in
+                MainActor.assumeIsolated {
+                    finish(response)
+                }
+            }
+        } else {
+            finish(alert.runModal())
+        }
     }
 }
 
@@ -386,23 +531,42 @@ private struct QuickCommandChip: View {
 private struct TerminalHero: View {
     let clusterName: String
     let accent: Color
-    let connectionState: ClusterConnectionState
-    let isLoggedIn: Bool
+    let presentation: ClusterPresentation
     let onOpenShell: () -> Void
 
+    private var isConnected: Bool {
+        presentation.phase == .live || presentation.phase == .loadingFirstSnapshot
+    }
+
     private var headline: String {
-        isLoggedIn
-            ? "No terminal sessions on \(clusterName) yet"
-            : "The terminal reuses \(clusterName)'s SSH session — connect first."
+        switch presentation.phase {
+        case .live, .loadingFirstSnapshot:
+            return "No terminal sessions on \(clusterName) yet"
+        case .checking:
+            return "Checking for \(clusterName)'s SSH session…"
+        case .signingIn, .queued:
+            return "Signing in to \(clusterName)…"
+        case .off, .notConnected, .paused, .stale:
+            return "The terminal reuses \(clusterName)'s SSH session — connect first."
+        }
     }
 
     /// The not-connected copy is honest about what a shell will do: every
     /// session pre-flights the cluster's master, so trying anyway costs
     /// nothing and never prompts for a password or a Duo push.
     private var detail: String {
-        isLoggedIn
-            ? "Open a shell on the \(clusterName) login node over the existing SSH session — no extra password or Duo push."
-            : "Use Connect for \(clusterName) in the sidebar. You can still try a shell: it checks for \(clusterName)'s session first and never asks for a password."
+        switch presentation.phase {
+        case .live, .loadingFirstSnapshot:
+            return "Open a shell on the \(clusterName) login node over the existing SSH session — no extra password or Duo push."
+        case .paused:
+            return "Monitoring is paused, but a live session still works: a shell checks for it first and never asks for a password."
+        case .checking:
+            return "If a session is still open, a shell uses it at once — no password or Duo push."
+        case .signingIn, .queued:
+            return "Once the sign-in finishes, shells open over the new session without another Duo push."
+        case .off, .notConnected, .stale:
+            return "Use Connect for \(clusterName) in the sidebar. You can still try a shell: it checks for \(clusterName)'s session first and never asks for a password."
+        }
     }
 
     var body: some View {
@@ -415,7 +579,7 @@ private struct TerminalHero: View {
                     .foregroundStyle(accent)
                     .accessibilityHidden(true)
 
-                ConnectionStatePill(state: connectionState)
+                TerminalPhasePill(presentation: presentation)
 
                 Text(headline)
                     .font(.headline)
@@ -442,5 +606,48 @@ private struct TerminalHero: View {
             Spacer(minLength: 16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// The cluster's state as `ClusterPresentation` words it, so the terminal
+/// never says "Cached" while the sidebar says "Checking".
+private struct TerminalPhasePill: View {
+    let presentation: ClusterPresentation
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if presentation.showsProgress {
+                ProgressView()
+                    .controlSize(.mini)
+            } else {
+                Circle()
+                    .fill(presentation.tint)
+                    .frame(width: 7, height: 7)
+            }
+            Text(presentation.title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(presentation.phase == .live ? Color.primary : Color.secondary)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(presentation.tint.opacity(0.12), in: Capsule())
+        .overlay(Capsule().stroke(presentation.tint.opacity(0.25), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connection: \(presentation.title)")
+    }
+}
+
+// MARK: - Styling
+
+extension TerminalStatusPresentation.Tone {
+    /// Status colours only; the cluster accent stays on the chrome.
+    var color: SwiftUI.Color {
+        switch self {
+        case .live: return StatusTone.normal.color
+        case .progress: return .secondary
+        case .neutral: return .secondary
+        case .warning: return StatusTone.warning.color
+        case .failure: return StatusTone.critical.color
+        }
     }
 }

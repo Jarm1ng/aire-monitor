@@ -1,26 +1,5 @@
+import HPCCore
 import SwiftUI
-
-/// Stable identifier of a monitored cluster. String-backed rather than an
-/// enum so generic code never switches on a particular cluster: everything
-/// cluster-specific lives in `ClusterProfile`, and adding a cluster means
-/// adding one profile to `ClusterCatalog`.
-struct ClusterID: RawRepresentable, Hashable, Codable, Sendable, Identifiable, CustomStringConvertible {
-    let rawValue: String
-
-    init(rawValue: String) {
-        self.rawValue = rawValue
-    }
-
-    init(_ rawValue: String) {
-        self.rawValue = rawValue
-    }
-
-    var id: String { rawValue }
-    var description: String { rawValue }
-
-    static let aire = ClusterID("aire")
-    static let calder = ClusterID("calder")
-}
 
 /// How the Mac reaches the university network. It is a property of where the
 /// user is (on the VPN/campus or not), so one route applies to every cluster.
@@ -90,53 +69,16 @@ struct StorageVolumeSpec: Codable, Sendable, Hashable {
     }
 }
 
-/// Coarse kind of a storage space, derived from its label. Drives icons,
-/// colors, trend series and sort order everywhere storage is shown.
-enum StorageKind: Int, Comparable, Sendable {
-    case home
-    case scratch
-    case flash
-    case other
-
-    init(label: String) {
-        let lowered = label.lowercased()
-        if lowered.contains("home") {
-            self = .home
-        } else if lowered.contains("scratch") {
-            self = .scratch
-        } else if lowered.contains("flash") {
-            self = .flash
-        } else {
-            self = .other
-        }
-    }
-
-    static func < (lhs: StorageKind, rhs: StorageKind) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-
-    var systemImage: String {
-        switch self {
-        case .home: return "house"
-        case .scratch: return "externaldrive"
-        case .flash: return "bolt.horizontal"
-        case .other: return "internaldrive"
-        }
-    }
-
+extension StorageKind {
     var color: Color {
         switch self {
         case .home: return .purple
-        case .scratch: return .teal
-        case .flash: return .orange
+        // Identity colours only (icons): never a status colour (orange is a
+        // warning) or a metric colour (teal is CPU).
+        case .scratch: return .blue
+        case .flash: return .indigo
         case .other: return .gray
         }
-    }
-
-    /// /users is one NFS export mounted on every Leeds cluster: the same
-    /// quota appears in each cluster's snapshot and must not be summed.
-    var isSharedAcrossClusters: Bool {
-        self == .home
     }
 }
 
@@ -179,38 +121,35 @@ struct PartitionHint: Sendable, Hashable {
     let sortRank: Int
 }
 
-/// Identity color of a cluster, used for badges, sidebar rows and the
-/// overview so AIRE and Calder data are never confused at a glance.
-enum ClusterAccent: String, Sendable {
-    case green
-    case violet
+/// Identity colour of a cluster, used for badges, sidebar rows and the
+/// overview so AIRE and Calder data are never confused at a glance. The
+/// components come from HPCCore's `ClusterIdentity`, shared with the widget.
+struct ClusterAccent: Hashable, Sendable {
+    let identity: ClusterIdentity
 
     var color: Color {
-        switch self {
-        case .green: return Color(red: 0.16, green: 0.74, blue: 0.48)
-        case .violet: return Color(red: 0.56, green: 0.45, blue: 0.96)
-        }
+        Color(red: identity.accentRed, green: identity.accentGreen, blue: identity.accentBlue)
     }
 }
 
 /// Everything the app knows about one cluster. Connection, collection,
 /// storage, partition and presentation knowledge all live here.
 struct ClusterProfile: Identifiable, Sendable, Hashable {
-    let id: ClusterID
-    let displayName: String
+    let identity: ClusterIdentity
     let defaultHostname: String
     /// One-line description for headers and empty states.
     let tagline: String
-    let accent: ClusterAccent
-    /// Monogram shown in the cluster badge.
-    let monogram: String
     let storage: [StorageVolumeSpec]
     let partitions: [PartitionHint]
     /// Partition used by the terminal's "GPU nodes" quick command.
     let gpuPartition: String?
-    /// Terminal quick command that prints this user's quotas.
-    let quotaCommand: String
     let documentationURL: URL
+
+    var id: ClusterID { identity.id }
+    var displayName: String { identity.displayName }
+    /// Monogram shown in the cluster badge.
+    var monogram: String { identity.monogram }
+    var accent: ClusterAccent { ClusterAccent(identity: identity) }
 
     func hint(forPartition name: String) -> PartitionHint? {
         partitions.first { $0.name == name }
@@ -231,12 +170,9 @@ struct ClusterProfile: Identifiable, Sendable, Hashable {
 
 extension ClusterProfile {
     static let aire = ClusterProfile(
-        id: .aire,
-        displayName: "AIRE",
+        identity: .aire,
         defaultHostname: "aire.leeds.ac.uk",
         tagline: "L40S GPUs · 168-core CPU nodes · high-memory queue",
-        accent: .green,
-        monogram: "A",
         storage: [
             StorageVolumeSpec(label: "Home", paths: ["$HOME"], quota: .nfs),
             // Aire 2.0 is expected to move scratch/flash to /scratch-aire and
@@ -260,20 +196,13 @@ extension ClusterProfile {
             PartitionHint(name: "teachingnodes", role: .teaching, summary: "teaching partition", sortRank: 3)
         ],
         gpuPartition: "gpu",
-        // Same candidate order as the Scratch volume above, so the command
-        // keeps working after the Aire 2.0 path change.
-        quotaCommand: "quota -s; for d in /scratch-aire/users/$USER /mnt/scratch/$USER; do "
-            + "[ -d \"$d\" ] && { lfs quota -h -u \"$USER\" \"$(df -P \"$d\" | awk 'NR==2{print $NF}')\"; break; }; done",
         documentationURL: URL(string: "https://arcdocs.leeds.ac.uk/aire/welcome.html")!
     )
 
     static let calder = ClusterProfile(
-        id: .calder,
-        displayName: "Calder",
+        identity: .calder,
         defaultHostname: "calder.leeds.ac.uk",
         tagline: "H200 GPUs · 128-core Turin CPU nodes · 48 h walltime",
-        accent: .violet,
-        monogram: "C",
         storage: [
             StorageVolumeSpec(label: "Home", paths: ["$HOME"], quota: .nfs),
             StorageVolumeSpec(
@@ -300,15 +229,6 @@ extension ClusterProfile {
         gpuPartition: "calder-gpu-hopper",
         // Calder scratch/flash use Lustre project quotas keyed by the
         // directory's project id, not per-user quotas.
-        // Same rule as the collector: project quota when the directory has a
-        // non-zero project id (project 0 is the filesystem-wide bucket of
-        // unassigned files), otherwise the per-user quota; missing spaces
-        // are skipped.
-        quotaCommand: "quota -s; for d in /scratch-calder/users/$USER /flash-calder/users/$USER; do "
-            + "[ -d \"$d\" ] || continue; m=$(df -P \"$d\" | awk 'NR==2{print $NF}'); "
-            + "p=$(lfs project -d \"$d\" 2>/dev/null | awk 'NR==1{print $1}'); "
-            + "if [ -n \"$p\" ] && [ \"$p\" -ne 0 ] 2>/dev/null; then lfs quota -h -p \"$p\" \"$m\"; "
-            + "else lfs quota -h -u \"$USER\" \"$m\"; fi; done",
         documentationURL: URL(string: "https://arcdocs.leeds.ac.uk/calder/welcome.html")!
     )
 }
@@ -320,16 +240,4 @@ enum ClusterCatalog {
     static func profile(for id: ClusterID) -> ClusterProfile? {
         all.first { $0.id == id }
     }
-}
-
-/// Display name for a Slurm GPU gres type: "l40s" -> "L40S",
-/// "nvidia_h200" -> "H200", "a100_80g" -> "A100 80G".
-func gpuModelDisplayName(_ rawModel: String) -> String {
-    var model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-    for prefix in ["nvidia_", "nvidia-", "amd_", "amd-"] where model.lowercased().hasPrefix(prefix) {
-        model = String(model.dropFirst(prefix.count))
-    }
-    return model
-        .replacingOccurrences(of: "_", with: " ")
-        .uppercased()
 }
