@@ -1,92 +1,116 @@
+import HPCCore
 import Foundation
 import SwiftUI
 
-// MARK: - Slurm state
+// MARK: - Slurm state (presentation)
 
-/// Single source of truth for Slurm state parsing, coloring, and availability.
-/// Used by the dashboard, menu bar, and status capsule so the surfaces never drift.
+/// Colour and label layer for Slurm states. Parsing lives in HPCCore
+/// (`JobState`, `NodeStateInfo`), which keeps the job and node vocabularies
+/// apart; this enum only maps them onto the dashboard palette. Counting and
+/// availability decisions never go through this type — they use
+/// `JobState` / `NodeStateInfo.isAvailable` directly.
 enum SlurmState: Equatable {
+    /// A node that accepts no work: out of the pool, grey.
     case unavailable
+    /// A job that ended badly (FAILED, TIMEOUT, CANCELLED, OUT_OF_MEMORY…):
+    /// a fault, red. Kept apart from `unavailable` so no surface has to
+    /// remember to repaint it.
+    case failed
     case mixed
     case allocated
     case completing
     case running
     case pending
+    case suspended
     case idle
-    case up
+    case finished
     case unknown
 
-    init(parsing raw: String) {
-        let value = raw.lowercased()
-        // A trailing "*" in compact sinfo states means the node is not
-        // responding ("idle*", "down*"): whatever its base state, the
-        // scheduler cannot start work there, so it must not count as free
-        // capacity.
-        if value.hasSuffix("*") {
-            self = .unavailable
+    init(node raw: String) {
+        self.init(node: NodeStateInfo(raw))
+    }
+
+    init(node info: NodeStateInfo) {
+        guard info.isAvailable else {
+            self = info.base == .unknown && !info.notResponding ? .unknown : .unavailable
             return
         }
-        if value.contains("maint")
-            || value.contains("down")
-            || value.contains("drain")
-            || value.contains("drng")
-            || value.contains("fail")
-            || value.contains("not_responding")
-            || value.contains("inval")
-            || value.contains("boot")
-            || value.contains("cancel")
-            || value.contains("timeout")
-            || value.contains("out_of_me") {
-            self = .unavailable
-        } else if value.contains("mix") {
-            self = .mixed
-        } else if value.contains("alloc") {
-            self = .allocated
-        } else if value.contains("comp") {
-            self = .completing
-        } else if value.contains("run") {
-            self = .running
-        } else if value.contains("pend") {
-            self = .pending
-        } else if value.contains("idle") || value.contains("plnd") {
-            // Compact `sinfo %t` prints IDLE+PLANNED (an idle node the
-            // backfill scheduler has earmarked for a queued job, routine on
-            // Calder's H200 nodes) as "plnd". Its base state is idle, so it
-            // is classified as such; StatePill still shows the raw "PLND"
-            // so the reservation stays visible. MIXED+PLANNED is "mix".
-            self = .idle
-        } else if value.contains("up") {
-            self = .up
-        } else {
-            self = .unknown
+        switch info.base {
+        case .mixed: self = .mixed
+        case .allocated: self = .allocated
+        case .completing: self = .completing
+        case .idle, .planned: self = .idle
+        default: self = .unknown
         }
     }
+
+    init(job raw: String) {
+        self.init(job: JobState(raw))
+    }
+
+    init(job state: JobState) {
+        switch state {
+        case .running, .configuring: self = .running
+        case .pending, .requeued: self = .pending
+        case .suspended: self = .suspended
+        case .completing: self = .completing
+        case .finished(let raw): self = raw == "COMPLETED" || raw == "CD" ? .finished : .failed
+        case .other: self = .unknown
+        }
+    }
+
+    /// For views that receive a bare state string: job states are matched
+    /// exactly first (they are long upper-case words), anything else is read
+    /// as a node state. Only for colouring a pill; dashboards that know
+    /// whether a string is a job or a node state use the specific init.
+    init(parsing raw: String) {
+        if case .other = JobState(raw) {
+            self.init(node: raw)
+        } else {
+            self.init(job: raw)
+        }
+    }
+
+    /// Node occupancy is capacity, not health: idle green, mixed (partly
+    /// allocated) a lighter shade of allocated's blue, allocated blue — the
+    /// same "paler means partly used" ramp as the Nodes tab's GPU heatmap.
+    /// No occupancy state takes a status tone, so orange keeps meaning a
+    /// warning (a degraded partition, a full GPU pool) or a queued job
+    /// instead of matching half of a healthy fleet.
+    static let partlyAllocatedColor = Color(red: 0.40, green: 0.69, blue: 1.0)
 
     var color: Color {
         switch self {
         case .unavailable:
-            return .red
-        case .mixed, .pending:
+            // Grey, like every "accepts no work" figure (GPU meters, the
+            // Nodes tab badge, `AppTheme.unavailable`): a drained or down
+            // node is out of the pool, not an alarm.
+            return AppTheme.unavailable
+        case .failed:
+            return StatusTone.critical.color
+        case .mixed:
+            return Self.partlyAllocatedColor
+        case .pending:
             return .orange
+        case .suspended:
+            return .yellow
         case .allocated:
             return .blue
         case .completing:
             return .teal
-        case .running, .idle, .up:
+        case .running, .idle, .finished:
             return .green
         case .unknown:
             return .secondary
         }
     }
 
-    var isAvailable: Bool {
-        self != .unavailable
-    }
-
     var label: String {
         switch self {
         case .unavailable:
             return "Unavailable"
+        case .failed:
+            return "Failed"
         case .mixed:
             return "Mixed"
         case .allocated:
@@ -97,161 +121,93 @@ enum SlurmState: Equatable {
             return "Running"
         case .pending:
             return "Pending"
+        case .suspended:
+            return "Suspended"
         case .idle:
             return "Idle"
-        case .up:
-            return "Up"
+        case .finished:
+            return "Finished"
         case .unknown:
             return "Unknown"
         }
     }
 }
 
-func colorForState(_ state: String) -> Color {
-    SlurmState(parsing: state).color
-}
+// MARK: - Node state wording
 
-func isAvailable(_ node: NodeSummary) -> Bool {
-    SlurmState(parsing: node.state).isAvailable
-}
-
-// MARK: - GRES / GPU parsing
-
-/// Sums GPU counts from a Slurm GRES string.
-/// Handles `gpu:4`, `gpu:l40s:3` (AIRE), `gpu:nvidia_h200:8(S:0-1)` (Calder),
-/// `gpu:a100:4,mps:400`, and `(null)`.
-func slurmGPUTotal(from gres: String) -> Int {
-    let trimmed = gres.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty, trimmed.lowercased() != "(null)" else {
-        return 0
-    }
-    var total = 0
-    for rawEntry in splitOutsideParentheses(trimmed, separator: ",") {
-        let entry = rawEntry.trimmingCharacters(in: .whitespaces)
-        // Drop any parenthesised suffix like (S:0-1) or (IDX:0-3).
-        let core = entry.prefix { $0 != "(" }
-        let pieces = core.split(separator: ":")
-        guard let first = pieces.first, first.lowercased() == "gpu" else {
-            continue
-        }
-        guard pieces.count >= 2, let last = pieces.last else {
-            continue
-        }
-        let digits = last.prefix { $0.isNumber }
-        total += Int(digits) ?? 0
-    }
-    return total
-}
-
-/// Raw Slurm gres type from a GRES string: "l40s" for `gpu:l40s:3(S:0-1)`,
-/// "nvidia_h200" for `gpu:nvidia_h200:8(S:0-1)`, nil for `gpu:4` or `(null)`.
-/// This is an identifier, not display text — never show it uppercased
-/// ("NVIDIA_H200"); use `slurmGPUModelDisplayName(from:)` instead.
-func slurmGPUModel(from gres: String) -> String? {
-    for rawEntry in splitOutsideParentheses(gres, separator: ",") {
-        let core = rawEntry.trimmingCharacters(in: .whitespaces).prefix { $0 != "(" }
-        let pieces = core.split(separator: ":")
-        guard pieces.count >= 3, pieces[0].lowercased() == "gpu" else {
-            continue
-        }
-        return String(pieces[1])
-    }
-    return nil
-}
-
-/// Display name of the GPU model in a GRES string: "L40S" for `gpu:l40s:3`,
-/// "H200" for `gpu:nvidia_h200:8(S:0-1)`, nil when the GRES names no model.
-/// The one way GPU models reach the UI, so AIRE and Calder read alike.
-func slurmGPUModelDisplayName(from gres: String) -> String? {
-    slurmGPUModel(from: gres).map(gpuModelDisplayName)
-}
-
-func gpuTotal(_ node: NodeSummary) -> Int {
-    node.gpuTotal ?? slurmGPUTotal(from: node.gres)
-}
-
-func gpuAllocated(_ node: NodeSummary) -> Int {
-    node.gpuAllocated ?? 0
-}
-
-func gpuIdle(_ node: NodeSummary) -> Int {
-    if let idle = node.gpuIdle {
-        return idle
-    }
-    return max(gpuTotal(node) - gpuAllocated(node), 0)
-}
-
-// MARK: - Node list expansion
-
-/// Expands a compressed Slurm node list into concrete hostnames.
-/// `gpu[001-004,007],cpu01` -> `["gpu001", "gpu002", "gpu003", "gpu004", "gpu007", "cpu01"]`.
-/// Dashes outside the brackets are part of the name, so Calder's
-/// `calder-h200-[01-03]` -> `["calder-h200-01", "calder-h200-02", "calder-h200-03"]`.
-func expandNodeList(_ compressed: String) -> [String] {
-    let trimmed = compressed.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty, trimmed.lowercased() != "(null)" else {
-        return []
-    }
-    var result: [String] = []
-    for token in splitOutsideBrackets(trimmed) {
-        guard let open = token.firstIndex(of: "["),
-              let close = token.lastIndex(of: "]"),
-              open < close else {
-            let name = token.trimmingCharacters(in: .whitespaces)
-            if !name.isEmpty {
-                result.append(name)
+extension NodeStateInfo {
+    /// Order of node states in legends and state bars: busy, then idle, then
+    /// the unavailable flavours — so a red "down" segment never lands
+    /// between the allocated and mixed ones the way an alphabetical sort
+    /// put it.
+    var displayRank: Int {
+        if isAvailable {
+            switch base {
+            case .allocated: return 0
+            case .mixed: return 1
+            case .completing: return 2
+            case .planned: return 3
+            case .idle: return 4
+            default: return 5
             }
-            continue
         }
-        let prefix = String(token[..<open])
-        let suffix = String(token[token.index(after: close)...])
-        let inner = token[token.index(after: open)..<close]
-        for part in inner.split(separator: ",") {
-            if let dash = part.firstIndex(of: "-") {
-                let startText = part[..<dash]
-                let endText = part[part.index(after: dash)...]
-                if let start = Int(startText), let end = Int(endText), start <= end, end - start < 100_000 {
-                    let width = startText.count
-                    for value in start...end {
-                        result.append(prefix + String(format: "%0\(width)d", value) + suffix)
-                    }
-                    continue
-                }
-            }
-            result.append(prefix + String(part) + suffix)
+        // Unavailable: still-busy draining nodes first, then out-of-service
+        // flavours roughly by how long they tend to last.
+        switch base {
+        case .draining: return 10
+        case .mixed, .allocated, .completing: return 11
+        case .idle, .planned: return 12
+        case .drained: return 13
+        case .reserved, .maintenance: return 14
+        case .booting, .rebooting, .poweredDown: return 15
+        case .down, .failing, .failed: return 16
+        default: return 17
         }
     }
-    return result
-}
 
-/// Set of nodes running the given jobs, built from exact expanded hostnames.
-/// Never substring-matches, so `gpu1` can not collide with `gpu10`.
-/// Hostnames are only unique within one cluster: pass a single cluster's
-/// jobs and test the result only against that cluster's nodes.
-func busyNodeSet(for jobs: [Job]) -> Set<String> {
-    var nodes = Set<String>()
-    for job in jobs {
-        let state = SlurmState(parsing: job.state)
-        guard state == .running || state == .completing else {
-            continue
-        }
-        if let list = job.nodeList, !list.isEmpty {
-            nodes.formUnion(expandNodeList(list))
-        } else if state == .running {
-            // For running jobs squeue's %R column is the node list.
-            nodes.formUnion(expandNodeList(job.reasonOrNodeList))
-        }
+    /// Short words for the trailing flags, for legends: "not responding",
+    /// "maintenance", "planned".
+    var shortFlagWords: [String] {
+        var words: [String] = []
+        if notResponding { words.append("not responding") }
+        if maintenanceReservation { words.append("maintenance") }
+        if plannedByBackfill && base != .planned { words.append("planned") }
+        if powerSaving { words.append("powered down") }
+        if poweringDown { words.append("powering down") }
+        if rebootPending { words.append("reboot pending") }
+        return words
     }
-    return nodes
+
+    /// Legend text: "Mixed · planned", "Drained · not responding", "Down ·
+    /// maintenance". The raw code belongs in the tooltip (`helpText`).
+    var legendText: String {
+        ([displayLabel] + shortFlagWords).joined(separator: " · ")
+    }
+
+    /// "drain* — Drained: not responding" for tooltips, keeping the raw
+    /// Slurm code visible for people who know it.
+    var helpText: String {
+        let flags = flagDescriptions
+        let meaning = flags.isEmpty ? displayLabel : "\(displayLabel): \(flags.joined(separator: ", "))"
+        let raw = self.raw.trimmingCharacters(in: .whitespaces)
+        return raw.isEmpty ? meaning : "\(raw) — \(meaning)"
+    }
 }
 
 // MARK: - Value formatting
 
-/// Canonical placeholder for missing values across every surface.
-let missingValuePlaceholder = "—"
-
 func number(_ value: Int?) -> String {
     value.map(String.init) ?? missingValuePlaceholder
+}
+
+/// Grouped thousands ("13,888") for counts in running text.
+func groupedNumber(_ value: Int) -> String {
+    value.formatted(.number.grouping(.automatic))
+}
+
+/// "1 node", "3 nodes", "1,600 cores". `plural` defaults to noun + "s".
+func pluralized(_ count: Int, _ noun: String, plural: String? = nil) -> String {
+    "\(groupedNumber(count)) \(count == 1 ? noun : (plural ?? noun + "s"))"
 }
 
 func percentText(_ value: Double?) -> String {
@@ -261,17 +217,47 @@ func percentText(_ value: Double?) -> String {
     return "\(Int(value.rounded()))%"
 }
 
+/// A storage size the collector reports in GiB (quota, lfs and df figures
+/// all use powers of 1024), labelled in binary units: "44.5 GiB", "999
+/// GiB", "1,024 GiB", "12.5 TiB". Below 10 TiB a size stays in whole GiB
+/// rather than rounding to "1.0 TB": a 1,024 GiB limit printed as "1.0 TB"
+/// beside "999 GB used" and "24.9 GB free" read as 99.9 % full with 1 GB
+/// left, against the 98 % shown, and the figures no longer added up.
 func formatGB(_ value: Double?) -> String {
-    guard let value else {
+    binarySizeText(value, tebibytesFrom: 10 * 1024)
+}
+
+/// Node memory (Slurm's MiB divided by 1024), in the same binary units but
+/// coarser — "754 GiB", "1.5 TiB" — since it is never set against a used
+/// figure, and nodes a few MiB apart should not print "1,510–1,511 GiB".
+func formatMemoryGB(_ value: Double?) -> String {
+    binarySizeText(value, tebibytesFrom: 1024)
+}
+
+private func binarySizeText(_ value: Double?, tebibytesFrom threshold: Double) -> String {
+    guard let value, value.isFinite else {
         return missingValuePlaceholder
     }
-    if value >= 1024 {
-        return String(format: "%.1f TB", value / 1024)
+    if abs(value) >= threshold {
+        return String(format: "%.1f TiB", value / 1024)
     }
-    if value >= 100 {
-        return String(format: "%.0f GB", value)
+    if abs(value) >= 100 {
+        return "\(groupedNumber(Int(value.rounded()))) GiB"
     }
-    return String(format: "%.1f GB", value)
+    return String(format: "%.1f GiB", value)
+}
+
+/// squeue's elapsed column as text: "1:11:17" -> "1 h 11 min". Unparsable
+/// values are returned unchanged.
+func elapsedText(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return missingValuePlaceholder
+    }
+    guard let seconds = slurmElapsedSeconds(trimmed) else {
+        return trimmed
+    }
+    return slurmDurationText(seconds: seconds)
 }
 
 func cpuText(_ node: NodeSummary) -> String {
@@ -281,209 +267,52 @@ func cpuText(_ node: NodeSummary) -> String {
     return "\(allocated)/\(total)"
 }
 
+/// "2/3" allocated of configured GPUs; "?/3" when the snapshot carries no
+/// allocation for the node (unknown is never shown as zero).
 func gpuText(_ node: NodeSummary) -> String {
-    let total = gpuTotal(node)
+    let total = node.gpuCount
     guard total > 0 else {
         return missingValuePlaceholder
     }
-    return "\(gpuAllocated(node))/\(total)"
+    guard let allocated = node.knownGPUAllocated else {
+        return "?/\(total)"
+    }
+    return "\(min(allocated, total))/\(total)"
 }
 
-/// Human text for a Slurm time limit as printed by `sinfo %l` / `squeue %l`:
-/// "2-00:00:00" -> "2 days" (Calder's partition maximum), "1-12:00:00" ->
-/// "1 day 12 h", "12:00:00" -> "12 h", "0:30:00" or "30:00" -> "30 min",
-/// "infinite" / "UNLIMITED" -> "no limit". Empty and "n/a" give the
-/// missing-value placeholder. Anything unparsable is returned unchanged:
-/// showing Slurm's own text beats guessing at a walltime.
-func formatSlurmTimeLimit(_ raw: String) -> String {
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    let lowered = trimmed.lowercased()
-    if trimmed.isEmpty || lowered == "n/a" {
-        return missingValuePlaceholder
-    }
-    if lowered == "infinite" || lowered == "unlimited" {
-        return "no limit"
-    }
-    guard let seconds = slurmDurationSeconds(trimmed) else {
-        return trimmed
-    }
-    return slurmDurationText(seconds: seconds)
-}
+// MARK: - Status capsule
 
-// MARK: - Timestamps
+/// The pill used for states the dashboards derive themselves (a held job, a
+/// partition's health), in the same capsule language as `StatePill`.
+struct StatusCapsule: View {
+    let text: String
+    let color: Color
+    var help: String?
 
-/// Humane timestamp presentation: relative text for display, absolute for tooltips.
-@MainActor
-enum SlurmTimestamp {
-    private static let isoWithFraction: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static let iso: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
-    private static let plain: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        formatter.timeZone = .current
-        return formatter
-    }()
-
-    private static let relative: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter
-    }()
-
-    static func parse(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-        return isoWithFraction.date(from: trimmed)
-            ?? iso.date(from: trimmed)
-            ?? plain.date(from: trimmed)
+    var body: some View {
+        Text(text.uppercased())
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background {
+                Capsule()
+                    .fill(.thinMaterial)
+                    .overlay {
+                        Capsule()
+                            .fill(color.opacity(0.14))
+                    }
+            }
+            .foregroundStyle(color)
+            .overlay(
+                Capsule()
+                    .stroke(color.opacity(0.20), lineWidth: 1)
+            )
+            .clipShape(Capsule())
+            .fixedSize()
+            .help(help ?? "")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("State")
+            .accessibilityValue(help.map { "\(text), \($0)" } ?? text)
     }
-
-    /// "just now", "2 min. ago", … falling back to the raw string when unparsable.
-    static func relativeText(_ raw: String, reference: Date = Date()) -> String {
-        guard let date = parse(raw) else {
-            return raw
-        }
-        if abs(date.timeIntervalSince(reference)) < 15 {
-            return "just now"
-        }
-        return relative.localizedString(for: date, relativeTo: reference)
-    }
-
-    /// Absolute rendering for tooltips, falling back to the raw string.
-    static func absoluteText(_ raw: String) -> String {
-        guard let date = parse(raw) else {
-            return raw
-        }
-        return date.formatted(date: .abbreviated, time: .standard)
-    }
-}
-
-// MARK: - Private duration helpers
-
-/// Seconds in a Slurm duration. Slurm accepts "M", "M:S", "H:M:S", "D-H",
-/// "D-H:M" and "D-H:M:S": without a day part a lone field is minutes, with
-/// one the clock fields are hours[:minutes[:seconds]].
-private func slurmDurationSeconds(_ text: String) -> Int? {
-    var days = 0
-    var clock = Substring(text)
-    let hasDayPart = text.contains("-")
-    if hasDayPart {
-        let pieces = text.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-        guard pieces.count == 2, let parsedDays = Int(pieces[0]), parsedDays >= 0 else {
-            return nil
-        }
-        days = parsedDays
-        clock = pieces[1]
-    }
-    var values: [Int] = []
-    for field in clock.split(separator: ":", omittingEmptySubsequences: false) {
-        guard let value = Int(field), value >= 0 else {
-            return nil
-        }
-        values.append(value)
-    }
-    let clockSeconds: Int
-    if hasDayPart {
-        guard (1...3).contains(values.count) else {
-            return nil
-        }
-        let padded = values + Array(repeating: 0, count: 3 - values.count)
-        clockSeconds = padded[0] * 3600 + padded[1] * 60 + padded[2]
-    } else {
-        switch values.count {
-        case 1:
-            clockSeconds = values[0] * 60
-        case 2:
-            clockSeconds = values[0] * 60 + values[1]
-        case 3:
-            clockSeconds = values[0] * 3600 + values[1] * 60 + values[2]
-        default:
-            return nil
-        }
-    }
-    return days * 86_400 + clockSeconds
-}
-
-/// "2 days", "1 day 12 h", "1 h 30 min", "45 s". Seconds only appear for
-/// sub-hour values; a walltime is never meaningfully "2 days 0 h 0 min 5 s".
-private func slurmDurationText(seconds total: Int) -> String {
-    let days = total / 86_400
-    let hours = total % 86_400 / 3600
-    let minutes = total % 3600 / 60
-    let seconds = total % 60
-    var parts: [String] = []
-    if days > 0 {
-        parts.append(days == 1 ? "1 day" : "\(days) days")
-    }
-    if hours > 0 {
-        parts.append("\(hours) h")
-    }
-    if minutes > 0 {
-        parts.append("\(minutes) min")
-    }
-    if seconds > 0 && days == 0 && hours == 0 {
-        parts.append("\(seconds) s")
-    }
-    return parts.isEmpty ? "0 min" : parts.joined(separator: " ")
-}
-
-// MARK: - Private splitting helpers
-
-private func splitOutsideParentheses(_ text: String, separator: Character) -> [String] {
-    var parts: [String] = []
-    var current = ""
-    var depth = 0
-    for character in text {
-        if character == "(" {
-            depth += 1
-        } else if character == ")" {
-            depth = max(depth - 1, 0)
-        }
-        if character == separator && depth == 0 {
-            parts.append(current)
-            current = ""
-        } else {
-            current.append(character)
-        }
-    }
-    if !current.isEmpty {
-        parts.append(current)
-    }
-    return parts
-}
-
-private func splitOutsideBrackets(_ text: String) -> [String] {
-    var parts: [String] = []
-    var current = ""
-    var depth = 0
-    for character in text {
-        if character == "[" {
-            depth += 1
-        } else if character == "]" {
-            depth = max(depth - 1, 0)
-        }
-        if character == "," && depth == 0 {
-            parts.append(current)
-            current = ""
-        } else {
-            current.append(character)
-        }
-    }
-    if !current.isEmpty {
-        parts.append(current)
-    }
-    return parts
 }

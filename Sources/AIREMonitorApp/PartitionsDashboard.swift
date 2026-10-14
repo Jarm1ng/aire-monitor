@@ -1,3 +1,4 @@
+import HPCCore
 import SwiftUI
 
 /// The Partitions tab for one cluster. Icons, accents, order and card
@@ -9,6 +10,11 @@ import SwiftUI
 struct PartitionsDashboard: View {
     let profile: ClusterProfile
     let partitions: [PartitionSummary]
+    /// The same snapshot's nodes, for counts by unique node: AIRE's teaching
+    /// nodes are also in `nodes`, so summing sinfo rows across partitions
+    /// counts them twice. Empty (older call sites, or a snapshot without node
+    /// rows) falls back to the summed rows and says so.
+    var nodes: [NodeSummary] = []
     // Hoisted into the cluster's ClusterDashboardState so the toggle
     // survives tab switches.
     @Binding var showDetails: Bool
@@ -25,6 +31,7 @@ struct PartitionsDashboard: View {
     var body: some View {
         // Grouped once per render; the tiles, panel and cards all read it.
         let groups = self.groups
+        let totals = PartitionTotals(partitions: partitions, nodes: nodes)
 
         VStack(alignment: .leading, spacing: 14) {
             PageHeader(
@@ -36,34 +43,35 @@ struct PartitionsDashboard: View {
                 DetailsToggleButton(showDetails: $showDetails)
             }
 
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 MetricView(
                     title: "Partitions",
                     value: "\(groups.count)",
-                    subtitle: "\(groups.filter(\.isAvailable).count) available",
+                    subtitle: "\(groups.filter(\.health.acceptsWork).count) can start jobs",
                     systemImage: "rectangle.3.group",
                     accent: .blue
                 )
                 MetricView(
                     title: "Nodes",
-                    value: "\(groups.reduce(0) { $0 + $1.totalNodes })",
-                    subtitle: "summed across partitions",
+                    value: groupedNumber(totals.nodeCount),
+                    subtitle: totals.nodeSubtitle,
                     systemImage: "server.rack",
-                    accent: .purple
+                    accent: .purple,
+                    help: totals.nodeHelp
                 )
                 MetricView(
-                    title: "GPU Capacity",
-                    value: "\(gpuCapacity)",
-                    subtitle: gpuCapacitySubtitle(groups),
+                    title: "GPU capacity",
+                    value: groupedNumber(totals.gpuTotal),
+                    subtitle: totals.gpuSubtitle,
                     systemImage: PartitionRole.gpu.systemImage,
                     accent: AppTheme.gpu
                 )
                 MetricView(
-                    title: "Maint Rows",
-                    value: "\(maintenanceRows)",
-                    subtitle: "maintenance states",
+                    title: "Unavailable nodes",
+                    value: groupedNumber(totals.unavailableNodes),
+                    subtitle: totals.unavailableSubtitle,
                     systemImage: "wrench.and.screwdriver",
-                    accent: .red
+                    accent: totals.unavailableNodes > 0 ? StatusTone.unavailable.color : .green
                 )
             }
 
@@ -76,7 +84,9 @@ struct PartitionsDashboard: View {
             } else {
                 PartitionPortfolioPanel(groups: groups)
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 270, maximum: 380), spacing: 12)], spacing: 12) {
+                // Top-aligned cells: cards of different heights in one row
+                // start on the same line instead of being centred.
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 270, maximum: 380), spacing: 12, alignment: .top)], spacing: 12) {
                     ForEach(groups) { group in
                         PartitionCard(group: group)
                     }
@@ -85,7 +95,7 @@ struct PartitionsDashboard: View {
             }
 
             if showDetails {
-                SectionHeader(title: "Partition details", subtitle: "\(partitions.count) rows")
+                SectionHeader(title: "Partition details", subtitle: pluralized(partitions.count, "row"))
                 PartitionsTable(partitions: partitions)
                     .frame(height: 300)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -93,36 +103,90 @@ struct PartitionsDashboard: View {
         }
         .animation(AppTheme.smoothEase, value: showDetails)
     }
+}
 
-    /// Configured GPUs summed over partitions (every state row carries its
-    /// own node count). A node listed in two GPU partitions would count
-    /// twice; neither Leeds cluster shares GPU nodes between partitions.
-    private var gpuCapacity: Int {
-        partitions.reduce(0) { total, row in
-            total + ((row.nodeCount ?? 0) * slurmGPUTotal(from: row.gres))
+/// Cluster-wide tile figures. Counted by unique node whenever the node list
+/// is available, so a node in two partitions counts once and maintenance
+/// reservations ("down$", "drain$") are seen; otherwise summed from sinfo
+/// rows, with subtitles that say so.
+struct PartitionTotals: Equatable {
+    let nodeCount: Int
+    let nodeSubtitle: String
+    let nodeHelp: String
+    let gpuTotal: Int
+    let gpuSubtitle: String
+    let unavailableNodes: Int
+    let unavailableSubtitle: String
+
+    init(partitions: [PartitionSummary], nodes: [NodeSummary]) {
+        if nodes.isEmpty {
+            nodeCount = partitions.reduce(0) { $0 + ($1.nodeCount ?? 0) }
+            nodeSubtitle = "summed across partitions"
+            nodeHelp = "Node counts summed across partition rows: a node in two partitions counts twice."
+            // Rows: a node listed in two partitions counts twice here.
+            gpuTotal = partitions.reduce(0) { $0 + ($1.nodeCount ?? 0) * slurmGPUTotal(from: $1.gres) }
+            var models: [String: Int] = [:]
+            var order: [String] = []
+            for row in partitions {
+                let count = (row.nodeCount ?? 0) * slurmGPUTotal(from: row.gres)
+                guard count > 0 else { continue }
+                let model = slurmGPUModelDisplayName(from: row.gres) ?? ""
+                if models[model] == nil { order.append(model) }
+                models[model, default: 0] += count
+            }
+            gpuSubtitle = Self.gpuSubtitle(order.map { ($0, models[$0] ?? 0) })
+            let unavailableRows = partitions.filter { !NodeStateInfo($0.state).isAvailable }
+            unavailableNodes = unavailableRows.reduce(0) { $0 + ($1.nodeCount ?? 0) }
+            let maintenance = unavailableRows
+                .filter { Self.isMaintenance(NodeStateInfo($0.state)) }
+                .reduce(0) { $0 + ($1.nodeCount ?? 0) }
+            unavailableSubtitle = maintenance > 0 ? "\(maintenance) in maintenance · summed rows" : "summed across partitions"
+            return
+        }
+        nodeCount = nodes.count
+        let shared = nodes.filter { $0.partitions.count > 1 }.count
+        // Short enough for a quarter of the narrowest detail column, where
+        // "11 nodes in more than one partition" was cut to "11 nodes in
+        // more than…"; the tile's tooltip carries the long form.
+        nodeSubtitle = shared > 0 ? "\(groupedNumber(shared)) in 2+ partitions" : "unique nodes"
+        nodeHelp = shared > 0
+            ? "\(pluralized(nodes.count, "node")), each counted once; \(pluralized(shared, "node")) \(shared == 1 ? "is" : "are") in more than one partition."
+            : "\(pluralized(nodes.count, "node")), each in one partition."
+        let fleet = GPUFleet(nodes: nodes)
+        gpuTotal = fleet.total
+        gpuSubtitle = Self.gpuSubtitle(fleet.pools.map { ($0.model ?? "", $0.total) })
+        let unavailable = nodes.filter { !$0.stateInfo.isAvailable }
+        unavailableNodes = unavailable.count
+        let maintenance = unavailable.filter { Self.isMaintenance($0.stateInfo) }.count
+        if unavailable.isEmpty {
+            unavailableSubtitle = "every node accepts work"
+        } else if maintenance > 0 {
+            unavailableSubtitle = "\(maintenance) in maintenance"
+        } else {
+            unavailableSubtitle = "down, drained or not responding"
         }
     }
 
-    /// Names the GPU model ("H200 GPUs configured") so a Calder figure can
-    /// never be read as AIRE L40S capacity, or vice versa.
-    private func gpuCapacitySubtitle(_ groups: [PartitionGroup]) -> String {
-        var models: [String] = []
-        for group in groups where group.gpusPerNode > 0 {
-            if let model = group.gpuModel, !models.contains(model) {
-                models.append(model)
-            }
+    /// "42 L40S configured", "56 H200 + 3 L40" — each model named with its
+    /// own count, never one anonymous sum.
+    private static func gpuSubtitle(_ models: [(String, Int)]) -> String {
+        guard !models.isEmpty else {
+            return "no GPU nodes"
         }
-        if gpuCapacity == 0 {
-            return "no GPU partitions"
-        }
-        if models.isEmpty {
+        if models.count == 1, models[0].0.isEmpty {
             return "configured GPUs"
         }
-        return "\(models.joined(separator: " + ")) GPUs configured"
+        let named = models
+            .map { model, count in model.isEmpty ? "\(count) other" : "\(count) \(model)" }
+            .joined(separator: " + ")
+        // "configured" only fits beside one model: "56 H200 + 3 L40
+        // configured" truncates in a quarter of the narrowest column, and
+        // the tile's title already says it is capacity.
+        return models.count == 1 ? named + " configured" : named
     }
 
-    private var maintenanceRows: Int {
-        partitions.filter { $0.state.lowercased().contains("maint") }.count
+    private static func isMaintenance(_ info: NodeStateInfo) -> Bool {
+        info.maintenanceReservation || info.base == .maintenance
     }
 }
 
@@ -173,16 +237,27 @@ struct PartitionGroup: Identifiable {
         } else {
             role = .cpu
         }
+        health = PartitionHealth(rows: rows)
+        sortedRows = rows.sorted { lhs, rhs in
+            let left = NodeStateInfo(lhs.state).displayRank
+            let right = NodeStateInfo(rhs.state).displayRank
+            return left != right ? left < right : lhs.state < rhs.state
+        }
     }
 
     var id: String { name }
 
+    /// Whether the partition can start work now, from both sinfo's
+    /// administrative flag (%a) and the state of its nodes.
+    let health: PartitionHealth
+
+    /// State rows in display order: busy, idle, then unavailable flavours.
+    let sortedRows: [PartitionSummary]
+
+    /// Nodes in this partition. Rows of ONE partition never overlap, so the
+    /// sum is exact here (unlike a sum across partitions).
     var totalNodes: Int {
         rows.reduce(0) { $0 + ($1.nodeCount ?? 0) }
-    }
-
-    var isAvailable: Bool {
-        rows.contains { $0.availability == "up" }
     }
 
     var cpusPerNode: Int? {
@@ -274,6 +349,107 @@ struct PartitionGroup: Identifiable {
     }
 }
 
+/// Whether a partition can start a job now. sinfo's availability column
+/// (%a) is only the administrative switch: a partition whose every node is
+/// drained still reports "up", so node states decide the rest.
+enum PartitionHealth: Equatable {
+    /// Up, and every node accepts work.
+    case up
+    /// Up, but only some nodes accept work.
+    case degraded(usable: Int, total: Int)
+    /// Up, but no node can start anything (all drained, down, reserved…).
+    case noUsableNodes(total: Int)
+    /// Administratively not "up": the %a text ("down", "drain", "inact").
+    case down(String)
+
+    init(rows: [PartitionSummary]) {
+        let upRows = rows.filter { $0.availability.trimmingCharacters(in: .whitespaces).lowercased() == "up" }
+        guard !upRows.isEmpty else {
+            let state = rows.lazy
+                .map { $0.availability.trimmingCharacters(in: .whitespaces).lowercased() }
+                .first { !$0.isEmpty } ?? "down"
+            self = .down(state == "inact" ? "inactive" : state)
+            return
+        }
+        // A row without a node count (older caches) still stands for at
+        // least one node; counting it as zero would read "no usable nodes".
+        let total = rows.reduce(0) { $0 + max($1.nodeCount ?? 1, 0) }
+        let usable = upRows
+            .filter { NodeStateInfo($0.state).isAvailable }
+            .reduce(0) { $0 + max($1.nodeCount ?? 1, 0) }
+        if usable == 0 {
+            self = .noUsableNodes(total: total)
+        } else if usable < total {
+            self = .degraded(usable: usable, total: total)
+        } else {
+            self = .up
+        }
+    }
+
+    /// Up or degraded: a job submitted here can start without waiting for
+    /// an administrator.
+    var acceptsWork: Bool {
+        switch self {
+        case .up, .degraded:
+            return true
+        case .noUsableNodes, .down:
+            return false
+        }
+    }
+
+    /// Every node out of service (drained, down, reserved) is the
+    /// "accepts no work" class the palette draws grey everywhere (the
+    /// Unavailable nodes tile, a wholly unavailable GPU pool's header chip,
+    /// the capacity signal), not an alarm; red is kept for a partition
+    /// Slurm itself reports down or inactive.
+    var tone: StatusTone {
+        switch self {
+        case .up: return .normal
+        case .degraded: return .warning
+        case .noUsableNodes: return .unavailable
+        case .down: return .critical
+        }
+    }
+
+    /// Portfolio-row text: "up", "up · 5 of 7 usable", "no usable nodes",
+    /// "down".
+    var label: String {
+        switch self {
+        case .up:
+            return "up"
+        case let .degraded(usable, total):
+            return "up · \(usable) of \(total) usable"
+        case .noUsableNodes:
+            return "no usable nodes"
+        case .down(let state):
+            return state
+        }
+    }
+
+    /// Short pill text for cards.
+    var pillText: String {
+        switch self {
+        case .up: return "Up"
+        case let .degraded(usable, total): return "\(usable) of \(total) usable"
+        case .noUsableNodes: return "No usable nodes"
+        case .down(let state): return state
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .up:
+            return "The partition is up and every node accepts work."
+        case let .degraded(usable, total):
+            return "Up, but only \(usable) of \(total) nodes accept work; the rest are drained, down or reserved."
+        case .noUsableNodes(let total):
+            return "The partition is up, but none of its \(pluralized(total, "node")) accepts work (drained, down or reserved), so jobs submitted here wait."
+        case .down(let state):
+            return "Slurm reports the partition as \(state): jobs can be submitted but will not start."
+        }
+    }
+}
+
 struct PartitionPortfolioPanel: View {
     let groups: [PartitionGroup]
 
@@ -342,23 +518,32 @@ struct PartitionPortfolioRow: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
+                    // One line, never "calder-\ngpu-hopper": the name has
+                    // first claim on the row, and the node count and walltime
+                    // (both repeated on the partition's card) give way
+                    // before it would wrap.
                     Text(group.name)
                         .font(.callout.weight(.semibold))
-                    Text("\(group.totalNodes) nodes")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    if let walltime {
-                        Label(walltime, systemImage: "timer")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .help("Maximum walltime")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(1)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            nodeCountText
+                            walltimeLabel
+                        }
+                        nodeCountText
+                        Color.clear.frame(width: 0, height: 0)
                     }
-                    Spacer()
-                    Text(group.isAvailable ? "up" : "down")
+                    Spacer(minLength: 6)
+                    Text(group.health.label)
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(group.isAvailable ? .green : .red)
+                        .foregroundStyle(group.health.tone.color)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .help(group.health.help)
                 }
-                PartitionStateBar(rows: group.rows)
+                PartitionStateBar(rows: group.sortedRows)
             }
         }
         .padding(8)
@@ -377,8 +562,28 @@ struct PartitionPortfolioRow: View {
         group.timeLimit.map(formatSlurmTimeLimit)
     }
 
+    private var nodeCountText: some View {
+        Text(pluralized(group.totalNodes, "node"))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize()
+    }
+
+    @ViewBuilder
+    private var walltimeLabel: some View {
+        if let walltime {
+            Label(walltime, systemImage: "timer")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+                .help("Maximum walltime")
+        }
+    }
+
     private var accessibilityValue: String {
-        var parts = ["\(group.totalNodes) nodes", group.isAvailable ? "up" : "down"]
+        var parts = [pluralized(group.totalNodes, "node"), group.health.label]
         if let walltime {
             parts.append("maximum walltime \(walltime)")
         }
@@ -410,25 +615,32 @@ struct PartitionCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                StatePill(state: group.isAvailable ? "up" : "down")
+                StatusCapsule(text: group.health.pillText, color: group.health.tone.color, help: group.health.help)
             }
 
-            PartitionStateBar(rows: group.rows)
+            PartitionStateBar(rows: group.sortedRows)
 
             VStack(spacing: 6) {
-                ForEach(group.rows.sorted { $0.state < $1.state }) { row in
+                ForEach(group.sortedRows) { row in
+                    let info = NodeStateInfo(row.state)
                     HStack {
                         Circle()
-                            .fill(colorForState(row.state))
+                            .fill(SlurmState(node: info).color)
                             .frame(width: 7, height: 7)
-                        Text(row.state)
+                        // Plain words ("Drained · not responding"); the raw
+                        // sinfo code ("drain*") stays in the tooltip.
+                        Text(info.legendText)
+                            .lineLimit(1)
                         Spacer()
                         Text("\(row.nodeCount ?? 0)")
                             .monospacedDigit()
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .accessibilityElement(children: .combine)
+                    .help(info.helpText)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(info.legendText)
+                    .accessibilityValue(pluralized(row.nodeCount ?? 0, "node"))
                 }
             }
 
@@ -453,14 +665,17 @@ struct PartitionCard: View {
                         .help("CPU cores per node")
                 }
                 if let mem = group.memoryMBPerNode {
-                    // Slurm reports MiB; formatGB is 1024-based throughout the app.
-                    Label(formatGB(Double(mem) / 1024), systemImage: "memorychip")
+                    // Slurm reports MiB; sizes are 1024-based throughout the app.
+                    Label(formatMemoryGB(Double(mem) / 1024), systemImage: "memorychip")
                         .help("Memory per node")
                 }
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
         }
+        // Fill the grid row so cards beside a taller one keep a common top
+        // and bottom edge.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .dashboardCard(accent: group.accent)
         .overlay(alignment: .top) {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -485,18 +700,18 @@ struct PartitionCard: View {
 }
 
 struct PartitionStateBar: View {
+    /// Rows in display order (`PartitionGroup.sortedRows`).
     let rows: [PartitionSummary]
 
     private var segments: [MeterSegment] {
-        rows.sorted { $0.state < $1.state }
-            .enumerated()
-            .map { index, row in
-                MeterSegment(
-                    id: "\(index)-\(row.state)",
-                    value: max(row.nodeCount ?? 0, 0),
-                    color: colorForState(row.state)
-                )
-            }
+        rows.enumerated().map { index, row in
+            let info = NodeStateInfo(row.state)
+            return MeterSegment(
+                id: "\(index)-\(info.legendText)",
+                value: max(row.nodeCount ?? 0, 0),
+                color: SlurmState(node: info).color
+            )
+        }
     }
 
     var body: some View {
@@ -504,8 +719,7 @@ struct PartitionStateBar: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Node states")
             .accessibilityValue(
-                rows.sorted { $0.state < $1.state }
-                    .map { "\($0.nodeCount ?? 0) \($0.state)" }
+                rows.map { "\($0.nodeCount ?? 0) \(NodeStateInfo($0.state).legendText)" }
                     .joined(separator: ", ")
             )
     }

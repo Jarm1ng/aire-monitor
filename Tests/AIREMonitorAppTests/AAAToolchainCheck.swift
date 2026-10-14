@@ -1,3 +1,4 @@
+import HPCCore
 // Named to sort first: a missing module is a fatal error that stops the
 // compiler before it parses later files, so this hint must be parsed before
 // any file that imports Testing. Without it the only message is "no such

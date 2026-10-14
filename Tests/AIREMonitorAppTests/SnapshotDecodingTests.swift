@@ -1,3 +1,4 @@
+import HPCCore
 import Foundation
 import Testing
 @testable import AIREMonitorApp

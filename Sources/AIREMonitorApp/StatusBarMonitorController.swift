@@ -1,10 +1,11 @@
+import HPCCore
 import AppKit
 import Combine
 import SwiftUI
 
-/// Owns the menu-bar status item. Its title summarises every enabled
-/// cluster at once ("C · train 1:23", "3 jobs", "A 6 · C 27"), its icon tint
-/// shows combined connection health, and its menu hosts MenuBarMonitorView.
+/// Owns the menu-bar status item. Its title summarises every live cluster at
+/// once ("C · train 1h 23m", "3 jobs", "A 6 · C 27"), its icon tint shows
+/// combined connection health, and its menu hosts MenuBarMonitorView.
 @MainActor
 final class StatusBarMonitorController: NSObject {
     static let shared = StatusBarMonitorController()
@@ -12,15 +13,14 @@ final class StatusBarMonitorController: NSObject {
     private var model: AppModel?
     private var statusItem: NSStatusItem?
     private var menu: NSMenu?
-    private var menuHostingView: NSHostingView<MenuBarMonitorView>?
+    private var menuHostingView: NSHostingView<StatusMenuRootView>?
+    /// Feeds the open dropdown the digest built for the status item.
+    private var digestStore: MenuBarDigestStore?
     private var cancellables = Set<AnyCancellable>()
     private var lastSignature = ""
     private var isUpdateScheduled = false
     private var isMenuOpen = false
-
-    private let statusFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-    private let minItemLength: CGFloat = 56
-    private let maxItemLength: CGFloat = 160
+    private var isMenuContentAttached = false
 
     private override init() {
         super.init()
@@ -29,15 +29,15 @@ final class StatusBarMonitorController: NSObject {
     func configure(model: AppModel) {
         self.model = model
         installStatusItemIfNeeded()
-        installMenu(model: model)
+        installMenuIfNeeded()
         bindModel(model)
         lastSignature = ""
         updateStatusItem()
     }
 
     /// Dismisses the status-bar menu, so actions that activate other windows
-    /// (Open dashboard, Widget) do not fight an in-progress menu tracking
-    /// session.
+    /// (Open dashboard, Widget, Quit) do not fight an in-progress menu
+    /// tracking session.
     func closeMenu() {
         menu?.cancelTracking()
     }
@@ -53,22 +53,24 @@ final class StatusBarMonitorController: NSObject {
         // handles menu-bar appearance (light/dark), vibrancy, and the
         // standard click highlight.
         button.title = "HPC"
-        button.font = statusFont
+        button.font = StatusItemLayout.font
         button.imagePosition = .imageLeading
         button.imageHugsTitle = true
         button.toolTip = "Leeds HPC Monitor"
-        (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
+        // StatusBarSummary already fits the title to the item; should that
+        // ever fall short, cut the job name's middle, not the elapsed time.
+        (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingMiddle
     }
 
-    private func installMenu(model: AppModel) {
-        let rootView = makeMenuView(model: model)
-        if let menuHostingView {
-            // Re-entrant configure: reuse the existing menu, just swap the model.
-            menuHostingView.rootView = rootView
+    private func installMenuIfNeeded() {
+        guard menuHostingView == nil else {
+            // Re-entrant configure: the next open builds the content
+            // against the new model.
+            detachMenuContent()
             return
         }
 
-        let hostingView = NSHostingView(rootView: rootView)
+        let hostingView = NSHostingView(rootView: StatusMenuRootView(content: nil))
         hostingView.sizingOptions = [.preferredContentSize]
         hostingView.setFrameSize(hostingView.fittingSize)
 
@@ -85,17 +87,45 @@ final class StatusBarMonitorController: NSObject {
         menuHostingView = hostingView
     }
 
-    private func makeMenuView(model: AppModel) -> MenuBarMonitorView {
-        MenuBarMonitorView(model: model) { [weak self] in
-            self?.closeMenu()
+    /// Builds the dropdown just before it is shown. While the menu is
+    /// closed the hosting view holds an empty placeholder, so nothing in it
+    /// observes or re-renders on the many model changes nobody would see.
+    private func attachMenuContent() {
+        guard let model, let menuHostingView, !isMenuContentAttached else {
+            return
         }
+        let digest = MenuBarDigest(model: model)
+        let store = digestStore ?? MenuBarDigestStore(digest: digest)
+        store.update(digest)
+        digestStore = store
+        menuHostingView.rootView = StatusMenuRootView(
+            content: MenuBarMonitorView(model: model, store: store) { [weak self] in
+                self?.closeMenu()
+            }
+        )
+        isMenuContentAttached = true
+        fitMenuPanel()
     }
 
+    private func detachMenuContent() {
+        guard isMenuContentAttached else {
+            return
+        }
+        menuHostingView?.rootView = StatusMenuRootView(content: nil)
+        isMenuContentAttached = false
+    }
+
+    /// Listens to the coordinator AND to every session directly: the
+    /// coordinator forwards session changes today, but the status item must
+    /// keep up even if that app-wide forwarding (which re-renders every
+    /// observer of AppModel) is narrowed. Bursts are coalesced below.
     private func bindModel(_ model: AppModel) {
         cancellables.removeAll()
-        model.objectWillChange
+        let changes = [model.objectWillChange.map { _ in () }.eraseToAnyPublisher()]
+            + model.sessions.map { $0.objectWillChange.map { _ in () }.eraseToAnyPublisher() }
+        Publishers.MergeMany(changes)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] in
                 // The queue hop above guarantees main-thread delivery (and
                 // keeps flowing during menu tracking, unlike RunLoop.main).
                 MainActor.assumeIsolated {
@@ -105,10 +135,9 @@ final class StatusBarMonitorController: NSObject {
             .store(in: &cancellables)
     }
 
-    /// Coalesces bursts of model changes into one summary rebuild. A single
-    /// refresh publishes several properties per cluster and AppModel
-    /// forwards every one of them, so without this the digest of every
-    /// cluster would be rebuilt once per property.
+    /// Coalesces bursts of model changes into one digest rebuild. A single
+    /// refresh publishes several properties per cluster, so without this the
+    /// digest of every cluster would be rebuilt once per property.
     private func scheduleStatusUpdate() {
         guard !isUpdateScheduled else { return }
         isUpdateScheduled = true
@@ -117,17 +146,29 @@ final class StatusBarMonitorController: NSObject {
                 guard let self else { return }
                 self.isUpdateScheduled = false
                 self.updateStatusItem()
-                if self.isMenuOpen {
-                    self.fitMenuPanel()
-                }
             }
         }
     }
 
+    /// Rebuilds the digest once and hands the same value to the status item
+    /// and, while it is open, the dropdown.
     private func updateStatusItem() {
         guard let model, let button = statusItem?.button else { return }
 
-        let summary = StatusBarSummary(digest: MenuBarDigest(model: model))
+        let digest = MenuBarDigest(model: model)
+        if isMenuOpen {
+            digestStore?.update(digest)
+            fitMenuPanel()
+            // SwiftUI applies the store change on its next pass; fit again
+            // once it has, so a section that grew is not clipped.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.fitMenuPanel()
+                }
+            }
+        }
+
+        let summary = StatusBarSummary(digest: digest)
         // Only touch the button when something visible changed: AppKit
         // re-lays out the whole status bar on every title/image change.
         let signature = summary.signature
@@ -139,17 +180,7 @@ final class StatusBarMonitorController: NSObject {
         button.title = summary.title
         button.toolTip = summary.tooltip
         button.setAccessibilityLabel(summary.accessibilityLabel)
-        statusItem?.length = reservedLength(for: summary, hasIcon: image != nil)
-    }
-
-    /// Width computed from a digit-stable template of the title so the status
-    /// item does not resize on every elapsed-time tick or idle-GPU change.
-    private func reservedLength(for summary: StatusBarSummary, hasIcon: Bool) -> CGFloat {
-        let template = summary.widthTemplateTitle as NSString
-        let textWidth = ceil(template.size(withAttributes: [.font: statusFont]).width)
-        let iconWidth: CGFloat = hasIcon ? 20 : 0
-        let padding: CGFloat = 16
-        return min(max(iconWidth + textWidth + padding, minItemLength), maxItemLength)
+        statusItem?.length = summary.reservedLength(hasIcon: image != nil)
     }
 
     /// Resizes the hosted dropdown to its content. A cluster connecting or
@@ -164,14 +195,24 @@ final class StatusBarMonitorController: NSObject {
 }
 
 extension StatusBarMonitorController: NSMenuDelegate {
+    nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
+        // Called before the menu is laid out for display: the earliest point
+        // to attach the real content, so the first frame has its full size.
+        MainActor.assumeIsolated {
+            attachMenuContent()
+        }
+    }
+
     nonisolated func menuWillOpen(_ menu: NSMenu) {
         // NSMenu delegate callbacks always arrive on the main thread.
         MainActor.assumeIsolated {
             isMenuOpen = true
+            attachMenuContent()
             fitMenuPanel()
-            // Each session's refresh() self-guards on isRefreshing and
-            // isLoggingIn, so opening the menu shows data at most a few
-            // seconds old without ever starting a sign-in.
+            // Each session's refresh self-guards (pause, sign-in, never
+            // connected), so opening the menu shows data at most a few
+            // seconds old without ever starting a sign-in or painting an
+            // error on a cluster the user is not using.
             model?.refreshAllQuietly()
         }
     }
@@ -179,253 +220,29 @@ extension StatusBarMonitorController: NSMenuDelegate {
     nonisolated func menuDidClose(_ menu: NSMenu) {
         MainActor.assumeIsolated {
             isMenuOpen = false
+            // Deferred: a footer action that closed the menu may still be
+            // unwinding inside the hosted SwiftUI view.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.isMenuOpen else { return }
+                    self.detachMenuContent()
+                }
+            }
         }
     }
 }
 
-/// What the status item shows, derived from the shared menu bar digest.
-private struct StatusBarSummary {
-    let digest: MenuBarDigest
-    let mode: Mode
+/// The menu item's root view: the dropdown while the menu is open, an
+/// inert placeholder of the same width while it is closed.
+private struct StatusMenuRootView: View {
+    let content: MenuBarMonitorView?
 
-    enum Mode {
-        /// Exactly one running job across all enabled clusters.
-        case singleJob(cluster: MenuBarClusterDigest, job: Job)
-        /// Several running jobs (on one or more clusters).
-        case multipleJobs(count: Int)
-        /// No running jobs: idle GPUs of each cluster that has a snapshot.
-        /// Pools stay separate (L40S and H200 are different hardware).
-        case idleGPUs([(cluster: MenuBarClusterDigest, pool: MenuBarGPUPool)])
-        case idle(IdleState)
-    }
-
-    enum IdleState {
-        case off
-        case signingIn
-        case syncing
-        case ready
-        case cached
-        case offline
-
-        var title: String {
-            switch self {
-            case .off: return "Off"
-            case .signingIn: return "Signing in"
-            case .syncing: return "Syncing"
-            case .ready: return "Ready"
-            case .cached: return "Cached"
-            case .offline: return "Offline"
-            }
-        }
-    }
-
-    init(digest: MenuBarDigest) {
-        self.digest = digest
-        let enabled = digest.enabled
-        let running = digest.runningCount
-        if running == 1, let primary = digest.primaryRunningJob {
-            mode = .singleJob(cluster: primary.cluster, job: primary.job)
-        } else if running > 1 {
-            mode = .multipleJobs(count: running)
+    var body: some View {
+        if let content {
+            content
         } else {
-            let pools = enabled.compactMap { cluster in
-                cluster.gpu.map { (cluster: cluster, pool: $0) }
-            }
-            if !pools.isEmpty {
-                mode = .idleGPUs(pools)
-            } else if enabled.isEmpty {
-                mode = .idle(.off)
-            } else if enabled.contains(where: { $0.state.isBusy }) {
-                mode = .idle(.signingIn)
-            } else if enabled.contains(where: \.isRefreshing), !enabled.contains(where: \.hasSnapshot) {
-                mode = .idle(.syncing)
-            } else if enabled.contains(where: \.isLive) {
-                mode = .idle(.ready)
-            } else if enabled.contains(where: \.hasSnapshot) {
-                mode = .idle(.cached)
-            } else {
-                mode = .idle(.offline)
-            }
+            Color.clear
+                .frame(width: MenuBarMonitorView.panelWidth, height: 1)
         }
-    }
-
-    var title: String {
-        switch mode {
-        case .singleJob(let cluster, let job):
-            return "\(cluster.profile.monogram) · \(Self.jobTitle(job)) \(job.elapsed)".statusTrimmed
-        case .multipleJobs(let count):
-            return "\(count) jobs"
-        case .idleGPUs(let pools):
-            return pools.map { "\($0.cluster.profile.monogram) \($0.pool.idle)" }.joined(separator: " · ")
-        case .idle(let state):
-            return state.title
-        }
-    }
-
-    /// `title` with every changing digit replaced by a fixed-width
-    /// placeholder (elapsed padded to at least h:mm:ss, GPU counts to two
-    /// digits), so the reserved width only changes when the job or the
-    /// cluster set changes - not on every refresh tick.
-    var widthTemplateTitle: String {
-        switch mode {
-        case .singleJob(let cluster, let job) where !job.elapsed.isEmpty:
-            return "\(cluster.profile.monogram) · \(Self.jobTitle(job)) \(elapsedWidthTemplate(job.elapsed))".statusTrimmed
-        case .idleGPUs(let pools):
-            return pools.map { "\($0.cluster.profile.monogram) \(countWidthTemplate($0.pool.idle))" }
-                .joined(separator: " · ")
-        default:
-            return title
-        }
-    }
-
-    var iconName: String {
-        switch mode {
-        case .singleJob, .multipleJobs:
-            return "play.circle.fill"
-        case .idleGPUs:
-            return "bolt.horizontal.circle.fill"
-        case .idle(.off):
-            return "pause.circle"
-        case .idle(.signingIn), .idle(.syncing):
-            return "arrow.triangle.2.circlepath"
-        case .idle(.ready), .idle(.cached):
-            return "server.rack"
-        case .idle(.offline):
-            return "wifi.slash"
-        }
-    }
-
-    /// Combined connection health: green when every enabled cluster is
-    /// live, orange when only some are (or data is cached/paused, or a
-    /// sign-in is running), red when nothing is live and a cluster reports
-    /// an error, dimmed when simply offline. nil (template image) when
-    /// monitoring is off everywhere, so the icon blends in.
-    var tint: NSColor? {
-        switch digest.health {
-        case .off: return nil
-        case .allLive: return .systemGreen
-        case .partial, .connecting: return .systemOrange
-        case .failing: return .systemRed
-        case .offline: return .secondaryLabelColor
-        }
-    }
-
-    var image: NSImage? {
-        let base = NSImage(systemSymbolName: iconName, accessibilityDescription: "Leeds HPC Monitor status")
-        var configuration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
-        if let tint {
-            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-        }
-        let image = base?.withSymbolConfiguration(configuration)
-        image?.isTemplate = tint == nil
-        return image
-    }
-
-    /// One block per cluster, then the shared home quota once. Deliberately
-    /// free of relative ages: those would change the signature every second
-    /// and defeat the redraw skipping.
-    var tooltip: String {
-        var lines = [headline]
-        for cluster in digest.clusters {
-            lines.append("\(cluster.displayName) — \(cluster.connectionText)")
-            if let signIn = cluster.signInText {
-                lines.append("  \(signIn)")
-            }
-            guard cluster.isEnabled, cluster.hasSnapshot else {
-                continue
-            }
-            lines.append("  \(cluster.runningJobs.count) running, \(cluster.pendingJobs.count) pending")
-            if let pool = cluster.gpu {
-                lines.append("  \(pool.idle) of \(pool.total) \(pool.title) free")
-            }
-            let pressure = cluster.storage.compactMap(\.pressureText)
-            if !pressure.isEmpty {
-                lines.append("  " + pressure.joined(separator: ", "))
-            }
-        }
-        if let home = digest.sharedHome, let pressure = home.row.pressureText {
-            lines.append("\(pressure) (\(home.sharedByText), counted once)")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    var accessibilityLabel: String {
-        switch mode {
-        case .singleJob(let cluster, let job):
-            return "\(Self.jobDisplayName(job)) running on \(cluster.displayName) for \(job.elapsed)"
-        case .multipleJobs(let count):
-            return "\(count) running jobs: \(runningBreakdown)"
-        case .idleGPUs(let pools):
-            let parts = pools.map { "\($0.cluster.displayName) \($0.pool.idle) \($0.pool.title)" }
-            return "Idle GPUs: \(parts.joined(separator: ", "))"
-        case .idle(let state):
-            return "Leeds HPC Monitor: \(state.title)"
-        }
-    }
-
-    var signature: String {
-        [
-            title,
-            widthTemplateTitle,
-            iconName,
-            tint?.description ?? "template",
-            tooltip,
-            accessibilityLabel
-        ].joined(separator: "|")
-    }
-
-    private var headline: String {
-        switch mode {
-        case .singleJob(let cluster, let job):
-            return "\(Self.jobDisplayName(job)) on \(cluster.displayName) has been running for \(job.elapsed)"
-        case .multipleJobs(let count):
-            var text = "\(count) running jobs — \(runningBreakdown)"
-            if let primary = digest.primaryRunningJob {
-                text += " (latest: \(Self.jobDisplayName(primary.job)) on \(primary.cluster.displayName))"
-            }
-            return text
-        case .idleGPUs, .idle:
-            return "Leeds HPC Monitor — \(digest.headerStatusLine)"
-        }
-    }
-
-    /// "AIRE 1, Calder 2": running jobs per cluster, never as one bare sum.
-    private var runningBreakdown: String {
-        digest.enabled
-            .filter { !$0.runningJobs.isEmpty }
-            .map { "\($0.displayName) \($0.runningJobs.count)" }
-            .joined(separator: ", ")
-    }
-
-    private static func jobDisplayName(_ job: Job) -> String {
-        let name = job.name.statusTrimmed
-        return name.isEmpty ? "Job \(job.jobId)" : name
-    }
-
-    /// Short enough that monogram + name + h:mm:ss fits the item width cap.
-    private static func jobTitle(_ job: Job) -> String {
-        shortened(job.name.statusTrimmed.isEmpty ? "job" : job.name, limit: 12)
-    }
-}
-
-private func elapsedWidthTemplate(_ elapsed: String) -> String {
-    let mapped = String(elapsed.map { $0.isNumber ? "8" : $0 })
-    return mapped.count >= 7 ? mapped : "8:88:88"
-}
-
-private func countWidthTemplate(_ count: Int) -> String {
-    String(repeating: "8", count: max(String(count).count, 2))
-}
-
-private func shortened(_ value: String, limit: Int) -> String {
-    let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard cleaned.count > limit else { return cleaned }
-    let end = cleaned.index(cleaned.startIndex, offsetBy: max(limit - 1, 1))
-    return "\(cleaned[..<end])…"
-}
-
-private extension String {
-    var statusTrimmed: String {
-        trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
