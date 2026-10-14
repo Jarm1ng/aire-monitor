@@ -1,27 +1,12 @@
+import HPCCore
 import Foundation
-import UserNotifications
 import os
-
-private let cacheLogger = Logger(subsystem: "HPCMonitor", category: "SnapshotCache")
 
 // ISO8601DateFormatter is documented as thread-safe; share one instance
 // instead of allocating a formatter per call.
 nonisolated(unsafe) private let iso8601Formatter = ISO8601DateFormatter()
 
-struct JobStateRecord: Codable {
-    let jobId: String
-    let name: String
-    let partition: String
-    let state: String
-    let lastSeenAt: String
-}
-
-struct JobStateSnapshot: Codable {
-    let updatedAt: String
-    let jobs: [String: JobStateRecord]
-}
-
-struct TrendPoint: Codable, Identifiable {
+struct TrendPoint: Codable, Identifiable, Equatable, Sendable {
     let collectedAt: String
     let totalJobs: Int
     let runningJobs: Int
@@ -37,6 +22,11 @@ struct TrendPoint: Codable, Identifiable {
     // Optional so history files written before flash was collected decode.
     let flashUsedPercent: Double?
     let flashAvailableGB: Double?
+    /// GPUs whose allocation was unknown at this point (node_details failed
+    /// or was cut). They are in `gpuTotal` but neither allocated nor idle,
+    /// so a point with unknown GPUs must not be drawn as a utilisation
+    /// figure. nil in history written before this field existed.
+    var gpuUnknown: Int? = nil
 
     var id: String { collectedAt }
 }
@@ -51,7 +41,7 @@ private enum JSONFile {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
-            cacheLogger.error(
+            Log.cache.error(
                 "Failed to decode \(url.lastPathComponent, privacy: .public); moving corrupt file aside: \(String(describing: error), privacy: .public)"
             )
             let quarantineURL = url.appendingPathExtension("bad")
@@ -61,12 +51,19 @@ private enum JSONFile {
         }
     }
 
-    static func write<T: Encodable>(_ value: T, to url: URL) throws {
+    /// `pretty` only for small files a person may read or edit
+    /// (preferences, collector invocation, the widget lease). Machine-only
+    /// files are written compactly: the snapshot is rewritten every refresh.
+    static func write<T: Encodable>(_ value: T, to url: URL, pretty: Bool = false) throws {
+        let data = try (pretty ? JSONEncoder.prettySorted : JSONEncoder.compact).encode(value)
+        try writeData(data, to: url)
+    }
+
+    static func writeData(_ data: Data, to url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let data = try JSONEncoder.prettySorted.encode(value)
         try data.write(to: url, options: .atomic)
     }
 }
@@ -75,7 +72,19 @@ private enum JSONFile {
 /// own snapshot, history and job-state baseline: Slurm job ids are only
 /// unique within one cluster, so a shared baseline would mis-fire
 /// start/end notifications across clusters.
-struct SnapshotCache {
+///
+/// All methods are synchronous file operations. The running app calls the
+/// writers only through `ClusterCacheWriter` (a serial background queue),
+/// never on the main actor during a refresh.
+struct SnapshotCache: Sendable {
+    /// Points kept in memory and in the history log after compaction: 4 h
+    /// at the 10 s cadence. Trends draws the most recent part; Storage uses
+    /// all of it.
+    static let historyCapacity = 1440
+    /// Lines the append-only history log may grow past the capacity before
+    /// it is rewritten: about one rewrite an hour at the 10 s cadence.
+    static let historyCompactionSlack = 360
+
     let projectRoot: String
     let clusterID: ClusterID
 
@@ -93,71 +102,186 @@ struct SnapshotCache {
         directoryURL.appendingPathComponent("latest_snapshot.json")
     }
 
-    private var jobStateURL: URL {
-        directoryURL.appendingPathComponent("job_state.json")
+    var appStateURL: URL {
+        directoryURL.appendingPathComponent(ClusterAppState.fileName)
     }
 
-    private var historyURL: URL {
+    /// Append-only history: one compact TrendPoint per line.
+    var historyLogURL: URL {
+        directoryURL.appendingPathComponent("snapshot_history.jsonl")
+    }
+
+    /// The pre-jsonl history (one pretty-printed array rewritten on every
+    /// refresh). Read once and migrated into the log by the first rewrite.
+    var legacyHistoryURL: URL {
         directoryURL.appendingPathComponent("snapshot_history.json")
+    }
+
+    private var jobStateURL: URL {
+        directoryURL.appendingPathComponent("job_state.json")
     }
 
     private var collectorURL: URL {
         directoryURL.appendingPathComponent("collector.json")
     }
 
+    // MARK: Snapshot
+
     func loadLatestSnapshot() -> ClusterSnapshot? {
         JSONFile.decodeQuarantining(ClusterSnapshot.self, from: latestSnapshotURL)
     }
 
+    /// Rewritten after every refresh, even when only `collected_at` moved:
+    /// the desktop widget shows this file and dates it by its contents.
     func saveLatestSnapshot(_ snapshot: ClusterSnapshot) throws {
         try JSONFile.write(snapshot, to: latestSnapshotURL)
     }
 
-    func loadHistory() -> [TrendPoint] {
-        JSONFile.decodeQuarantining([TrendPoint].self, from: historyURL) ?? []
+    // MARK: History
+
+    struct HistoryLog: Equatable {
+        /// Deduplicated by collection time, oldest first, capped.
+        var points: [TrendPoint]
+        /// Lines currently in the jsonl log (what a rewrite would shrink).
+        var lineCount: Int
+        /// The legacy JSON array exists, or the log holds malformed lines or
+        /// more lines than the capacity: the next write should be a rewrite.
+        var needsCompaction: Bool
     }
 
-    func recordHistory(from snapshot: ClusterSnapshot) throws -> [TrendPoint] {
-        var history = loadHistory()
-        let point = TrendPoint(snapshot: snapshot)
+    func loadHistoryLog(capacity: Int = SnapshotCache.historyCapacity) -> HistoryLog {
+        let fileManager = FileManager.default
+        var points: [TrendPoint] = []
+        let hasLegacy = fileManager.fileExists(atPath: legacyHistoryURL.path)
+        if hasLegacy {
+            points = JSONFile.decodeQuarantining([TrendPoint].self, from: legacyHistoryURL) ?? []
+        }
+        var lineCount = 0
+        var malformed = 0
+        if let data = try? Data(contentsOf: historyLogURL) {
+            let decoder = JSONDecoder()
+            for line in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+                lineCount += 1
+                // A torn last line (crash mid-append) or a hand edit costs
+                // one point, never the whole history.
+                if let point = try? decoder.decode(TrendPoint.self, from: Data(line)) {
+                    points.append(point)
+                } else {
+                    malformed += 1
+                }
+            }
+        }
+        if malformed > 0 {
+            Log.cache.error(
+                "Skipped \(malformed, privacy: .public) malformed line(s) in \(clusterID.rawValue, privacy: .public)/snapshot_history.jsonl"
+            )
+        }
         // Dedupe by membership, not just the last entry: a stale collectedAt
-        // can reappear non-adjacently after an error gap, and TrendPoint.id is
-        // collectedAt, so duplicates would break SwiftUI identity.
-        let seenTimestamps = Set(history.map(\.collectedAt))
-        if !seenTimestamps.contains(point.collectedAt) {
-            history.append(point)
+        // can reappear non-adjacently after an error gap, and TrendPoint.id
+        // is collectedAt, so duplicates would break SwiftUI identity.
+        var seen = Set<String>()
+        points = points.filter { seen.insert($0.collectedAt).inserted }
+        if points.count > capacity {
+            points = Array(points.suffix(capacity))
         }
-        if history.count > 1440 {
-            history = Array(history.suffix(1440))
+        return HistoryLog(
+            points: points,
+            lineCount: lineCount,
+            needsCompaction: hasLegacy || malformed > 0 || lineCount > capacity
+        )
+    }
+
+    func loadHistory() -> [TrendPoint] {
+        loadHistoryLog().points
+    }
+
+    /// Appends one point as one line: O(1) per refresh, where the old
+    /// format re-read, re-encoded and atomically rewrote ~600 KB every 10 s.
+    func appendHistory(_ point: TrendPoint) throws {
+        var line = try JSONEncoder.compact.encode(point)
+        line.append(UInt8(ascii: "\n"))
+        guard FileManager.default.fileExists(atPath: historyLogURL.path) else {
+            try JSONFile.writeData(line, to: historyLogURL)
+            return
         }
-        try JSONFile.write(history, to: historyURL)
+        let handle = try FileHandle(forWritingTo: historyLogURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line)
+    }
+
+    /// Replaces the log with exactly `points` (atomically) and completes a
+    /// migration from the legacy JSON array.
+    func rewriteHistory(_ points: [TrendPoint]) throws {
+        let encoder = JSONEncoder.compact
+        var data = Data()
+        for point in points {
+            data.append(try encoder.encode(point))
+            data.append(UInt8(ascii: "\n"))
+        }
+        try JSONFile.writeData(data, to: historyLogURL)
+        if FileManager.default.fileExists(atPath: legacyHistoryURL.path) {
+            try FileManager.default.removeItem(at: legacyHistoryURL)
+        }
+    }
+
+    /// Load-append-return in one call (tests and one-off tools; the app
+    /// keeps history in memory and appends through ClusterCacheWriter).
+    @discardableResult
+    func recordHistory(from snapshot: ClusterSnapshot, capacity: Int = SnapshotCache.historyCapacity) throws -> [TrendPoint] {
+        let log = loadHistoryLog(capacity: capacity)
+        var history = log.points
+        let point = TrendPoint(snapshot: snapshot)
+        guard !history.contains(where: { $0.collectedAt == point.collectedAt }) else {
+            return history
+        }
+        history.append(point)
+        if history.count > capacity {
+            history = Array(history.suffix(capacity))
+        }
+        if log.needsCompaction || log.lineCount + 1 > capacity + Self.historyCompactionSlack {
+            try rewriteHistory(history)
+        } else {
+            try appendHistory(point)
+        }
         return history
     }
+
+    // MARK: Job states
 
     func loadJobStateSnapshot() -> JobStateSnapshot? {
         JSONFile.decodeQuarantining(JobStateSnapshot.self, from: jobStateURL)
     }
 
-    func saveJobStates(from jobs: [Job]) throws {
-        let now = iso8601Formatter.string(from: Date())
-        let records = Dictionary(
-            jobs.map { job in
-                (
-                    job.jobId,
-                    JobStateRecord(
-                        jobId: job.jobId,
-                        name: job.name,
-                        partition: job.partition,
-                        state: job.state,
-                        lastSeenAt: now
-                    )
-                )
-            },
-            uniquingKeysWith: { _, last in last }
-        )
-        let state = JobStateSnapshot(updatedAt: now, jobs: records)
-        try JSONFile.write(state, to: jobStateURL)
+    func saveJobStates(_ baseline: JobStateSnapshot) throws {
+        try JSONFile.write(baseline, to: jobStateURL)
     }
+
+    func saveJobStates(from jobs: [Job]) throws {
+        try saveJobStates(JobStateSnapshot(jobs: jobs, observedAt: iso8601Formatter.string(from: Date())))
+    }
+
+    // MARK: App state (widget lease)
+
+    func loadAppState() -> ClusterAppState? {
+        guard let data = try? Data(contentsOf: appStateURL) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ClusterAppState.self, from: data)
+    }
+
+    func saveAppState(_ state: ClusterAppState) throws {
+        try JSONFile.write(state, to: appStateURL, pretty: true)
+    }
+
+    func removeAppState() throws {
+        guard FileManager.default.fileExists(atPath: appStateURL.path) else {
+            return
+        }
+        try FileManager.default.removeItem(at: appStateURL)
+    }
+
+    // MARK: Collector invocation
 
     /// Password-free record of the exact collector invocation, consumed by
     /// the desktop widget's fallback collection.
@@ -173,7 +297,8 @@ struct SnapshotCache {
                 script: MonitorService.collectorScript,
                 arguments: arguments
             ),
-            to: collectorURL
+            to: collectorURL,
+            pretty: true
         )
     }
 }
@@ -181,20 +306,35 @@ struct SnapshotCache {
 // MARK: - Preferences
 
 /// Password-free settings persisted in `.runtime/preferences.json`.
-struct AppPreferences: Codable {
-    struct ClusterPreference: Codable {
+struct AppPreferences: Codable, Equatable {
+    struct ClusterPreference: Codable, Equatable {
         var enabled: Bool
         var hostname: String
     }
 
     var username: String = ""
     var route: ConnectionRoute = .directVPN
-    var jumpHostname: String = "rash.leeds.ac.uk"
-    var duoOption: String = "1"
+    var jumpHostname: String = HPCDefaults.jumpHostname
+    var duoOption: String = HPCDefaults.duoOption
+    /// "Remember in Keychain". Persisted so an opt-out survives relaunch;
+    /// files written before it existed decode as true (the old default).
+    var rememberPassword: Bool = true
     /// Keyed by ClusterID.rawValue.
     var clusters: [String: ClusterPreference] = [:]
     /// "overview" or "cluster:<id>".
     var selection: String?
+
+    enum CodingKeys: String, CodingKey {
+        case username
+        case route
+        case jumpHostname
+        case duoOption
+        // Stored as "rememberInKeychain": preferences.json is password-free
+        // by construction, and stays free of the word too.
+        case rememberPassword = "rememberInKeychain"
+        case clusters
+        case selection
+    }
 
     init() {}
 
@@ -202,8 +342,9 @@ struct AppPreferences: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
         route = (try? container.decodeIfPresent(ConnectionRoute.self, forKey: .route)) ?? .directVPN
-        jumpHostname = try container.decodeIfPresent(String.self, forKey: .jumpHostname) ?? "rash.leeds.ac.uk"
-        duoOption = try container.decodeIfPresent(String.self, forKey: .duoOption) ?? "1"
+        jumpHostname = try container.decodeIfPresent(String.self, forKey: .jumpHostname) ?? HPCDefaults.jumpHostname
+        duoOption = try container.decodeIfPresent(String.self, forKey: .duoOption) ?? HPCDefaults.duoOption
+        rememberPassword = (try? container.decodeIfPresent(Bool.self, forKey: .rememberPassword)) ?? true
         clusters = try container.decodeIfPresent([String: ClusterPreference].self, forKey: .clusters) ?? [:]
         selection = try container.decodeIfPresent(String.self, forKey: .selection)
     }
@@ -234,7 +375,7 @@ struct PreferencesStore {
     }
 
     func save(_ preferences: AppPreferences) throws {
-        try JSONFile.write(preferences, to: preferencesURL)
+        try JSONFile.write(preferences, to: preferencesURL, pretty: true)
     }
 
     private func legacyPreferences() -> AppPreferences? {
@@ -276,7 +417,7 @@ struct PreferencesStore {
                 try fileManager.createDirectory(at: aireDirectory, withIntermediateDirectories: true)
                 try fileManager.moveItem(at: legacy, to: migrated)
             } catch {
-                cacheLogger.error(
+                Log.cache.error(
                     "Could not migrate \(name, privacy: .public) into clusters/aire: \(String(describing: error), privacy: .public)"
                 )
             }
@@ -284,40 +425,31 @@ struct PreferencesStore {
     }
 }
 
-/// File-scope so it can call the global `gpuIdle(_:)`, which TrendPoint's
-/// own `gpuIdle` property shadows inside the initializer.
-private func idleGPUsOnAvailableNodes(_ nodes: [NodeSummary]) -> Int {
-    nodes.filter { isAvailable($0) }.reduce(0) { $0 + gpuIdle($1) }
-}
-
 extension TrendPoint {
     init(snapshot: ClusterSnapshot) {
-        let gpuNodes = snapshot.nodes.filter { ($0.gpuTotal ?? slurmGPUTotal(from: $0.gres)) > 0 }
-        let gpuTotalValue = gpuNodes.reduce(0) { $0 + ($1.gpuTotal ?? slurmGPUTotal(from: $1.gres)) }
-        let gpuAllocatedValue = gpuNodes.reduce(0) { $0 + ($1.gpuAllocated ?? 0) }
+        let fleet = GPUFleet(nodes: snapshot.nodes)
         let storage = snapshot.storage ?? []
         let home = storage.first { $0.kind == .home }
         let scratch = storage.first { $0.kind == .scratch }
         let flash = storage.first { $0.kind == .flash }
 
         collectedAt = snapshot.collectedAt
-        totalJobs = snapshot.jobs.count
-        runningJobs = snapshot.jobs.filter { $0.state.uppercased().contains("RUN") }.count
-        pendingJobs = snapshot.jobs.filter { $0.state.uppercased().contains("PEND") }.count
-        gpuTotal = gpuTotalValue
-        gpuAllocated = gpuAllocatedValue
-        // Free means startable now: idle GPUs on drained/down/not-responding
-        // nodes are excluded, matching ClusterSession.gpuAvailability, the
-        // Nodes tab and the widget (a drained 8-GPU node otherwise shows up
-        // as 8 "free" GPUs in the trend).
-        gpuIdle = idleGPUsOnAvailableNodes(gpuNodes)
-        unavailableGpuNodes = gpuNodes.filter { !isAvailable($0) }.count
+        totalJobs = snapshot.jobs.reduce(0) { $0 + $1.taskMultiplicity }
+        runningJobs = snapshot.jobs.filter { $0.jobState.isRunning }.count
+        pendingJobs = snapshot.jobs.filter { $0.jobState.isPending }.reduce(0) { $0 + $1.taskMultiplicity }
+        gpuTotal = fleet.total
+        gpuAllocated = fleet.allocated
+        // Startable idle GPUs only (same rule as every other surface):
+        // nothing on unavailable nodes, stranded GPUs or unknown allocation.
+        gpuIdle = fleet.idle
+        unavailableGpuNodes = fleet.unavailableNodes
         homeUsedPercent = home?.usedPercent
         scratchUsedPercent = scratch?.usedPercent
         homeAvailableGB = home?.availableGB
         scratchAvailableGB = scratch?.availableGB
         flashUsedPercent = flash?.usedPercent
         flashAvailableGB = flash?.availableGB
+        gpuUnknown = fleet.unknown
     }
 }
 
@@ -327,271 +459,12 @@ extension JSONEncoder {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
     }()
-}
 
-@MainActor
-final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate {
-    private var didRequestAuthorization = false
-    private let terminalStateKeywords = [
-        "BOOT_FAIL",
-        "CANCELLED",
-        "COMPLETED",
-        "DEADLINE",
-        "FAILED",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "PREEMPTED",
-        "REVOKED",
-        "SPECIAL_EXIT",
-        "TIMEOUT"
-    ]
-
-    private struct JobEnding {
-        let name: String
-        let jobId: String
-        let partition: String
-        let lastState: String
-        let finalState: String
-        let detail: String
-    }
-
-    // UNUserNotificationCenter aborts when the process has no app bundle
-    // (e.g. running the bare debug binary instead of the assembled .app).
-    static let notificationsSupported = Bundle.main.bundleIdentifier != nil
-
-    func configure() {
-        guard Self.notificationsSupported, !didRequestAuthorization else {
-            return
-        }
-        didRequestAuthorization = true
-        let center = UNUserNotificationCenter.current()
-        center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-    }
-
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound]
-    }
-
-    /// Diffs the previous and current job lists and posts notifications for
-    /// job starts and endings. Returns true when the diff was actually
-    /// processed (or there was nothing to diff yet), so callers know whether
-    /// it is safe to persist the current job states as the new baseline.
-    func notifyChanges(
-        cluster: ClusterProfile,
-        previous: JobStateSnapshot?,
-        current jobs: [Job]
-    ) async -> Bool {
-        guard Self.notificationsSupported else {
-            return false
-        }
-        // Re-query authorization every time instead of caching a one-shot
-        // flag, so a grant made later in System Settings takes effect without
-        // relaunching.
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        switch settings.authorizationStatus {
-        case .authorized, .provisional:
-            break
-        default:
-            return false
-        }
-        guard let previous else {
-            // First observation: nothing to diff, but the baseline may be
-            // persisted.
-            return true
-        }
-
-        let currentById = Dictionary(
-            jobs.map { ($0.jobId, $0) },
-            uniquingKeysWith: { _, last in last }
-        )
-
-        var endings: [JobEnding] = []
-        var notifiedStartIds = Set<String>()
-        for job in jobs {
-            guard let old = previous.jobs[job.jobId], old.state != job.state else {
-                continue
-            }
-            if isTerminalState(job.state) {
-                endings.append(
-                    JobEnding(
-                        name: job.name,
-                        jobId: job.jobId,
-                        partition: job.partition,
-                        lastState: old.state,
-                        finalState: job.state,
-                        detail: "Final state reported by Slurm."
-                    )
-                )
-            } else if isPendingState(old.state),
-                      isRunningState(job.state),
-                      notifiedStartIds.insert(job.jobId).inserted {
-                sendJobStartedNotification(cluster: cluster, name: job.name, jobId: job.jobId, partition: job.partition)
-            }
-        }
-
-        for old in previous.jobs.values where currentById[old.jobId] == nil && !isTerminalState(old.state) {
-            endings.append(
-                JobEnding(
-                    name: old.name,
-                    jobId: old.jobId,
-                    partition: old.partition,
-                    lastState: old.state,
-                    finalState: "Left queue",
-                    detail: "The job is no longer visible in squeue."
-                )
-            )
-        }
-
-        if endings.count == 1, let ending = endings.first {
-            sendJobEndedNotification(cluster: cluster, ending)
-        } else if endings.count > 1 {
-            sendJobsEndedSummaryNotification(cluster: cluster, endings)
-        }
-        return true
-    }
-
-    /// Human-readable summary of the notification permission state for
-    /// display in the sidebar. Async because the authorization status has to
-    /// be queried from UNUserNotificationCenter.
-    func authorizationSummary() async -> String {
-        guard Self.notificationsSupported else {
-            return "Unavailable outside the app bundle"
-        }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        switch settings.authorizationStatus {
-        case .authorized:
-            return "Allowed"
-        case .provisional:
-            return "Allowed (provisional)"
-        case .denied:
-            return "Denied — enable in System Settings"
-        case .notDetermined:
-            return "Not requested yet"
-        case .ephemeral:
-            return "Ephemeral"
-        @unknown default:
-            return "Unknown"
-        }
-    }
-
-    /// Posts the fleet-wide "a GPU freed up" alert. Returns true when the
-    /// notification was actually queued, so the caller can start its
-    /// cooldown; the same support/authorization guards as job notifications
-    /// apply.
-    func notifyGPUBecameAvailable(
-        cluster: ClusterProfile,
-        idleCount: Int,
-        gpuModel: String?,
-        partitions: [String]
-    ) async -> Bool {
-        guard Self.notificationsSupported else {
-            return false
-        }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        switch settings.authorizationStatus {
-        case .authorized, .provisional:
-            break
-        default:
-            return false
-        }
-        let nodesText = partitions.isEmpty
-            ? "GPU nodes"
-            : "\(partitions.joined(separator: ", ")) partition nodes"
-        let modelText = gpuModel.map { " \($0)" } ?? ""
-        let countText = "\(idleCount)\(modelText) GPU\(idleCount == 1 ? "" : "s")"
-        send(
-            title: "GPU available on \(cluster.displayName)",
-            subtitle: "Idle GPUs detected",
-            body: "\(countText) idle across \(nodesText)",
-            identifier: "\(cluster.id.rawValue)-gpu-available-\(iso8601Formatter.string(from: Date()))",
-            thread: "\(cluster.id.rawValue)-gpu-availability"
-        )
-        return true
-    }
-
-    private func isTerminalState(_ state: String) -> Bool {
-        let normalized = state.uppercased()
-        return terminalStateKeywords.contains { normalized.contains($0) }
-    }
-
-    private func isPendingState(_ state: String) -> Bool {
-        state.uppercased().contains("PEND")
-    }
-
-    private func isRunningState(_ state: String) -> Bool {
-        state.uppercased().contains("RUN")
-    }
-
-    private func displayName(name: String, jobId: String) -> String {
-        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleanName.isEmpty ? "Job \(jobId)" : cleanName
-    }
-
-    private func sendJobStartedNotification(cluster: ClusterProfile, name: String, jobId: String, partition: String) {
-        send(
-            title: "\(cluster.displayName) · job started",
-            subtitle: "Your job started",
-            body: "\(displayName(name: name, jobId: jobId)) (#\(jobId))\nNow running on partition \(partition).",
-            identifier: "\(cluster.id.rawValue)-job-started-\(jobId)-\(iso8601Formatter.string(from: Date()))",
-            thread: "\(cluster.id.rawValue)-job-events"
-        )
-    }
-
-    private func sendJobEndedNotification(cluster: ClusterProfile, _ ending: JobEnding) {
-        let subtitle = ending.finalState == "Left queue"
-            ? "Job finished or left the queue"
-            : "Job ended: \(ending.finalState)"
-        let body = [
-            "\(displayName(name: ending.name, jobId: ending.jobId)) (#\(ending.jobId))",
-            "Partition \(ending.partition) • previous state \(ending.lastState)",
-            ending.detail
-        ].joined(separator: "\n")
-
-        send(
-            title: "\(cluster.displayName) · job ended",
-            subtitle: subtitle,
-            body: body,
-            identifier: "\(cluster.id.rawValue)-job-ended-\(ending.jobId)-\(ending.finalState)-\(iso8601Formatter.string(from: Date()))",
-            thread: "\(cluster.id.rawValue)-job-events"
-        )
-    }
-
-    private func sendJobsEndedSummaryNotification(cluster: ClusterProfile, _ endings: [JobEnding]) {
-        let lines = endings.map { ending in
-            "\(displayName(name: ending.name, jobId: ending.jobId)) (#\(ending.jobId)) — \(ending.finalState)"
-        }
-        send(
-            title: "\(cluster.displayName) · jobs ended",
-            subtitle: "\(endings.count) jobs ended",
-            body: lines.joined(separator: "\n"),
-            identifier: "\(cluster.id.rawValue)-jobs-ended-summary-\(iso8601Formatter.string(from: Date()))",
-            thread: "\(cluster.id.rawValue)-job-events"
-        )
-    }
-
-    private func send(
-        title: String,
-        subtitle: String,
-        body: String,
-        identifier: String,
-        thread: String
-    ) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.subtitle = subtitle
-        content.body = body
-        content.sound = .default
-        content.threadIdentifier = thread
-
-        let request = UNNotificationRequest(
-            identifier: identifier,
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request)
-    }
+    /// No whitespace, no key sorting: the cheapest encoding for files only
+    /// machines read.
+    static let compact: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        return encoder
+    }()
 }

@@ -14,8 +14,9 @@
 #   HPC_CONTROL_PATH       this cluster's ControlMaster socket (required
 #                          unless HPC_SKIP_TARGET=1)
 #   HPC_JUMP_CONTROL_PATH  the shared jump ControlMaster socket
-#   HPC_FORCE_RELOGIN      "1" replaces this cluster's TARGET master even if it
-#                          still works; it never forces the shared jump master
+#   HPC_FORCE_RELOGIN      handed to the target starter: "1" replaces this
+#                          cluster's TARGET master even if it still works; it
+#                          never forces the shared jump master
 #   HPC_SKIP_TARGET        "1" authenticates only the jump leg (what the app does)
 #   HPC_LOGIN_DEBUG_LOG    optional event log (0600)
 #   HPC_DUO_OPTION         Duo menu answer (default 1 = push)
@@ -26,23 +27,33 @@
 #                          starter (default $HPC_PROJECT_ROOT/.runtime)
 #   HPC_PROJECT_ROOT       repository root (default: parent of this script's dir)
 #
-# Reads the password from stdin (preferred). HPC_PASSWORD is accepted as a
-# legacy fallback; every password variable (including the pre-rename AIRE_*
-# ones) is scrubbed from the environment immediately after reading so spawned
-# ssh processes never inherit them.
+# Reads the password from the first line of stdin (preferred, and what the
+# app does). HPC_PASSWORD is a legacy fallback used ONLY when stdin supplied
+# nothing — the same order as hpc_start_target_master.zsh, so a stale
+# exported HPC_PASSWORD can never override the password the app hands over
+# and be sent to the jump host. Every password variable (including the
+# pre-rename AIRE_* ones) is scrubbed from the environment immediately after
+# reading so spawned ssh processes never inherit them.
 #
 # Progress is reported on stdout as machine-readable lines:
 #   HPC-STATUS: <human-readable milestone>
 #
-# Exit codes:
+# Exit codes (the same contract as hpc_start_target_master.zsh):
 #   13  the remote host rejected the password (wrong password)
 #   14  the remote host demanded a password change (expired password)
-#   124 timed out waiting for a prompt
+#   15  the password was accepted but Duo approval was not completed (push
+#       declined, timed out, or the connection dropped while waiting); a
+#       repeated Duo prompt is never answered, so one login sends one push
+#   124 timed out waiting for a prompt before Duo was reached
+# When it delegates the target leg (HPC_SKIP_TARGET unset), the starter's
+# own codes pass through as well, e.g. 5: this cluster's master answers on
+# its socket but not end to end, and was left running.
 #
 # The helper only starts OpenSSH ControlMaster sessions and verifies them with
 # read-only commands. The target master itself is started by
 # hpc_start_target_master.zsh (directly by the app, or delegated to from here
-# when HPC_SKIP_TARGET is not set).
+# when HPC_SKIP_TARGET is not set — the starter then decides, honouring
+# HPC_FORCE_RELOGIN, whether a healthy target master is reused).
 
 fconfigure stdout -buffering line
 
@@ -78,7 +89,6 @@ set use_jump_host [env_or_default "HPC_USE_JUMP_HOST" "1"]
 set jump_hostname [env_or_default "HPC_JUMP_HOSTNAME" "rash.leeds.ac.uk"]
 set control_path [env_or_default "HPC_CONTROL_PATH" ""]
 set jump_control_path [env_or_default "HPC_JUMP_CONTROL_PATH" ""]
-set force_relogin [env_or_default "HPC_FORCE_RELOGIN" "0"]
 set skip_target [env_or_default "HPC_SKIP_TARGET" "0"]
 set debug_log [resolve_path [env_or_default "HPC_LOGIN_DEBUG_LOG" ""]]
 set duo_option [env_or_default "HPC_DUO_OPTION" "1"]
@@ -109,13 +119,32 @@ if {$use_jump_host eq "1" && $jump_control_path eq ""} {
     set jump_control_path "$::env(HOME)/.ssh/ctl/jump-cli-$username.sock"
 }
 
-if {[info exists ::env(HPC_PASSWORD)] && $::env(HPC_PASSWORD) ne ""} {
-    set password $::env(HPC_PASSWORD)
-} else {
+# Password order: the first line of a piped stdin (the app), then the legacy
+# HPC_PASSWORD, then — for a manual run at a terminal only — an interactive
+# prompt with echo off.
+proc stdin_is_terminal {} {
+    return [expr {[catch {exec /bin/test -t 0 <@ stdin}] == 0}]
+}
+
+set password ""
+set stdin_tty [stdin_is_terminal]
+if {!$stdin_tty} {
     if {[gets stdin password] < 0} {
-        puts stderr "Password was not provided on stdin"
-        exit 2
+        set password ""
     }
+}
+if {$password eq "" && [info exists ::env(HPC_PASSWORD)]} {
+    set password $::env(HPC_PASSWORD)
+}
+if {$password eq "" && $stdin_tty} {
+    puts -nonewline stderr "Password for $username: "
+    flush stderr
+    catch {exec stty -echo <@ stdin}
+    if {[gets stdin password] < 0} {
+        set password ""
+    }
+    catch {exec stty echo <@ stdin}
+    puts stderr ""
 }
 
 # Scrub inherited secrets so no spawned ssh child carries them in its
@@ -127,7 +156,7 @@ foreach secret_var {HPC_PASSWORD HPC_ASKPASS_PASSWORD AIRE_PASSWORD AIRE_ASKPASS
 }
 
 if {$password eq ""} {
-    puts stderr "Password was empty"
+    puts stderr "Password was not provided (stdin first line, or HPC_PASSWORD)"
     exit 2
 }
 
@@ -186,96 +215,57 @@ proc connected_message {label} {
     return "connected to $label"
 }
 
+# The ssh option sets are defined ONCE, in hpc_ssh_common.zsh, and shared
+# with the target starter: the interactive master login (password + Duo,
+# ControlMaster=yes, ControlPersist=24h) and the non-interactive client of an
+# existing master (BatchMode, no authentication, ControlMaster=no). Hand
+# copies of these lists drifted apart before.
+proc load_common_option_set {name} {
+    set common [resolve_path "scripts/hpc_ssh_common.zsh"]
+    if {![file readable $common]} {
+        puts stderr "Shared login helpers are missing: $common"
+        exit 2
+    }
+    if {[catch {
+        exec /bin/zsh -c {source "$1" && print -rl -- "${(@P)2}"} hpc-options $common $name
+    } output]} {
+        puts stderr "Could not load the $name ssh options from $common: $output"
+        exit 2
+    }
+    set options [split [string trim $output] "\n"]
+    if {[llength $options] == 0} {
+        puts stderr "The $name ssh option set in $common is empty"
+        exit 2
+    }
+    return $options
+}
+
+set master_login_options [load_common_option_set hpc_master_login_options]
+set client_options [load_common_option_set hpc_client_options]
+
 proc interactive_base_args {} {
-    return [list \
-        ssh \
-        -o StrictHostKeyChecking=accept-new \
-        -o PubkeyAuthentication=no \
-        -o GSSAPIAuthentication=no \
-        -o PreferredAuthentications=password,keyboard-interactive \
-        -o KbdInteractiveAuthentication=yes \
-        -o PasswordAuthentication=yes \
-        -o NumberOfPasswordPrompts=1 \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=10 \
-        -o TCPKeepAlive=yes \
-        -o ExitOnForwardFailure=yes \
-        -o ConnectTimeout=20 \
-    ]
+    global master_login_options
+    return [list ssh {*}$master_login_options]
 }
 
 proc verify_base_args {} {
-    return [list \
-        ssh \
-        -n \
-        -o BatchMode=yes \
-        -o PubkeyAuthentication=no \
-        -o GSSAPIAuthentication=no \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o ConnectTimeout=20 \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=10 \
-        -o TCPKeepAlive=yes \
-        -o ExitOnForwardFailure=yes \
-    ]
+    global client_options
+    return [list ssh {*}$client_options]
 }
 
 proc add_interactive_master_options {args control_path} {
     if {$control_path ne ""} {
-        lappend args \
-            -o ControlMaster=yes \
-            -o ControlPersist=24h \
-            -o ControlPath=$control_path
+        lappend args -o ControlPath=$control_path
     }
     return $args
 }
 
+# Options for a client of an existing master (`-O check`, `-O exit`).
 proc add_verify_master_options {args control_path} {
     if {$control_path ne ""} {
-        lappend args \
-            -o ControlPath=$control_path \
-            -o ControlMaster=auto
+        lappend args -o ControlPath=$control_path
     }
     return $args
-}
-
-proc shell_quote {value} {
-    if {$value eq ""} {
-        return "''"
-    }
-    regsub -all -- {'} $value {'"'"'} escaped
-    return "'$escaped'"
-}
-
-proc shell_join {values} {
-    set quoted [list]
-    foreach value $values {
-        lappend quoted [shell_quote $value]
-    }
-    return [join $quoted " "]
-}
-
-proc jump_proxy_command {} {
-    global username jump_hostname jump_control_path
-    set proxy_args [list \
-        ssh \
-        -o BatchMode=yes \
-        -o PubkeyAuthentication=no \
-        -o GSSAPIAuthentication=no \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o ConnectTimeout=20 \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=10 \
-        -o TCPKeepAlive=yes \
-        -o ControlMaster=auto \
-        -o ControlPath=$jump_control_path \
-        -o User=$username \
-        -W %h:%p \
-        $jump_hostname \
-    ]
-    return [shell_join $proxy_args]
 }
 
 proc cleanup_control_socket {control_path} {
@@ -285,70 +275,25 @@ proc cleanup_control_socket {control_path} {
     }
 }
 
-proc regex_escape {value} {
-    return [regsub -all {[][{}()*+?.^$\\|]} $value {\\&}]
-}
-
-# Kill a pid only after verifying it is one of OUR ssh processes for exactly
-# this control socket. Two process shapes qualify:
-#   - "ssh: <control-path> [mux]": the detached master. OpenSSH rewrites the
-#     master's process title to this once it has backgrounded, so its
-#     original argv (and any ControlPath= option) is no longer visible.
-#   - "ssh ... ControlPath=<control-path> ... ControlMaster=yes ...": a master
-#     still authenticating (e.g. abandoned at a Duo prompt).
-# For the argv shape the *first* ControlPath option must match exactly: every
-# cluster's target master embeds the shared jump ControlPath inside its
-# ProxyCommand string, so a naive substring match on the jump path would kill
-# every cluster's target master. Requiring ControlMaster=yes additionally
-# keeps every cluster's `-W` proxy (an `ssh ... ControlPath=<jump>` mux
-# client without ControlMaster=yes) out of reach.
-proc kill_verified_pid {pid control_path} {
-    set pid [string trim $pid]
-    if {![string is integer -strict $pid] || $pid <= 0} {
-        return 0
-    }
-    if {[catch {exec ps -p $pid -o command=} cmdline]} {
-        return 0
-    }
-    set cmdline [string trim $cmdline]
-    set title "ssh: $control_path \[mux\]"
-    if {$cmdline eq $title || [string first "$title " $cmdline] == 0} {
-        log_event "Terminating SSH master pid $pid for $control_path"
-        catch {exec kill $pid}
-        return 1
-    }
-    if {![regexp {^ssh(\s|$)} $cmdline]} {
-        return 0
-    }
-    if {![regexp {ControlPath=(\S+)} $cmdline -> first_control_path]} {
-        return 0
-    }
-    if {$first_control_path ne $control_path} {
-        return 0
-    }
-    if {![regexp {(^|\s)ControlMaster=yes(\s|$)} $cmdline]} {
-        return 0
-    }
-    log_event "Terminating SSH master pid $pid for $control_path"
-    catch {exec kill $pid}
-    return 1
-}
-
+# Kill whatever is left of a master for this control path. The rules for
+# "which process is ours" (a "ssh: <path> [mux]" title, or an ssh whose FIRST
+# ControlPath= is this path and that carries ControlMaster=yes, so no
+# cluster's `-W` proxy or tunnelled master ever matches) live in ONE place,
+# hpc_ssh_common.zsh, shared with the target starter and the stop helper.
 proc cleanup_orphan_master {control_path} {
     if {$control_path eq ""} {
         return
     }
-    set escaped [regex_escape $control_path]
-    set title_pattern "^ssh: $escaped "
-    append title_pattern {\[mux\]}
-    # pgrep only nominates candidates; kill_verified_pid decides.
-    foreach pattern [list "^ssh .*ControlPath=$escaped" $title_pattern] {
-        if {[catch {exec pgrep -f $pattern} pid_output]} {
-            continue
-        }
-        foreach pid [split $pid_output "\n"] {
-            kill_verified_pid $pid $control_path
-        }
+    set common [resolve_path "scripts/hpc_ssh_common.zsh"]
+    if {![file readable $common]} {
+        log_event "Shared login helpers missing ($common); orphan cleanup skipped"
+        return
+    }
+    if {[catch {
+        exec /bin/zsh -c {source "$1" && hpc_stop_master_processes "$2"} \
+            hpc-cleanup $common $control_path
+    } cleanup_error]} {
+        log_event "Orphan master cleanup for $control_path reported: $cleanup_error"
     }
 }
 
@@ -387,17 +332,33 @@ proc close_master {close_args label control_path} {
     cleanup_orphan_master $control_path
 }
 
+# End the spawned ssh at once, before it can send the server anything else
+# (closing the pty alone would make a pending prompt read EOF, and ssh would
+# then submit an EMPTY answer).
+proc abort_spawned_ssh {} {
+    # `spawn` set spawn_id in the CALLER's scope; without it exp_pid would
+    # name expect's own process.
+    upvar 1 spawn_id spawn_id
+    if {[catch {exp_pid -i $spawn_id} ssh_pid] == 0 && $ssh_pid != [pid]} {
+        catch {exec kill $ssh_pid}
+    }
+    catch {close -i $spawn_id}
+    catch {wait -i $spawn_id}
+}
+
 proc run_interactive_ssh {ssh_args success_re label} {
     global password duo_option timeout expect_out
     set saw_success 0
     set password_prompts 0
     set duo_prompts 0
+    set duo_approved 0
     set hostkey_prompts 0
     # True between sending the password and the next Duo prompt. A
-    # keyboard-interactive-only server (AIRE, Calder) never re-prompts after a
-    # wrong password: with NumberOfPasswordPrompts=1 it answers "Permission
-    # denied" and ssh exits 255. Ending in that window is the rejection signal;
-    # ending after a Duo exchange (e.g. a denied push) is not.
+    # keyboard-interactive-only server (AIRE, Calder, rash) never re-prompts
+    # after a wrong password: with NumberOfPasswordPrompts=1 it answers
+    # "Permission denied" and ssh exits 255. Ending in that window is the
+    # rejection signal; ending after a Duo exchange (e.g. a denied push) is
+    # not — that is exit 15.
     set awaiting_password_verdict 0
     set effective_success_re $success_re
     if {$effective_success_re eq ""} {
@@ -416,23 +377,24 @@ proc run_interactive_ssh {ssh_args success_re label} {
                 puts stderr "Unexpected repeated host-key prompts during $label authentication"
                 log_event "$label host-key prompt loop detected"
                 log_user 1
-                catch {close}
-                catch {wait}
+                abort_spawned_ssh
                 return 1
             }
             log_event "$label prompt: accepting new host key"
             send -- "yes\r"
             exp_continue
         }
-        -nocase -re {\m(new|current|old|retype|re-enter|reenter|confirm)\s+(unix\s+|ldap\s+|kerberos\s+)?password[^\r\n]*:\s*$|password (has )?expired|must change your password} {
-            # A PAM password-change flow: never feed the stored password into
-            # it (the askpass leg refuses the same prompts). Exit 14 is the
-            # app's "password expired" contract, distinct from a wrong one.
+        -nocase -re {\m(new|current|old|retype|re-enter|reenter|confirm)\s+(unix\s+|ldap\s+|kerberos\s+)?password[^\r\n]*:\s*$|\(current\)\s*(unix\s+|ldap\s+|kerberos\s+)?password|password (has )?expired|must change your password} {
+            # A PAM password-change flow (pam_sss: "Password expired. Change
+            # your password now." / "Current Password:"; RHEL 7 pam_unix:
+            # "(current) UNIX password:"): never feed the stored password
+            # into it (the askpass leg refuses the same prompts). Exit 14 is
+            # the app's "password expired" contract, distinct from a wrong
+            # one.
             puts stderr "$label requires a password change (the password has expired)"
             log_event "$label prompt: password change requested; refusing"
             log_user 1
-            catch {close}
-            catch {wait}
+            abort_spawned_ssh
             return 14
         }
         -nocase -re {password[^\r\n]*:\s*$} {
@@ -443,41 +405,20 @@ proc run_interactive_ssh {ssh_args success_re label} {
                 # PreferredAuthentications=password,keyboard-interactive and
                 # NumberOfPasswordPrompts=1, ssh asks once per method, so the
                 # second prompt is keyboard-interactive retrying after the
-                # password method failed. The Duo branches below reset this
+                # password method failed. The Duo branch below resets this
                 # counter, because a password prompt after a Duo exchange is
                 # a fresh leg, not a rejection. Exit 13 is the app's
                 # "password rejected" contract.
                 puts stderr "$label rejected the password"
                 log_event "$label password rejected (second password prompt)"
                 log_user 1
-                catch {close}
-                catch {wait}
+                abort_spawned_ssh
                 return 13
             }
             log_event "$label prompt: sending password"
             set awaiting_password_verdict 1
             send -- "$password\r"
-            status_line "password sent, waiting for Duo approval on your phone ($label)"
-            exp_continue
-        }
-        -nocase -re {passcode\s+or\s+option[^\r\n]*:\s*$} {
-            incr duo_prompts
-            if {$duo_prompts > 3} {
-                puts stderr "$label Duo prompt repeated too many times; aborting"
-                log_event "$label Duo prompt loop detected"
-                log_user 1
-                catch {close}
-                catch {wait}
-                return 1
-            }
-            log_event "$label prompt: sending Duo option"
-            # Reaching a Duo prompt means the preceding password was accepted;
-            # only an immediate re-prompt (no intervening Duo exchange) counts
-            # as a rejection.
-            set password_prompts 0
-            set awaiting_password_verdict 0
-            send -- "$duo_option\r"
-            status_line "waiting for Duo approval on your phone ($label)"
+            status_line "password sent ($label)"
             exp_continue
         }
         -nocase -re {select one of the following options[^\r\n]*} {
@@ -485,55 +426,33 @@ proc run_interactive_ssh {ssh_args success_re label} {
             # prompt follows. Consume it without answering.
             exp_continue
         }
-        -nocase -re {option\s*\([^\)]*\)\s*:\s*$} {
+        -nocase -re {passcode\s+or\s+option[^\r\n]*:\s*$|option\s*\([^\)]*\)\s*:\s*$|verification code[^\r\n]*:\s*$|response[^\r\n]*:\s*$} {
+            # Every Duo / second-factor prompt shape. Reaching one means the
+            # preceding password was accepted.
             incr duo_prompts
-            if {$duo_prompts > 3} {
-                puts stderr "$label Duo prompt repeated too many times; aborting"
-                log_event "$label Duo prompt loop detected"
-                log_user 1
-                catch {close}
-                catch {wait}
-                return 1
-            }
-            log_event "$label prompt: sending Duo option"
             set password_prompts 0
             set awaiting_password_verdict 0
+            if {$duo_prompts > 1} {
+                # pam_duo asks again only when the push we requested was not
+                # approved (declined, timed out; its `prompts` option allows
+                # up to 3). Answering would send the user another push for a
+                # login they already turned down, and even refusing would
+                # make ssh submit an empty answer — so end ssh here. Same
+                # rule, same exit code, as the askpass leg.
+                puts stderr "$label: the Duo push was not approved (declined or timed out). The password was accepted; no further push was sent."
+                log_event "$label Duo prompt repeated: push not approved; aborting without answering"
+                log_user 1
+                abort_spawned_ssh
+                return 15
+            }
+            log_event "$label prompt: sending Duo option"
             send -- "$duo_option\r"
             status_line "waiting for Duo approval on your phone ($label)"
             exp_continue
         }
-        -nocase -re {verification code[^\r\n]*:\s*$} {
-            incr duo_prompts
-            if {$duo_prompts > 3} {
-                puts stderr "$label Duo prompt repeated too many times; aborting"
-                log_event "$label Duo prompt loop detected"
-                log_user 1
-                catch {close}
-                catch {wait}
-                return 1
-            }
-            log_event "$label prompt: sending Duo option"
-            set password_prompts 0
-            set awaiting_password_verdict 0
-            send -- "$duo_option\r"
-            status_line "waiting for Duo approval on your phone ($label)"
-            exp_continue
-        }
-        -nocase -re {response[^\r\n]*:\s*$} {
-            incr duo_prompts
-            if {$duo_prompts > 3} {
-                puts stderr "$label Duo prompt repeated too many times; aborting"
-                log_event "$label Duo prompt loop detected"
-                log_user 1
-                catch {close}
-                catch {wait}
-                return 1
-            }
-            log_event "$label prompt: sending Duo option"
-            set password_prompts 0
-            set awaiting_password_verdict 0
-            send -- "$duo_option\r"
-            status_line "waiting for Duo approval on your phone ($label)"
+        -nocase -re {success\.\s*logging you in} {
+            # pam_duo's approval message.
+            set duo_approved 1
             exp_continue
         }
         -re $effective_success_re {
@@ -555,15 +474,30 @@ proc run_interactive_ssh {ssh_args success_re label} {
                 log_event "$label password rejected (Permission denied right after the password)"
                 return 13
             }
+            if {$exit_code != 0 && $duo_prompts > 0 && !$awaiting_password_verdict && !$duo_approved} {
+                # The server asked for Duo (so it accepted the password) and
+                # the login then failed without pam_duo approving it: the push
+                # was declined, timed out, or the connection dropped while
+                # waiting for it.
+                puts stderr "$label did not receive Duo approval (declined, timed out, or the connection dropped while waiting). The password was accepted."
+                log_event "$label Duo approval not completed (exit $exit_code)"
+                return 15
+            }
             if {$success_re ne "" && $saw_success == 0 && $exit_code == 0} {
                 return 1
             }
             return $exit_code
         }
         timeout {
+            log_user 1
+            abort_spawned_ssh
+            if {$duo_prompts > 0 && !$awaiting_password_verdict && !$duo_approved} {
+                puts stderr "$label: the Duo push was not approved in time. The password was accepted."
+                log_event "$label timed out waiting for Duo approval"
+                return 15
+            }
             puts stderr "Timed out while waiting for $label SSH, password, or Duo prompt"
             log_event "$label authentication timed out"
-            log_user 1
             return 124
         }
     }
@@ -821,13 +755,14 @@ proc ensure_jump_master {check_args interactive_args close_args} {
     return [expr {$auth_exit == 0 ? 1 : $auth_exit}]
 }
 
-# Start this cluster's target master by delegating to
+# Start (or reuse) this cluster's target master by delegating to
 # hpc_start_target_master.zsh — the same starter the app runs — so there is a
-# single implementation of the target login (per-cluster runtime files,
-# verified teardown, FIFO password handoff, keepalive). The password goes down
-# the child's stdin pipe only (never argv or environment), exactly as the app
-# hands it over; the child's stdout (HPC-STATUS lines, auth_ok line) is
-# relayed and its stderr passes straight through.
+# single implementation of the target login (reuse of a healthy master unless
+# HPC_FORCE_RELOGIN=1, per-cluster runtime files, verified teardown, FIFO
+# password handoff). The password goes down the child's stdin pipe only
+# (never argv or environment), exactly as the app hands it over; the child's
+# stdout (HPC-STATUS lines, auth_ok line) is relayed and its stderr passes
+# straight through.
 proc start_target_master {} {
     global password project_root runtime_dir target_label
     set starter [resolve_path "scripts/hpc_start_target_master.zsh"]
@@ -868,8 +803,6 @@ proc start_target_master {} {
     return $exit_code
 }
 
-set target_command {printf 'auth_ok|%s|%s|%s\n' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"}
-
 if {$use_jump_host eq "1"} {
     set jump_args [add_interactive_master_options [interactive_base_args] $jump_control_path]
     lappend jump_args -f -N -o User=$username $jump_hostname
@@ -895,21 +828,6 @@ if {$use_jump_host eq "1"} {
 if {$skip_target eq "1"} {
     log_event "Skipping $target_label target authentication by request"
     exit 0
-}
-
-if {$force_relogin ne "1"} {
-    set verify_target_args [add_verify_master_options [verify_base_args] $control_path]
-    lappend verify_target_args -o User=$username
-    if {$use_jump_host eq "1"} {
-        lappend verify_target_args -o ProxyCommand=[jump_proxy_command]
-    } else {
-        lappend verify_target_args -o ProxyCommand=none -o ProxyJump=none
-    }
-    lappend verify_target_args $target_hostname $target_command
-    if {[verify_ssh $verify_target_args] == 0} {
-        status_line [connected_message $target_label]
-        exit 0
-    }
 }
 
 exit [start_target_master]

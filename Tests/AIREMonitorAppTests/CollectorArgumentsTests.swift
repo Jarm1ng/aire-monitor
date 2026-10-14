@@ -1,3 +1,4 @@
+import HPCCore
 import Foundation
 import Testing
 @testable import AIREMonitorApp
@@ -95,5 +96,104 @@ struct CollectorArgumentsTests {
         // only ever travels on a login helper's stdin.
         let arguments = MonitorService.collectorArguments(settings: makeSettings(catalogProfile(id), route: route))
         #expect(!arguments.contains { $0.lowercased().contains("password") })
+    }
+}
+
+@Suite("Collector arguments · storage")
+struct CollectorStorageFlagTests {
+    @Test("--skip-storage only on request, never in the widget's argv", arguments: catalogIDs, ConnectionRoute.allCases)
+    func skipStorageFlag(id: ClusterID, route: ConnectionRoute) {
+        let settings = makeSettings(catalogProfile(id), route: route)
+        // collector.json is written from the default: the widget replays it
+        // verbatim and must keep collecting storage.
+        #expect(!MonitorService.collectorArguments(settings: settings).contains(MonitorService.skipStorageFlag))
+        let skipping = MonitorService.collectorArguments(settings: settings, skipStorage: true)
+        #expect(skipping.last == "--skip-storage")
+        #expect(Array(skipping.dropLast()) == MonitorService.collectorArguments(settings: settings))
+    }
+}
+
+/// Every child process gets the scrubbed environment, and the stop helper
+/// gets exactly contract 2's variables.
+@Suite("Helper processes")
+struct HelperProcessTests {
+    @Test("Child environments never carry a password variable")
+    func childEnvironmentScrubsPasswords() {
+        let inherited = [
+            "PATH": "/usr/bin:/bin",
+            "HPC_PASSWORD": "secret",
+            "HPC_ASKPASS_PASSWORD": "secret",
+            "AIRE_PASSWORD": "secret",
+            "AIRE_ASKPASS_PASSWORD": "secret"
+        ]
+        let scrubbed = MonitorService.childEnvironment(from: inherited)
+        #expect(scrubbed == ["PATH": "/usr/bin:/bin"])
+        for name in MonitorService.passwordEnvironmentNames {
+            #expect(MonitorService.childEnvironment()[name] == nil)
+        }
+    }
+
+    @Test("Stop helper environment matches contract 2", arguments: ConnectionRoute.allCases)
+    func stopMasterEnvironment(route: ConnectionRoute) {
+        let settings = makeSettings(.calder, route: route)
+        let environment = MonitorService.stopMasterEnvironment(settings: settings, stopJumpIfUnused: false)
+        #expect(environment["HPC_PROJECT_ROOT"] == settings.projectRoot)
+        #expect(environment["HPC_RUNTIME_DIR"] == settings.runtimeDirectory)
+        #expect(environment["HPC_CONTROL_PATH"] == settings.controlPath)
+        #expect(environment["HPC_HOSTNAME"] == settings.hostname)
+        #expect(environment["HPC_USERNAME"] == testUsername)
+        #expect(environment["HPC_TARGET_LABEL"] == "Calder")
+        #expect(environment["HPC_JUMP_HOSTNAME"] == "rash.leeds.ac.uk")
+        #expect(environment["HPC_STOP_JUMP_IF_UNUSED"] == "0")
+        for name in MonitorService.passwordEnvironmentNames {
+            #expect(environment[name] == nil)
+        }
+        switch route {
+        case .rashJump:
+            #expect(environment["HPC_USE_JUMP_HOST"] == "1")
+            #expect(environment["HPC_JUMP_CONTROL_PATH"] == settings.jumpControlPath)
+        case .directVPN:
+            #expect(environment["HPC_USE_JUMP_HOST"] == "0")
+            #expect(environment["HPC_JUMP_CONTROL_PATH"] == nil)
+        }
+    }
+
+    @Test("The jump master is offered for closing only on request, and only on the rash route")
+    func stopJumpIfUnused() {
+        let rash = makeSettings(.aire, route: .rashJump)
+        #expect(MonitorService.stopMasterEnvironment(settings: rash, stopJumpIfUnused: true)["HPC_STOP_JUMP_IF_UNUSED"] == "1")
+        let direct = makeSettings(.aire, route: .directVPN)
+        #expect(MonitorService.stopMasterEnvironment(settings: direct, stopJumpIfUnused: true)["HPC_STOP_JUMP_IF_UNUSED"] == "0")
+    }
+
+    @Test("Stop helper status lines are read, and a kept jump session is recognised")
+    func stopReport() {
+        let output = """
+        some noise
+        HPC-STATUS: stopped the AIRE session
+        HPC-STATUS: kept the shared jump-host session (rash.leeds.ac.uk): another connection still uses it
+        """
+        let report = StopMasterReport(statusLines: MonitorService.statusLines(in: output))
+        #expect(report.statusLines == [
+            "stopped the AIRE session",
+            "kept the shared jump-host session (rash.leeds.ac.uk): another connection still uses it"
+        ])
+        #expect(report.keptSharedJumpSession)
+        #expect(!report.stoppedSharedJumpSession)
+        let stopped = StopMasterReport(statusLines: ["stopped the Calder session", "stopped the shared jump-host session (rash.leeds.ac.uk)"])
+        #expect(stopped.stoppedSharedJumpSession)
+        #expect(!stopped.keptSharedJumpSession)
+    }
+
+    @Test("Remote commands ride the master with the shared never-prompt options")
+    func remoteCommandArguments() {
+        let settings = makeSettings(.aire, route: .rashJump)
+        let arguments = MonitorService.remoteCommandArguments(settings: settings, command: "scancel '42'")
+        #expect(Array(arguments.prefix(2)) == ["-S", settings.controlPath])
+        #expect(Array(arguments.suffix(2)) == [settings.hostname, "scancel '42'"])
+        for option in ["BatchMode=yes", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no", "ControlMaster=no", "ConnectTimeout=5", "User=\(testUsername)"] {
+            #expect(arguments.contains(option), "missing \(option)")
+        }
+        #expect(arguments == SSHMuxOptions.sshArguments(settings: settings) + [settings.hostname, "scancel '42'"])
     }
 }

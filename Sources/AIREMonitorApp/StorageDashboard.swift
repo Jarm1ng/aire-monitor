@@ -1,14 +1,21 @@
+import HPCCore
 import SwiftUI
 
 /// One cluster's Storage tab. `storage` arrives pre-sorted (home, scratch,
-/// flash, others). Colors, icons and trend series all come from
+/// flash, others). Icons and identity colours come from
 /// `StorageSummary.kind`, never from a particular cluster's labels or mount
 /// points, so AIRE's /mnt/scratch, Calder's /scratch-calder and future
-/// /scratch-aire, /flash-* spaces render without code changes.
+/// /scratch-aire, /flash-* spaces render without code changes. How full a
+/// space is shows only through the shared status tone
+/// (`StorageSummary.usageTone`: 75 % warning, 90 % or over quota critical),
+/// so a healthy Flash never wears a warning colour.
 struct StorageDashboard: View {
     let profile: ClusterProfile
     let storage: [StorageSummary]
     let history: [TrendPoint]
+
+    /// Shared with the Trends tab, so both chart the same period.
+    @AppStorage(TrendWindow.storageKey) private var window: TrendWindow = .hour
 
     private var overQuotaCount: Int {
         storage.filter { $0.overQuota == true }.count
@@ -26,6 +33,9 @@ struct StorageDashboard: View {
     }
 
     var body: some View {
+        // Parsed once per history version, windowed like the Trends tab.
+        let slice = TrendTimeline.cached(for: history).slice(window)
+
         VStack(alignment: .leading, spacing: 14) {
             PageHeader(
                 title: "Storage",
@@ -39,10 +49,10 @@ struct StorageDashboard: View {
                             label: "Over quota",
                             value: "\(overQuotaCount)",
                             systemImage: "exclamationmark.triangle.fill",
-                            color: .red
+                            color: StatusTone.critical.color
                         )
                     }
-                    InfoChip(label: "Spaces", value: "\(storage.count)", systemImage: "folder", color: .teal)
+                    TrendWindowPicker(window: $window)
                 }
             }
 
@@ -55,7 +65,7 @@ struct StorageDashboard: View {
             } else {
                 StorageColumnsLayout(minimumColumnWidth: 290, spacing: 12) {
                     ForEach(storage) { item in
-                        StorageCard(item: item, trendValues: trendValues(for: item))
+                        StorageCard(item: item, trend: trendSeries(for: item, in: slice))
                     }
                 }
 
@@ -64,29 +74,32 @@ struct StorageDashboard: View {
         }
     }
 
-    /// History series for a space. TrendPoint keeps one value per kind (the
-    /// first home/scratch/flash space of each snapshot), so a kind that
-    /// appears more than once gets no chart rather than a borrowed one.
-    private func trendValues(for item: StorageSummary) -> [Double] {
+    /// History series for a space over the shared window. TrendPoint keeps
+    /// one value per kind (the first home/scratch/flash space of each
+    /// snapshot), so a kind that appears more than once gets no chart rather
+    /// than a borrowed one.
+    private func trendSeries(for item: StorageSummary, in slice: TrendSlice) -> TrendSeries? {
         guard storage.filter({ $0.kind == item.kind }).count == 1 else {
-            return []
+            return nil
         }
+        let series: TrendSeries
         switch item.kind {
         case .home:
-            return history.compactMap(\.homeUsedPercent)
+            series = slice.series(maxPoints: 240, \.homeUsedPercent)
         case .scratch:
-            return history.compactMap(\.scratchUsedPercent)
+            series = slice.series(maxPoints: 240, \.scratchUsedPercent)
         case .flash:
-            return history.compactMap(\.flashUsedPercent)
+            series = slice.series(maxPoints: 240, \.flashUsedPercent)
         case .other:
-            return []
+            return nil
         }
+        return series.isEmpty ? nil : series
     }
 }
 
 struct StorageCard: View {
     let item: StorageSummary
-    let trendValues: [Double]
+    var trend: TrendSeries? = nil
 
     private var percent: Double {
         min(max(item.usedPercent ?? 0, 0), 100)
@@ -96,8 +109,13 @@ struct StorageCard: View {
         item.overQuota == true
     }
 
-    private var color: Color {
-        StorageCard.accent(for: item)
+    private var tone: StatusTone {
+        item.usageTone
+    }
+
+    /// Status colour for everything that says how full the space is.
+    private var statusColor: Color {
+        StorageCard.statusColor(for: item)
     }
 
     /// Whole-filesystem numbers (df) are not a personal quota: say "Size"
@@ -111,9 +129,16 @@ struct StorageCard: View {
             HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 8) {
-                        Label(item.label, systemImage: item.kind.systemImage)
-                            .font(.headline.weight(.semibold))
-                            .foregroundStyle(color)
+                        // Identity (icon in the kind colour) is kept apart
+                        // from status (ring, bars, values).
+                        Label {
+                            Text(item.label)
+                                .foregroundStyle(.primary)
+                        } icon: {
+                            Image(systemName: item.kind.systemImage)
+                                .foregroundStyle(item.kind.color)
+                        }
+                        .font(.headline.weight(.semibold))
                         if isOverQuota {
                             overQuotaBadge
                         }
@@ -148,24 +173,25 @@ struct StorageCard: View {
             }
 
             HStack(spacing: 10) {
-                StorageStat(title: "Used", value: formatGB(item.usedGB), color: color)
-                StorageStat(title: "Free", value: formatGB(item.availableGB), color: isOverQuota ? .red : .green)
+                StorageStat(title: "Used", value: formatGB(item.usedGB), color: tone == .normal ? .primary : statusColor)
+                StorageStat(title: "Free", value: formatGB(item.availableGB), color: isOverQuota ? StatusTone.critical.color : .primary)
                 StorageStat(title: limitTitle, value: formatGB(item.limitGB), color: .secondary)
             }
 
-            if !trendValues.isEmpty {
-                TrendChart(values: trendValues, color: color, isPercentage: true, threshold: 90)
-                    .frame(height: 72)
+            if let trend {
+                TimeTrendChart(series: trend, color: statusColor, isPercentage: true, thresholds: storageThresholds, compact: true)
+                    .equatable()
+                    .frame(height: 86)
             }
 
-            if let fileLimit = item.fileLimit, fileLimit > 0 {
-                StorageFileBar(count: item.fileCount, limit: fileLimit, color: color)
+            if let fileLimit = item.fileLimit ?? item.fileQuota, fileLimit > 0 {
+                StorageFileBar(count: item.fileCount, limit: fileLimit)
             }
         }
         // Fill the row height StorageColumnsLayout offers, so neighbouring
         // cards line up even when only some have a trend chart or file bar.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .dashboardCard(accent: color)
+        .dashboardCard(accent: tone == .warning || tone == .critical ? statusColor : .primary)
         .animation(AppTheme.smoothEase, value: percent)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(item.label) storage")
@@ -178,7 +204,7 @@ struct StorageCard: View {
     @ViewBuilder
     private var ringMeter: some View {
         if item.usedPercent != nil {
-            RingMeter(value: percent / 100, color: color, label: isOverQuota ? "over" : "used")
+            RingMeter(value: percent / 100, color: statusColor, label: isOverQuota ? "over" : "used")
         } else {
             ZStack {
                 Circle()
@@ -194,11 +220,11 @@ struct StorageCard: View {
     private var overQuotaBadge: some View {
         Label("Over quota", systemImage: "exclamationmark.triangle.fill")
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(.red)
+            .foregroundStyle(StatusTone.critical.color)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(Color.red.opacity(0.12), in: Capsule())
-            .overlay(Capsule().stroke(Color.red.opacity(0.28), lineWidth: 1))
+            .background(StatusTone.critical.color.opacity(0.12), in: Capsule())
+            .overlay(Capsule().stroke(StatusTone.critical.color.opacity(0.28), lineWidth: 1))
             .help("Usage is above the soft quota. Writes start failing once the grace period expires or the hard limit is reached.")
     }
 
@@ -222,6 +248,13 @@ struct StorageCard: View {
         }
         if isOverQuota {
             parts.append("over quota")
+        } else if item.fileCountDominates, let files = item.fileUsedPercent {
+            parts.append("\(Int(files.rounded())) percent of the file limit")
+        }
+        switch tone {
+        case .warning: parts.append("warning")
+        case .critical: parts.append("critical")
+        default: break
         }
         if let caption = StorageCard.quotaCaption(for: item) {
             parts.append(caption)
@@ -234,16 +267,12 @@ struct StorageCard: View {
 
     // MARK: Shared presentation rules (also used by StorageComparison)
 
-    /// Over quota or >= 90% is red, >= 75% orange, otherwise the kind color.
-    static func accent(for item: StorageSummary) -> Color {
-        let percent = item.usedPercent ?? 0
-        if item.overQuota == true || percent >= 90 {
-            return .red
-        }
-        if percent >= 75 {
-            return .orange
-        }
-        return item.kind.color
+    /// The status colour of a space: the shared tone (space or file count,
+    /// whichever is closer to its limit; over quota is critical). Green
+    /// while healthy, never the kind colour, so an orange-ish identity can
+    /// not pass for a warning.
+    static func statusColor(for item: StorageSummary) -> Color {
+        item.usageTone.color
     }
 
     /// How the numbers were measured, e.g. "Lustre project quota · project
@@ -411,10 +440,13 @@ struct StorageStat: View {
 struct StorageFileBar: View {
     let count: Int?
     let limit: Int
-    let color: Color
 
     private var ratio: Double {
         min(Double(count ?? 0) / Double(max(limit, 1)), 1)
+    }
+
+    private var tone: StatusTone {
+        count == nil ? .unavailable : StatusTone(usedPercent: ratio * 100)
     }
 
     var body: some View {
@@ -422,13 +454,14 @@ struct StorageFileBar: View {
             HStack {
                 Text("Files")
                 Spacer()
-                Text("\(count ?? 0) / \(limit)")
+                Text("\(count.map(groupedNumber) ?? missingValuePlaceholder) of \(groupedNumber(limit))")
                     .monospacedDigit()
+                    .foregroundStyle(tone == .normal || tone == .unavailable ? Color.secondary : tone.color)
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
             ProgressView(value: ratio)
-                .tint(ratio > 0.9 ? .red : color)
+                .tint(tone.color)
                 .accessibilityLabel("File count usage")
                 .accessibilityValue("\(Int((ratio * 100).rounded())) percent")
         }
@@ -440,16 +473,20 @@ struct StorageComparison: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Space balance", subtitle: "Used share of each space's limit")
+            SectionHeader(title: "Space balance", subtitle: "Used share of each space's limit · warning from 75 %, critical from 90 %")
             // A Grid sizes the label column to the longest label, so
             // "Scratch" or a future "Project flash" never truncates while the
             // bars still line up.
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
                 ForEach(storage) { item in
                     GridRow {
-                        Label(item.label, systemImage: item.kind.systemImage)
+                        Label {
+                            Text(item.label)
+                        } icon: {
+                            Image(systemName: item.kind.systemImage)
+                                .foregroundStyle(item.kind.color)
+                        }
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(StorageCard.accent(for: item))
                             .lineLimit(1)
                             .fixedSize()
                             .accessibilityHidden(true)
@@ -457,9 +494,9 @@ struct StorageComparison: View {
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel("\(item.label) usage")
                             .accessibilityValue(accessibilityValue(for: item))
-                        Text(percentText(item.usedPercent))
+                        Text(pressureText(for: item))
                             .font(.caption.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(item.overQuota == true ? Color.red : Color.primary)
+                            .foregroundStyle(item.usageTone == .normal || item.usageTone == .unavailable ? Color.primary : item.usageTone.color)
                             .gridColumnAlignment(.trailing)
                             .accessibilityHidden(true)
                         Text("\(formatGB(item.usedGB)) / \(formatGB(item.limitGB))")
@@ -476,16 +513,25 @@ struct StorageComparison: View {
         .dashboardCard(accent: .teal)
     }
 
+    /// "63%", or "95% files" when the file count is the closer limit, so
+    /// the figure agrees with the colour beside it.
+    private func pressureText(for item: StorageSummary) -> String {
+        if item.fileCountDominates, let files = item.fileUsedPercent {
+            return "\(percentText(files)) files"
+        }
+        return percentText(item.usedPercent)
+    }
+
     private func usageBar(for item: StorageSummary) -> some View {
         let ratio = CGFloat(min(max((item.usedPercent ?? 0) / 100, 0), 1))
         return RoundedRectangle(cornerRadius: 5)
-            .fill(Color.green.opacity(0.16))
+            .fill(AppTheme.mutedFill)
             .frame(height: 12)
             .frame(maxWidth: .infinity)
             .overlay(alignment: .leading) {
                 GeometryReader { proxy in
                     RoundedRectangle(cornerRadius: 5)
-                        .fill(StorageCard.accent(for: item).opacity(0.85))
+                        .fill(StorageCard.statusColor(for: item).opacity(0.85))
                         .frame(width: proxy.size.width * ratio)
                 }
             }
@@ -496,6 +542,8 @@ struct StorageComparison: View {
         var value = percentText(item.usedPercent)
         if item.overQuota == true {
             value += ", over quota"
+        } else if item.fileCountDominates, let files = item.fileUsedPercent {
+            value += ", \(Int(files.rounded())) percent of the file limit"
         }
         return value
     }

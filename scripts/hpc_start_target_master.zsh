@@ -2,11 +2,18 @@
 # Start one cluster's background ControlMaster (AIRE, Calder, ...) on either
 # route: direct (VPN) or tunnelled through the shared rash jump master.
 #
-# This script always REPLACES this cluster's target master (it is the
-# "forced relogin" path); callers that want to reuse a healthy master check
-# it first, as hpc_ssh_login.expect does. It never touches the jump master or
-# any other cluster's master, keepalive, log or pid file: every file it
-# writes lives in this cluster's HPC_RUNTIME_DIR.
+# A healthy existing master for this cluster is REUSED (no Duo push) unless
+# HPC_FORCE_RELOGIN=1 asks for a replacement. A replacement tears the old
+# master down before authenticating, so callers should force only when the
+# user explicitly asked to replace a session: a failed forced login leaves
+# the cluster disconnected. Without forcing, an existing master is never
+# torn down: one that answers on its socket but not end to end is left
+# running and reported (exit 5), because only the user can tell a dead link
+# from a slow login node that still carries their terminals. The script
+# never touches the jump master or any other cluster's master, log or pid
+# file: every file it writes lives in this cluster's HPC_RUNTIME_DIR, and
+# every pid it signals is verified against this cluster's control socket
+# (see hpc_ssh_common.zsh).
 #
 # Environment:
 #   HPC_USERNAME           remote username (required)
@@ -17,12 +24,25 @@
 #   HPC_USE_JUMP_HOST      "1" to tunnel through the jump master (default 1)
 #   HPC_JUMP_HOSTNAME      jump host (default rash.leeds.ac.uk)
 #   HPC_JUMP_CONTROL_PATH  shared jump master socket (required with jump host)
+#   HPC_FORCE_RELOGIN      "1" replaces this cluster's master even if it still
+#                          works (default: reuse a healthy one, and leave one
+#                          that does not answer end to end running; exit 5)
+#   HPC_REUSE_ONLY         "1" adopts a healthy existing master and otherwise
+#                          exits 4 without touching anything: no password
+#                          needed, no teardown, no Duo. Also retires what
+#                          older releases left next to that master (a 5 s
+#                          keepalive, a permanent remote `sleep` session), so
+#                          the app can run it once for a session it re-adopts
+#                          at startup without signing in.
 #   HPC_DUO_OPTION         Duo menu answer (default 1 = push)
 #   HPC_RUNTIME_DIR        per-cluster logs/pids (default $HPC_PROJECT_ROOT/.runtime;
 #                          callers running several clusters must pass one
 #                          directory per cluster — the app always does)
 #   HPC_PROJECT_ROOT       repository root (default: parent of this script's dir)
-#   HPC_VERIFY_TIMEOUT     seconds to wait for the master to verify (default 90)
+#   HPC_TIMEOUT            seconds the authentication (connect, password and
+#                          Duo approval) may take before it is abandoned
+#                          (default 150)
+#   HPC_VERIFY_TIMEOUT     seconds to wait for the new master to verify (default 90)
 #   HPC_SSH_VERBOSE        "1" adds -vv to the master's ssh log
 #   HPC_DEBUG              "1" enables the redacted askpass prompt log
 #
@@ -32,15 +52,34 @@
 # environment immediately. The secret then reaches ssh's askpass helper only
 # through a private FIFO (see start_password_writer below) — never argv, and
 # never the environment, because `ssh -f` daemonizes into the long-lived
-# master with its environment intact.
+# master with its environment intact. Reusing a healthy master needs no
+# password at all.
+#
+# Lifetime: the master runs no remote command (-N), so ControlPersist=24h is
+# a real IDLE limit — it closes 24 h after its last client (the collector,
+# a terminal, a transfer) went away. hpc_stop_master.zsh closes it at once.
 #
 # Progress is reported on stdout as machine-readable lines:
 #   HPC-STATUS: <human-readable milestone>
+# A "waiting for Duo approval" line is printed only once the server has
+# actually asked for Duo, never while ssh is still connecting.
 #
 # Exit codes:
-#   13  the remote host rejected the password (wrong password)
-#   14  the remote host demanded a password change (expired password)
-#   3   HPC_USE_JUMP_HOST=1 but the shared jump master is not running
+#   0    connected (a new master, or a healthy existing one reused)
+#   2    configuration error (missing variable, helper or password)
+#   3    HPC_USE_JUMP_HOST=1 but the shared jump master is not running
+#   4    HPC_REUSE_ONLY=1 and there is no healthy master to reuse
+#   5    without HPC_FORCE_RELOGIN=1: a master answers on this cluster's
+#        socket, but the read-only check command did not come back through
+#        it within 15 s. It was left running (nothing on it closed, no
+#        password sent, no Duo); HPC_FORCE_RELOGIN=1 replaces it
+#   13   the remote host rejected the password (wrong password)
+#   14   the remote host demanded a password change (expired password)
+#   15   the password was accepted but Duo approval was not completed (push
+#        declined, timed out, or the connection dropped while waiting); no
+#        second push is ever requested
+#   124  timed out (HPC_TIMEOUT) before the server asked for Duo
+#   other  ssh's own exit status, with the master log on stderr
 set -euo pipefail
 umask 077
 
@@ -54,6 +93,16 @@ JUMP_HOSTNAME="${HPC_JUMP_HOSTNAME:-rash.leeds.ac.uk}"
 CONTROL_PATH="${HPC_CONTROL_PATH:?HPC_CONTROL_PATH is required}"
 JUMP_CONTROL_PATH="${HPC_JUMP_CONTROL_PATH:-}"
 DUO_OPTION="${HPC_DUO_OPTION:-1}"
+FORCE_RELOGIN="${HPC_FORCE_RELOGIN:-0}"
+REUSE_ONLY="${HPC_REUSE_ONLY:-0}"
+AUTH_TIMEOUT="${HPC_TIMEOUT:-150}"
+VERIFY_TIMEOUT="${HPC_VERIFY_TIMEOUT:-90}"
+if [[ "$AUTH_TIMEOUT" != <-> ]] || (( AUTH_TIMEOUT < 1 )); then
+  AUTH_TIMEOUT=150
+fi
+if [[ "$VERIFY_TIMEOUT" != <-> ]]; then
+  VERIFY_TIMEOUT=90
+fi
 
 # Password: stdin first line (preferred), legacy env var as fallback.
 PASSWORD=""
@@ -78,24 +127,15 @@ if [[ -n "$JUMP_CONTROL_PATH" && "$JUMP_CONTROL_PATH" != /* ]]; then
   JUMP_CONTROL_PATH="$ROOT_DIR/$JUMP_CONTROL_PATH"
 fi
 
-if [[ -z "$PASSWORD" ]]; then
-  print -u2 "$TARGET_LABEL password is required (stdin first line, or HPC_PASSWORD)"
+ASKPASS="$ROOT_DIR/scripts/hpc_ssh_askpass.sh"
+COMMON="$ROOT_DIR/scripts/hpc_ssh_common.zsh"
+if [[ ! -r "$COMMON" ]]; then
+  print -u2 "Shared login helpers are missing: $COMMON"
   exit 2
 fi
-
-ASKPASS="$ROOT_DIR/scripts/hpc_ssh_askpass.sh"
-KEEPALIVE="$ROOT_DIR/scripts/hpc_target_keepalive.zsh"
-STARTER="$ROOT_DIR/scripts/hpc_start_background_ssh.zsh"
+source "$COMMON"
 if [[ ! -x "$ASKPASS" ]]; then
   print -u2 "Askpass helper is missing or not executable: $ASKPASS"
-  exit 2
-fi
-if [[ ! -x "$KEEPALIVE" ]]; then
-  print -u2 "Target keepalive helper is missing or not executable: $KEEPALIVE"
-  exit 2
-fi
-if [[ ! -x "$STARTER" ]]; then
-  print -u2 "Background starter is missing or not executable: $STARTER"
   exit 2
 fi
 
@@ -103,129 +143,104 @@ control_dir="$(dirname -- "$CONTROL_PATH")"
 mkdir -p -m 700 -- "$control_dir" "$RUNTIME_DIR"
 chmod 700 "$control_dir" "$RUNTIME_DIR" 2>/dev/null || true
 
-proxy_args=()
 if [[ "$USE_JUMP_HOST" == "1" ]]; then
   if [[ -z "$JUMP_CONTROL_PATH" ]]; then
     print -u2 "HPC_JUMP_CONTROL_PATH is required when HPC_USE_JUMP_HOST=1"
     exit 2
   fi
-  proxy_command="ssh -o BatchMode=yes -o ControlPath=${(q)JUMP_CONTROL_PATH} -o User=${(q)REMOTE_USERNAME} -W %h:%p ${(q)JUMP_HOSTNAME}"
-  proxy_args=(-o "ProxyCommand=$proxy_command")
+  if [[ "$JUMP_CONTROL_PATH" == "$CONTROL_PATH" ]]; then
+    print -u2 "HPC_CONTROL_PATH must differ from the shared jump master's HPC_JUMP_CONTROL_PATH"
+    exit 2
+  fi
+fi
+hpc_set_proxy_args "$USE_JUMP_HOST" "$JUMP_CONTROL_PATH" "$REMOTE_USERNAME" "$JUMP_HOSTNAME"
+hpc_set_verify_base "$CONTROL_PATH" "$REMOTE_USERNAME"
+verify_base=("${hpc_verify_base[@]}")
+target_command="$hpc_target_command"
 
+# Per-cluster runtime files. Names are cluster-neutral because the directory
+# itself is per cluster (.runtime/clusters/<id>/ when launched by the app).
+# The pid file is additionally per CONTROL PATH (route + username), so a
+# login on one route never erases the record of the other route's master.
+log_path="$RUNTIME_DIR/master_ssh.log"
+pid_path="$(hpc_master_pid_file "$RUNTIME_DIR" "$CONTROL_PATH")"
+legacy_pid_path="$RUNTIME_DIR/master_ssh.pid"
+legacy_keepalive_pid_path="$RUNTIME_DIR/keepalive.pid"
+askpass_fifo="$RUNTIME_DIR/askpass.fifo"
+askpass_events="$RUNTIME_DIR/askpass.events"
+
+capture_master_pid() {
+  local out
+  out="$("${verify_base[@]}" -O check "$TARGET_HOSTNAME" 2>&1 || true)"
+  if [[ "$out" =~ 'pid=([0-9]+)' ]]; then
+    print -- "${match[1]}" >| "$pid_path"
+  fi
+}
+
+# Upgrade cleanup, on every path through this script: older releases ran a
+# keepalive next to each master (a remote `true` every 5 s, for ever, which
+# also stopped the master from ever going idle).
+hpc_stop_legacy_keepalives "$CONTROL_PATH" "$legacy_keepalive_pid_path"
+
+# ---------------------------------------------------------------------------
+# Reuse a healthy master unless a replacement was explicitly requested.
+# Healthy = the control socket answers (`-O check`, instant and local) AND a
+# read-only command runs through it within 15 s.
+#
+# A master that answers on its socket but fails the second half is NOT torn
+# down by a plain sign-in. It may be wedged (link dead, its terminals gone
+# with it), but it may just as well be slow — an overloaded login node, a
+# stalled home filesystem holding up the new session's shell — while it
+# still carries the user's shells, editors and `srun --pty` allocations,
+# and those two look the same from here. So the plain sign-in exits 5 and
+# leaves it alone; the app then points to its confirmed Reconnect
+# (HPC_FORCE_RELOGIN=1), which says how many terminals close. A really dead
+# link also closes itself within about five minutes (ServerAlive 30 s x 10),
+# after which a plain sign-in finds no master and logs in normally.
+# ---------------------------------------------------------------------------
+if [[ "$FORCE_RELOGIN" != "1" || "$REUSE_ONLY" == "1" ]]; then
+  if "${verify_base[@]}" -O check "$TARGET_HOSTNAME" >/dev/null 2>&1; then
+    reuse_output=""
+    if reuse_output="$(perl -e 'alarm shift; exec @ARGV' 15 \
+          "${verify_base[@]}" "$TARGET_HOSTNAME" "$target_command" 2>/dev/null)" \
+        && [[ "$reuse_output" == *"auth_ok|"* ]]; then
+      # A master from an older release still carries a permanent remote
+      # `sleep` session; end it so ControlPersist can finally expire.
+      hpc_end_legacy_session_clients "$CONTROL_PATH"
+      capture_master_pid
+      print "HPC-STATUS: reusing the existing $TARGET_LABEL session"
+      print "HPC-STATUS: connected to $TARGET_LABEL"
+      print -- "$reuse_output"
+      exit 0
+    fi
+    if [[ "$REUSE_ONLY" != "1" ]]; then
+      print -u2 "The existing $TARGET_LABEL session answers on its control socket, but a check command through it did not come back within 15 s. It was left running, so nothing on it was closed and no password was sent: its login node may be slow, or its connection may have died. Reconnect replaces it (its terminals close); a dead connection also closes by itself within about five minutes, and signing in then works normally."
+      exit 5
+    fi
+  fi
+fi
+
+if [[ "$REUSE_ONLY" == "1" ]]; then
+  print -u2 "No healthy $TARGET_LABEL session to reuse; sign in to $TARGET_LABEL."
+  exit 4
+fi
+
+if [[ -z "$PASSWORD" ]]; then
+  print -u2 "$TARGET_LABEL password is required (stdin first line, or HPC_PASSWORD)"
+  exit 2
+fi
+
+if [[ "$USE_JUMP_HOST" == "1" ]]; then
   # The jump master is shared by every cluster and owned by
   # hpc_ssh_login.expect; this script only rides on it. Check it before
-  # touching anything: with a dead jump socket the ProxyCommand's mux client
-  # would silently fall back to a direct BatchMode connection to the jump
-  # host, whose "Permission denied" must not be mistaken for this cluster
-  # rejecting the password — and there is no point tearing down this
-  # cluster's old master for a login that cannot succeed.
+  # touching anything: there is no point tearing down this cluster's old
+  # master for a login that cannot succeed.
   if ! ssh -n -o BatchMode=yes -o ControlPath="$JUMP_CONTROL_PATH" \
       -O check -o User="$REMOTE_USERNAME" "$JUMP_HOSTNAME" >/dev/null 2>&1; then
     print -u2 "The shared jump-host session ($JUMP_HOSTNAME) is not running, so $TARGET_LABEL cannot be reached through it. Authenticate the jump host first (hpc_ssh_login.expect with HPC_SKIP_TARGET=1), then retry."
     exit 3
   fi
-else
-  proxy_args=(-o ProxyCommand=none -o ProxyJump=none)
 fi
-
-verify_base=(
-  ssh
-  -n
-  -o BatchMode=yes
-  -o PubkeyAuthentication=no
-  -o GSSAPIAuthentication=no
-  -o PasswordAuthentication=no
-  -o KbdInteractiveAuthentication=no
-  -o ConnectTimeout=20
-  -o ServerAliveInterval=30
-  -o ServerAliveCountMax=10
-  -o TCPKeepAlive=yes
-  -o ExitOnForwardFailure=yes
-  -o ControlPath="$CONTROL_PATH"
-  -o ControlMaster=auto
-  -o User="$REMOTE_USERNAME"
-  "${proxy_args[@]}"
-)
-
-target_command='printf '\''auth_ok|%s|%s|%s\n'\'' "$(hostname -f 2>/dev/null || hostname)" "$(whoami)" "$(date -Iseconds 2>/dev/null || date)"'
-
-# Per-cluster runtime files. Names are cluster-neutral because the directory
-# itself is per cluster (.runtime/clusters/<id>/ when launched by the app).
-log_path="$RUNTIME_DIR/master_ssh.log"
-pid_path="$RUNTIME_DIR/master_ssh.pid"
-keepalive_log_path="$RUNTIME_DIR/keepalive.log"
-keepalive_pid_path="$RUNTIME_DIR/keepalive.pid"
-keepalive_starter_log_path="$RUNTIME_DIR/keepalive_starter.log"
-askpass_fifo="$RUNTIME_DIR/askpass.fifo"
-askpass_events="$RUNTIME_DIR/askpass.events"
-legacy_keepalive_label="local.aire.target-keepalive"
-
-# Kill a pid only after verifying it is one of OUR ssh processes for exactly
-# this control socket. Two process shapes qualify:
-#   - "ssh: <control-path> [mux]": the detached master. OpenSSH rewrites the
-#     master's process title to this once it has backgrounded, so its
-#     original argv (and any ControlPath= option) is no longer visible.
-#   - "ssh ... ControlPath=<control-path> ... ControlMaster=yes ...": a master
-#     still authenticating, or the session client that `ssh -f` with
-#     ControlPersist leaves behind running the remote `sleep`.
-# For the argv shape the *first* ControlPath option must match exactly:
-# every master tunnelled through the shared jump host embeds the jump
-# ControlPath inside its ProxyCommand string. Requiring ControlMaster=yes
-# additionally keeps every cluster's `-W` proxy (an `ssh ... ControlPath=<jump>`
-# mux client without ControlMaster=yes) out of reach.
-kill_verified_pid() {
-  local pid="$1" control_path="$2" cmdline first_cp
-  [[ "$pid" == <-> ]] || return 1
-  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  # setproctitle pads the rewritten title with spaces; drop them.
-  cmdline="${cmdline%"${cmdline##*[![:space:]]}"}"
-  if [[ "$cmdline" == "ssh: $control_path [mux]" || "$cmdline" == "ssh: $control_path [mux] "* ]]; then
-    kill "$pid" 2>/dev/null || true
-    return 0
-  fi
-  [[ "$cmdline" == ssh\ * ]] || return 1
-  first_cp="${cmdline#*ControlPath=}"
-  [[ "$first_cp" != "$cmdline" ]] || return 1
-  first_cp="${first_cp%% *}"
-  [[ "$first_cp" == "$control_path" ]] || return 1
-  [[ " $cmdline " == *" ControlMaster=yes "* ]] || return 1
-  kill "$pid" 2>/dev/null || true
-  return 0
-}
-
-kill_master_by_pid_file() {
-  local pid_file="$1" control_path="$2"
-  if [[ -s "$pid_file" ]]; then
-    kill_verified_pid "$(<"$pid_file")" "$control_path" || true
-  fi
-  rm -f -- "$pid_file"
-}
-
-kill_master_by_pattern() {
-  local control_path="$1" escaped pattern pid
-  escaped="$(printf '%s' "$control_path" | sed -e 's/[][^$.*+?(){}|\\]/\\&/g')"
-  # Candidates only; kill_verified_pid makes the final decision.
-  for pattern in "^ssh .*ControlPath=${escaped}" "^ssh: ${escaped} \\[mux\\]"; do
-    for pid in ${(f)"$(pgrep -f "$pattern" 2>/dev/null || true)"}; do
-      kill_verified_pid "$pid" "$control_path" || true
-    done
-  done
-}
-
-# The keepalive pid file can be stale (the keepalive exits itself when the
-# master dies, leaving the file behind), so the recorded pid may have been
-# recycled by an unrelated process — or, with several clusters running, by
-# ANOTHER cluster's keepalive. Only kill after confirming the pid is numeric
-# and its argv is the keepalive script immediately followed by THIS cluster's
-# control path (the keepalive's first positional argument).
-kill_verified_keepalive_pid() {
-  local pid="$1" control_path="$2" cmdline
-  [[ "$pid" == <-> ]] || return 1
-  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$cmdline" == *"hpc_target_keepalive.zsh $control_path "* ]] || return 1
-  kill "$pid" 2>/dev/null || true
-  return 0
-}
 
 # Hand the password to the askpass helper without putting it in any argv or
 # environment: a writer subshell offers it ONCE on a 0600 FIFO inside this
@@ -300,57 +315,65 @@ cleanup_secret_handoff() {
   fi
   rm -f -- "$askpass_fifo"
 }
+
+# The authenticating ssh runs in the background (so this script can report
+# what the server is actually asking for, and enforce HPC_TIMEOUT); it must
+# never outlive the script that is waiting on it.
+ssh_pid=""
+stop_auth_ssh() {
+  local pid="$ssh_pid" tries=0
+  [[ -n "$pid" ]] || return 0
+  ssh_pid=""
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && (( tries < 20 )); do
+    zselect -t 10 2>/dev/null || true
+    tries=$(( tries + 1 ))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 trap cleanup_secret_handoff EXIT
-trap 'cleanup_secret_handoff; exit 130' INT TERM HUP
+trap 'stop_auth_ssh; cleanup_secret_handoff; exit 130' INT TERM HUP
 
 # Tear down any previous master for THIS cluster's socket: ask it to exit
-# cleanly, then fall back to pid-file and verified-pattern kills. The jump
-# master and other clusters' masters have different control paths and are
-# never matched.
+# cleanly, then signal its verified processes (per-path pid file, the shared
+# pid file of older releases, and a verified pattern search) and wait for
+# them to go, so the dying master cannot unlink the replacement's socket.
+# The jump master and other clusters' masters have different control paths
+# and are never matched.
 "${verify_base[@]}" -O exit "$TARGET_HOSTNAME" >/dev/null 2>&1 || true
 rm -f -- "$CONTROL_PATH"
-kill_master_by_pid_file "$pid_path" "$CONTROL_PATH"
-kill_master_by_pattern "$CONTROL_PATH"
+hpc_stop_master_processes "$CONTROL_PATH" "$pid_path" || true
+if [[ -s "$legacy_pid_path" ]]; then
+  hpc_stop_master_processes "$CONTROL_PATH" "$legacy_pid_path" || true
+fi
+hpc_retire_shared_pid_file "$legacy_pid_path" "$CONTROL_PATH" master
+rm -f -- "$pid_path"
 
 verbose_args=()
 if [[ "${HPC_SSH_VERBOSE:-0}" == "1" ]]; then
   verbose_args=(-vv)
 fi
 
+# -N: no remote command. The master exists only to carry other clients'
+# sessions, and with no session of its own ControlPersist counts real idle
+# time (an always-attached remote command would keep it alive for ever).
+# Compression applies to the target master only: on the rash route its
+# stream is what travels inside the jump tunnel, so compressing the jump
+# master as well would gain nothing. Snapshot JSON and file listings shrink
+# several-fold.
 master_args=(
   ssh
   "${verbose_args[@]}"
   -f
-  -o StrictHostKeyChecking=accept-new
-  -o PubkeyAuthentication=no
-  -o GSSAPIAuthentication=no
-  -o PreferredAuthentications=password,keyboard-interactive
-  -o KbdInteractiveAuthentication=yes
-  -o PasswordAuthentication=yes
-  -o NumberOfPasswordPrompts=1
-  -o ServerAliveInterval=30
-  -o ServerAliveCountMax=10
-  -o TCPKeepAlive=yes
-  -o ExitOnForwardFailure=yes
-  -o ConnectTimeout=20
-  -o ControlMaster=yes
-  -o ControlPersist=24h
+  -N
+  "${hpc_master_login_options[@]}"
+  -o Compression=yes
   -o ControlPath="$CONTROL_PATH"
   -o User="$REMOTE_USERNAME"
-  "${proxy_args[@]}"
+  "${hpc_proxy_args[@]}"
   "$TARGET_HOSTNAME"
-  sleep
-  2147483647
 )
-
-# Remove any keepalive left behind by older releases that used launchd (the
-# launchctl-submit approach crash-looped when the master died, hammering the
-# cluster; the keepalive is now run via the background starter only).
-launchctl remove "$legacy_keepalive_label" >/dev/null 2>&1 || true
-if [[ -s "$keepalive_pid_path" ]]; then
-  kill_verified_keepalive_pid "$(<"$keepalive_pid_path")" "$CONTROL_PATH" || true
-  rm -f -- "$keepalive_pid_path"
-fi
 
 # Askpass logging is opt-in and redacted; enable with HPC_DEBUG=1.
 if [[ "${HPC_DEBUG:-0}" == "1" ]]; then
@@ -358,59 +381,149 @@ if [[ "${HPC_DEBUG:-0}" == "1" ]]; then
   export HPC_ASKPASS_LOG="$RUNTIME_DIR/askpass.log"
 fi
 
+# Events the askpass helper recorded for this login (fixed words, one per
+# line; see hpc_ssh_askpass.sh). Re-read on every poll.
+typeset -a events
+load_events() {
+  events=()
+  if [[ -s "$askpass_events" ]]; then
+    events=(${(f)"$(<"$askpass_events")"})
+  fi
+}
+has_event() {
+  (( ${events[(Ie)$1]} ))
+}
+
 print "HPC-STATUS: starting $TARGET_LABEL authentication"
-# The askpass helper answers the password and Duo-option prompts instantly,
-# so the foreground `ssh -f` below blocks for the entire Duo push approval:
-# tell the user now, before the launch, while they still have to act.
-print "HPC-STATUS: waiting for Duo approval on your phone ($TARGET_LABEL)"
-# Only the FIFO's path (not a secret) and the Duo menu answer reach ssh's
-# environment. Capture the exit status with `|| rc=$?` so an authentication
-# failure does not trip `set -e` before the wrong-password mapping below.
-# stdin is /dev/null so the daemonized master never holds the caller's pipe.
+# Only the FIFO's path, the events path and the control path (none of them
+# secret) and the Duo menu answer reach ssh's environment. stdin is
+# /dev/null so the daemonized master never holds the caller's pipe.
 start_password_writer
 rm -f -- "$askpass_events"
-rc=0
 HPC_ASKPASS_EVENTS="$askpass_events" \
 HPC_ASKPASS_FIFO="$askpass_fifo" \
 HPC_ASKPASS_DUO_OPTION="$DUO_OPTION" \
+HPC_ASKPASS_CONTROL_PATH="$CONTROL_PATH" \
 SSH_ASKPASS="$ASKPASS" \
 SSH_ASKPASS_REQUIRE=force \
 DISPLAY="${DISPLAY:-:0}" \
-"${master_args[@]}" < /dev/null >| "$log_path" 2>&1 || rc=$?
+"${master_args[@]}" < /dev/null >| "$log_path" 2>&1 &
+ssh_pid=$!
+
+# `ssh -f` returns once authentication (password + Duo) has completed or
+# failed. Meanwhile, report what the server has actually asked for: the Duo
+# line appears only after askpass answered a real Duo prompt, so a slow
+# connect (VPN off, a busy login node) never tells the user to approve a
+# push that is not coming.
+auth_deadline=$(( SECONDS + AUTH_TIMEOUT ))
+said_password=0
+said_duo=0
+timed_out=0
+while kill -0 "$ssh_pid" 2>/dev/null; do
+  load_events
+  if (( ! said_password )) && has_event password; then
+    print "HPC-STATUS: password sent ($TARGET_LABEL)"
+    said_password=1
+  fi
+  if (( ! said_duo )) && has_event duo; then
+    print "HPC-STATUS: waiting for Duo approval on your phone ($TARGET_LABEL)"
+    said_duo=1
+  fi
+  if (( SECONDS >= auth_deadline )); then
+    timed_out=1
+    stop_auth_ssh
+    break
+  fi
+  zselect -t 20 2>/dev/null || true
+done
+rc=0
+if [[ -n "$ssh_pid" ]]; then
+  wait "$ssh_pid" 2>/dev/null || rc=$?
+  ssh_pid=""
+fi
+if (( timed_out )); then
+  rc=124
+fi
 chmod 600 "$log_path" 2>/dev/null || true
 
-# Drop the secret before anything else (diagnostics, keepalive, verification)
-# happens, including the failure exits below.
+# Drop the secret before anything else (diagnostics, verification) happens,
+# including the failure exits below.
 cleanup_secret_handoff
 PASSWORD=""
 unset PASSWORD
+load_events
+# The poll above can miss an exchange that finished between two looks. The
+# app relies on this line: on a successful sign-in it is how the app knows
+# this leg really had the password checked (a reused master never sends it).
+if (( ! said_password )) && has_event password; then
+  print "HPC-STATUS: password sent ($TARGET_LABEL)"
+  said_password=1
+fi
 
-# True when the master's log shows this cluster refusing the password. A
+password_expired() {
+  has_event password-change
+}
+
+# The server asked for Duo, so it had accepted the password, and the login
+# still did not complete — unless pam_duo reported success (its
+# "Success. Logging you in..." lands in the master log) and something
+# unrelated failed afterwards.
+duo_not_approved() {
+  has_event duo || return 1
+  if [[ -s "$log_path" ]] && grep -qi 'success\. logging you in' "$log_path"; then
+    return 1
+  fi
+  return 0
+}
+
+# True when this cluster refused the password itself: the password was
+# actually sent (askpass recorded it), no Duo prompt followed, and either a
+# second password prompt arrived or the log shows "Permission denied". A
 # "Permission denied" attributed to the jump host comes from a `-W` proxy
-# that fell back to a direct connection (the jump master died mid-login), not
-# from a wrong password, and must not be reported as exit 13.
+# that fell back to a direct connection (the jump master died mid-login),
+# and a failure before the password was ever sent (connection refused,
+# Calder's "Not allowed at this time") can never be a wrong password.
 password_rejected() {
   local line lower
+  has_event password || return 1
+  if has_event password-retry; then
+    return 0
+  fi
   [[ -s "$log_path" ]] || return 1
   while IFS= read -r line; do
     lower="${line:l}"
     [[ "$lower" == *"permission denied"* ]] || continue
-    [[ "$USE_JUMP_HOST" == "1" && "$lower" == *"@${JUMP_HOSTNAME:l}:"* ]] && continue
+    if [[ "$USE_JUMP_HOST" == "1" && "$lower" == *"@${JUMP_HOSTNAME:l}:"* ]]; then
+      continue
+    fi
     return 0
   done < "$log_path"
   return 1
-}
-
-password_expired() {
-  [[ -s "$askpass_events" ]] && grep -qx 'password-change' "$askpass_events"
 }
 
 if (( rc != 0 )); then
   print -u2 "$TARGET_LABEL background master failed to start."
   if password_expired; then
     print -u2 "$TARGET_LABEL requires a password change (the password has expired)."
-    rm -f -- "$askpass_events"
     exit 14
+  fi
+  if duo_not_approved; then
+    if has_event duo-denied; then
+      print -u2 "$TARGET_LABEL: the Duo push was declined. The password was accepted; no further push was sent."
+    elif has_event duo-timeout || (( timed_out )); then
+      print -u2 "$TARGET_LABEL: the Duo push was not approved in time. The password was accepted; no further push was sent."
+    else
+      print -u2 "$TARGET_LABEL did not receive Duo approval (declined, timed out, or the connection dropped while waiting). The password was accepted."
+    fi
+    exit 15
+  fi
+  if (( timed_out )); then
+    print -u2 "Timed out while waiting for $TARGET_LABEL SSH, password, or Duo prompt (after ${AUTH_TIMEOUT}s)."
+    if [[ -s "$log_path" ]]; then
+      print -u2 "$TARGET_LABEL SSH log:"
+      tail -n 80 "$log_path" >&2 || true
+    fi
+    exit 124
   fi
   if password_rejected; then
     print -u2 "$TARGET_LABEL rejected the password."
@@ -423,38 +536,17 @@ if (( rc != 0 )); then
   exit $rc
 fi
 
-capture_master_pid() {
-  local out
-  out="$("${verify_base[@]}" -O check "$TARGET_HOSTNAME" 2>&1 || true)"
-  if [[ "$out" =~ 'pid=([0-9]+)' ]]; then
-    print -- "${match[1]}" >| "$pid_path"
-  fi
-}
-
-start_keepalive() {
-  HPC_BACKGROUND_SSH_PID_FILE="$keepalive_pid_path" \
-  HPC_BACKGROUND_STARTER_LOG="$keepalive_starter_log_path" \
-  "$STARTER" "$keepalive_log_path" "$KEEPALIVE" \
-    "$CONTROL_PATH" \
-    "$REMOTE_USERNAME" \
-    "$TARGET_HOSTNAME" \
-    "$USE_JUMP_HOST" \
-    "$JUMP_HOSTNAME" \
-    "$JUMP_CONTROL_PATH" \
-    >/dev/null || true
-}
-
-# `ssh -f` returns only after authentication (password + Duo) has completed,
-# so this loop just waits (bounded by wall clock) for the mux socket to become
-# usable. Probe the control socket first (instant) and only then run the full
-# verification command.
-deadline=$(( SECONDS + ${HPC_VERIFY_TIMEOUT:-90} ))
+# `ssh -f` returned 0, so authentication (password + Duo) completed; this
+# loop just waits (bounded by wall clock) for the mux socket to become
+# usable. Probe the control socket first (instant) and only then run the
+# full verification command.
+deadline=$(( SECONDS + VERIFY_TIMEOUT ))
 last_heartbeat=$(( SECONDS - 5 ))
 while (( SECONDS < deadline )); do
   if "${verify_base[@]}" -O check "$TARGET_HOSTNAME" >/dev/null 2>&1; then
-    if output="$("${verify_base[@]}" "$TARGET_HOSTNAME" "$target_command" 2>&1)"; then
+    if output="$(perl -e 'alarm shift; exec @ARGV' 25 \
+          "${verify_base[@]}" "$TARGET_HOSTNAME" "$target_command" 2>&1)"; then
       capture_master_pid
-      start_keepalive
       print "HPC-STATUS: connected to $TARGET_LABEL"
       print -- "$output"
       exit 0
@@ -467,12 +559,10 @@ while (( SECONDS < deadline )); do
   sleep 1
 done
 
+# Authentication succeeded, so whatever went wrong here is not the password
+# and not Duo: never report 13 or 15 from this point.
 print -u2 "$TARGET_LABEL background master did not become usable."
 if [[ -s "$log_path" ]]; then
-  if password_rejected; then
-    print -u2 "$TARGET_LABEL rejected the password."
-    exit 13
-  fi
   print -u2 "$TARGET_LABEL SSH log:"
   tail -n 80 "$log_path" >&2 || true
 fi

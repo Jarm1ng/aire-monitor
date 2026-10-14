@@ -15,7 +15,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-# Build outside the project volume (see scripts/run_macos_app.sh: sync tools
+# Build outside the project volume (see scripts/build_bundle.sh: sync tools
 # watching the project can break llbuild's database mid-build).
 USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime/")"
 SCRATCH_DIR="${HPC_TEST_BUILD_DIR:-${USER_TMP%/}/hpc-monitor-tests-build}"

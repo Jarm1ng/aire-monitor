@@ -1,3 +1,4 @@
+import HPCCore
 import SwiftUI
 
 /// One cluster's Jobs tab. Everything here is scoped to `profile`: Slurm job
@@ -8,6 +9,10 @@ struct JobsDashboard: View {
     let jobs: [Job]
     // Hoisted into DashboardView so both survive tab switches.
     @Binding var showDetails: Bool
+    /// The job whose sheet is open. A copy taken when the sheet opened; the
+    /// sheet itself always shows the CURRENT snapshot's version of that job
+    /// (looked up by id), and this copy is only the fallback once the job
+    /// has left the queue.
     @Binding var selectedJob: Job?
     /// Wired by DashboardView: switches to the terminal tab and tails stdout.
     var onTailOutput: (@MainActor (Job) -> Void)? = nil
@@ -17,158 +22,484 @@ struct JobsDashboard: View {
     /// and opens the job's working directory.
     var onBrowseWorkDir: (@MainActor (Job) -> Void)? = nil
 
-    private var runningJobs: [Job] {
-        jobs.filter { SlurmState(parsing: $0.state) == .running }
-    }
-
-    private var pendingJobs: [Job] {
-        jobs.filter { SlurmState(parsing: $0.state) == .pending }
-    }
-
-    private var gpuJobs: [Job] {
-        jobs.filter { $0.isGPUJob(on: profile) }
-    }
-
-    /// GPUs held or requested by this user's jobs. Safe to sum: a dashboard
-    /// covers one cluster, and each cluster has a single GPU pool.
-    private var requestedGPUCount: Int {
-        gpuJobs.reduce(0) { $0 + ($1.gpuRequest?.count ?? 0) }
-    }
-
-    private var gpuJobsSubtitle: String {
-        let count = requestedGPUCount
-        guard count > 0 else {
-            return "training or inference"
-        }
-        return count == 1 ? "1 GPU requested" : "\(count) GPUs requested"
-    }
+    /// When the selected job was last present in a snapshot, for the
+    /// "no longer in the queue" banner.
+    @State private var selectedLastSeen: (id: String, at: Date)?
 
     var body: some View {
+        // Parsed once per render: state, GPU request and GPU classification
+        // are read many times by the cards, the table and the metrics.
+        let rows = JobRow.rows(for: jobs, profile: profile)
+        let summary = JobQueueSummary(rows: rows)
+
         VStack(alignment: .leading, spacing: 14) {
             PageHeader(
                 title: "Job Activity",
-                subtitle: "Your current Slurm workload on \(profile.displayName)",
+                subtitle: "Your Slurm jobs on \(profile.displayName)",
                 systemImage: "waveform.path.ecg.rectangle",
                 accent: .blue
             ) {
                 DetailsToggleButton(showDetails: $showDetails)
             }
 
-            HStack(spacing: 12) {
-                MetricView(title: "Running", value: "\(runningJobs.count)", subtitle: "active jobs", systemImage: "play.fill", accent: .green)
-                MetricView(title: "Pending", value: "\(pendingJobs.count)", subtitle: "waiting", systemImage: "clock.fill", accent: .orange)
-                MetricView(title: "GPU Jobs", value: "\(gpuJobs.count)", subtitle: gpuJobsSubtitle, systemImage: "memorychip", accent: AppTheme.gpu)
-                MetricView(title: "Total", value: "\(jobs.count)", subtitle: "visible jobs", systemImage: "sum", accent: .purple)
+            HStack(alignment: .top, spacing: 12) {
+                MetricView(title: "Running", value: "\(summary.running)", subtitle: summary.runningSubtitle, systemImage: "play.fill", accent: .green)
+                MetricView(title: "Pending", value: "\(summary.pending)", subtitle: summary.pendingSubtitle, systemImage: "clock.fill", accent: .orange, help: summary.pendingHelp)
+                MetricView(title: "GPU jobs", value: "\(summary.gpuJobs)", subtitle: summary.gpuSubtitle, systemImage: "memorychip", accent: AppTheme.gpu)
+                MetricView(title: "Total", value: "\(summary.total)", subtitle: summary.totalSubtitle, systemImage: "sum", accent: .purple)
             }
 
-            if jobs.isEmpty {
+            if rows.isEmpty {
                 EmptyVisual(
                     title: "No jobs in the queue",
                     subtitle: "Jobs you submit on \(profile.displayName) will appear here after the next refresh.",
                     systemImage: "checkmark.circle"
                 )
             } else {
-                JobPulsePanel(profile: profile, jobs: jobs)
+                JobPulsePanel(profile: profile, rows: rows, summary: summary)
                     .transition(.opacity.combined(with: .move(edge: .top)))
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 340), spacing: 10)], spacing: 10) {
-                    ForEach(jobs) { job in
-                        JobCard(profile: profile, job: job) {
-                            selectedJob = job
+                // Running first, then waiting, then held: the order every
+                // surface shares (HPCCore `jobDisplayOrder`), with headers so
+                // a long pending queue never buries the running jobs.
+                ForEach(JobGroup.allCases) { group in
+                    let members = rows.filter { $0.group == group }
+                    if !members.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            SectionHeader(title: group.title, subtitle: group.countText(members))
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 340), spacing: 10, alignment: .top)], spacing: 10) {
+                                ForEach(members) { row in
+                                    // The card is plain data (Equatable), so
+                                    // SwiftUI skips unchanged cards; the action
+                                    // lives on this wrapper, not in the card.
+                                    Button {
+                                        selectedJob = row.job
+                                    } label: {
+                                        JobCard(row: row)
+                                            .equatable()
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel("Job \(row.job.name), \(row.job.displayJobID)")
+                                    .accessibilityValue(row.accessibilitySummary)
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityHint("Opens job details")
+                                }
+                            }
                         }
                     }
                 }
-                .padding(.vertical, 2)
             }
 
             if showDetails {
-                SectionHeader(title: "Job details", subtitle: "\(jobs.count) rows")
-                JobsTable(profile: profile, jobs: jobs)
+                SectionHeader(title: "Job details", subtitle: pluralized(rows.count, "row"))
+                JobsTable(rows: rows)
                     .frame(height: 300)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
         .animation(AppTheme.smoothEase, value: showDetails)
-        .sheet(item: $selectedJob) { job in
+        .sheet(item: $selectedJob) { selected in
+            // Always the current snapshot's version of the job, so a job that
+            // started or finished while the sheet is open is shown as such.
+            let live = jobs.first { $0.jobId == selected.jobId }
+            let job = live ?? selected
             JobDetailView(
                 profile: profile,
                 job: job,
+                isGone: live == nil,
+                lastSeen: selectedLastSeen?.id == selected.jobId ? selectedLastSeen?.at : nil,
+                runningSiblings: Self.runningSiblings(of: job, in: jobs),
                 onTailOutput: onTailOutput,
                 onCancelJob: onCancelJob,
                 onBrowseWorkDir: onBrowseWorkDir
             )
         }
+        .onAppear {
+            noteSelectionSeen(in: jobs)
+        }
+        .onChange(of: selectedJob?.jobId) { _ in
+            noteSelectionSeen(in: jobs)
+        }
+        .onChange(of: jobs) { newJobs in
+            syncSelection(with: newJobs)
+        }
+    }
+
+    /// Keeps the stored copy in step with the queue while the job is still
+    /// listed (same id, so the sheet updates in place rather than
+    /// re-presenting); once it vanishes the copy is the last-seen state.
+    private func syncSelection(with newJobs: [Job]) {
+        guard let selected = selectedJob else {
+            return
+        }
+        if let live = newJobs.first(where: { $0.jobId == selected.jobId }) {
+            if live != selected {
+                selectedJob = live
+            }
+            selectedLastSeen = (selected.jobId, Date())
+        }
+    }
+
+    private func noteSelectionSeen(in jobs: [Job]) {
+        guard let selected = selectedJob, jobs.contains(where: { $0.jobId == selected.jobId }) else {
+            return
+        }
+        selectedLastSeen = (selected.jobId, Date())
+    }
+
+    /// Running tasks of the same job array, named in the cancel dialog of
+    /// the pending remainder so it is clear they keep running.
+    nonisolated static func runningSiblings(of job: Job, in jobs: [Job]) -> [Job] {
+        guard job.isArrayRemainder else {
+            return []
+        }
+        let arrayID = job.arrayJobID.map(String.init) ?? job.jobId
+        return jobs
+            .filter { candidate in
+                guard candidate.jobId != job.jobId, candidate.jobState.occupiesNodes else {
+                    return false
+                }
+                if let candidateArray = candidate.arrayJobID {
+                    return String(candidateArray) == arrayID
+                }
+                return candidate.jobId.hasPrefix("\(arrayID)_")
+            }
+            .sorted(by: jobDisplayOrder)
     }
 }
 
+// MARK: - Row model
+
+/// Sections of the Jobs grid, in display order.
+enum JobGroup: Int, CaseIterable, Identifiable {
+    case running
+    case waiting
+    case held
+    case other
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .running: return "Running"
+        case .waiting: return "Waiting"
+        case .held: return "Held"
+        case .other: return "Other"
+        }
+    }
+
+    /// "3 jobs", or "2 rows · 61 jobs" when array remainders stand for many.
+    func countText(_ rows: [JobRow]) -> String {
+        let jobs = rows.reduce(0) { $0 + $1.multiplicity }
+        if jobs == rows.count {
+            return pluralized(jobs, "job")
+        }
+        return "\(pluralized(rows.count, "row")) · \(pluralized(jobs, "job"))"
+    }
+}
+
+/// One job prepared for display. Built once per render of the Jobs tab, so
+/// cards and the table never re-parse TRES strings or states, and Equatable
+/// so SwiftUI can skip cards whose job did not change.
+struct JobRow: Identifiable, Equatable, Sendable {
+    let job: Job
+    let state: JobState
+    let gpu: JobGPURequest?
+    let isGPU: Bool
+    let reason: SlurmPendingReason?
+
+    var id: String { job.id }
+
+    init(job: Job, profile: ClusterProfile) {
+        self.job = job
+        state = job.jobState
+        gpu = job.gpuRequest
+        isGPU = job.isGPUJob(on: profile, gpuRequest: gpu)
+        reason = state.isPending ? SlurmPendingReason(job.reasonOrNodeList) : nil
+    }
+
+    /// Rows in the one display order every surface shares.
+    static func rows(for jobs: [Job], profile: ClusterProfile) -> [JobRow] {
+        jobs.sorted(by: jobDisplayOrder).map { JobRow(job: $0, profile: profile) }
+    }
+
+    var isHeld: Bool { reason?.isHeld ?? false }
+
+    /// Jobs this row stands for: the queued task count of an array
+    /// remainder, otherwise 1.
+    var multiplicity: Int { job.taskMultiplicity }
+
+    /// GPUs this row holds or asks for (per task × tasks for a remainder).
+    var gpuCount: Int { (gpu?.count ?? 0) * multiplicity }
+
+    var group: JobGroup {
+        if state.occupiesNodes {
+            return .running
+        }
+        if state.isPending {
+            return isHeld ? .held : .waiting
+        }
+        return .other
+    }
+
+    /// Pill text and colour: Slurm's state, except that a held job reads
+    /// "Held" in grey — it will not start however much capacity frees up,
+    /// so it must not look like an ordinary queued job.
+    var statusText: String {
+        isHeld ? "Held" : state.label
+    }
+
+    var statusColor: Color {
+        if isHeld {
+            return .gray
+        }
+        return SlurmState(job: state).color
+    }
+
+    var statusHelp: String {
+        if isHeld, let reason {
+            return "\(job.state) — \(reason.explanation)"
+        }
+        return job.state
+    }
+
+    /// One state-derived accent shared by the icon, tint, border and rail.
+    var accentColor: Color {
+        if isHeld {
+            return .gray
+        }
+        switch SlurmState(job: state) {
+        case .running:
+            return isGPU ? AppTheme.gpu : .green
+        case .pending:
+            return .orange
+        case .failed:
+            return StatusTone.critical.color
+        case .suspended:
+            return .yellow
+        default:
+            return .secondary
+        }
+    }
+
+    /// Node list for jobs on nodes; nil for queued jobs, whose `%R` column
+    /// is a reason, not a node list.
+    var nodeListText: String? {
+        if let list = job.nodeList, !list.isEmpty {
+            return list
+        }
+        if state.occupiesNodes, !job.reasonOrNodeList.isEmpty {
+            return job.reasonOrNodeList
+        }
+        return nil
+    }
+
+    /// "1 GPU", "2 × H200", or "1 × H200 per task" for an array remainder.
+    var gpuText: String? {
+        guard let gpu else {
+            return isGPU ? "GPU" : nil
+        }
+        return job.isArrayRemainder ? "\(gpu.summary) per task" : gpu.summary
+    }
+
+    var accessibilitySummary: String {
+        var parts = [statusText, "partition \(job.partition)"]
+        if job.isArrayRemainder {
+            parts.append(pluralized(multiplicity, "queued task"))
+        }
+        if state.occupiesNodes {
+            parts.append("elapsed \(elapsedText(job.elapsed))")
+        } else if let reason {
+            parts.append(reason.explanation)
+        }
+        if let gpuText {
+            parts.append(gpuText)
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Queue totals for the metric row. Array remainders count as the tasks
+/// they stand for, so 59 queued tasks never read as one pending job.
+///
+/// Pending never includes held jobs (HPCCore `JobQueueCounts`, which the
+/// overview, sidebar and menu bar use): a held job will not start however
+/// much capacity frees up, so it is counted and named on its own.
+struct JobQueueSummary: Equatable {
+    var running = 0
+    /// Waiting for capacity, priority or a dependency; held jobs excluded.
+    var pending = 0
+    var held = 0
+    var onDependency = 0
+    var other = 0
+    var total = 0
+    var gpuJobs = 0
+    var queuedArrayTasks = 0
+    /// GPUs held or requested, per GPU model ("H200", or "" for untyped
+    /// requests). Models are never added together.
+    var gpusByModel: [String: Int] = [:]
+
+    init(rows: [JobRow]) {
+        for row in rows {
+            let count = row.multiplicity
+            total += count
+            if row.job.isArrayRemainder {
+                queuedArrayTasks += count
+            }
+            if row.state.occupiesNodes {
+                running += count
+            } else if row.state.isPending {
+                if row.isHeld {
+                    held += count
+                } else {
+                    pending += count
+                    if row.reason?.isDependency == true {
+                        onDependency += count
+                    }
+                }
+            } else {
+                other += count
+            }
+            if row.isGPU {
+                gpuJobs += count
+                if row.gpuCount > 0 {
+                    gpusByModel[row.gpu?.modelDisplayName ?? "", default: 0] += row.gpuCount
+                }
+            }
+        }
+    }
+
+    var runningSubtitle: String {
+        other > 0 ? "\(other) suspended or ending" : "on nodes now"
+    }
+
+    /// "9 on dependency · +2 held": the dependency count is part of the
+    /// pending figure; held jobs are not, hence the "+", so queued work that
+    /// cannot start yet is told apart from jobs waiting for capacity
+    /// without reading as a subset of pending.
+    var pendingSubtitle: String {
+        var parts: [String] = []
+        if onDependency > 0 {
+            parts.append("\(onDependency) on dependency")
+        }
+        if held > 0 {
+            parts.append("+\(held) held")
+        }
+        return parts.isEmpty ? "waiting for a start" : parts.joined(separator: " · ")
+    }
+
+    /// The Pending tile's tooltip: what the figure counts and leaves out.
+    var pendingHelp: String {
+        var text = "\(pluralized(pending, "job")) waiting for resources, priority or a dependency"
+        if held > 0 {
+            text += "; \(pluralized(held, "held job")) on top, which will not start until released"
+        }
+        return text + "."
+    }
+
+    /// "8 GPUs requested", "6 × H200 + 2 × L40 requested".
+    var gpuSubtitle: String {
+        guard !gpusByModel.isEmpty else {
+            return gpuJobs > 0 ? "GPU count not reported" : "none in the queue"
+        }
+        let parts = gpusByModel
+            .sorted { lhs, rhs in lhs.value != rhs.value ? lhs.value > rhs.value : lhs.key < rhs.key }
+            .map { model, count in
+                model.isEmpty ? pluralized(count, "GPU") : "\(count) × \(model)"
+            }
+        return parts.joined(separator: " + ") + " requested"
+    }
+
+    /// Short enough for a quarter of the narrowest detail column; the
+    /// Pending tile beside it already says these tasks are queued.
+    var totalSubtitle: String {
+        queuedArrayTasks > 0 ? "incl. \(pluralized(queuedArrayTasks, "array task"))" : "in the queue"
+    }
+}
+
+// MARK: - Table
+
 struct JobsTable: View {
-    let profile: ClusterProfile
-    let jobs: [Job]
+    let rows: [JobRow]
 
     var body: some View {
         // Row identity is the bare job id, which is only unique because this
-        // table always shows a single cluster's jobs.
-        Table(jobs) {
-            TableColumn("Job ID", value: \.jobId)
-            TableColumn("Partition", value: \.partition)
-            TableColumn("Name", value: \.name)
-            TableColumn("GPUs") { job in
-                Text(gpuText(for: job))
+        // table always shows a single cluster's jobs. Rows arrive in the
+        // shared display order (running first).
+        Table(rows) {
+            TableColumn("Job ID") { row in
+                Text(row.job.displayJobID)
                     .monospacedDigit()
-                    .foregroundStyle(job.isGPUJob(on: profile) ? AppTheme.gpu : Color.secondary)
+                    .help(row.job.isArrayRemainder ? "\(pluralized(row.multiplicity, "queued task")) of array \(row.job.jobId)" : row.job.jobId)
             }
-            TableColumn("State", value: \.state)
-            TableColumn("Elapsed", value: \.elapsed)
-            TableColumn("Limit", value: \.timeLimit)
-            TableColumn("Nodes", value: \.nodes)
-            TableColumn("Reason / Node", value: \.reasonOrNodeList)
+            TableColumn("Partition") { row in
+                Text(row.job.partition)
+            }
+            TableColumn("Name") { row in
+                Text(row.job.name)
+            }
+            TableColumn("GPUs") { row in
+                Text(row.gpuText ?? missingValuePlaceholder)
+                    .monospacedDigit()
+                    .foregroundStyle(row.isGPU ? AppTheme.gpu : Color.secondary)
+            }
+            TableColumn("State") { row in
+                Text(row.statusText)
+                    .foregroundStyle(row.statusColor)
+                    .help(row.statusHelp)
+            }
+            TableColumn("Elapsed") { row in
+                Text(row.state.occupiesNodes ? elapsedText(row.job.elapsed) : missingValuePlaceholder)
+                    .monospacedDigit()
+                    .help(row.job.elapsed)
+            }
+            TableColumn("Limit") { row in
+                Text(formatSlurmTimeLimit(row.job.timeLimit))
+                    .monospacedDigit()
+                    .help(row.job.timeLimit)
+            }
+            TableColumn("Nodes") { row in
+                Text(row.job.nodes)
+                    .monospacedDigit()
+            }
+            TableColumn("Reason / Nodes") { row in
+                Text(row.reason?.explanation ?? row.nodeListText ?? missingValuePlaceholder)
+                    .help(row.job.reasonOrNodeList)
+            }
         }
-    }
-
-    /// GPU count and model when the TRES strings say; "GPU" for a job that is
-    /// only known to be a GPU job from its partition.
-    private func gpuText(for job: Job) -> String {
-        if let request = job.gpuRequest {
-            return request.summary
-        }
-        return job.isGPUJob(on: profile) ? "GPU" : missingValuePlaceholder
     }
 }
 
+// MARK: - Queue mix
+
+/// Proportions of the queue and where it runs. Counts live in the metric
+/// row above; this panel only shows the shape (no repeated numbers).
 struct JobPulsePanel: View {
     let profile: ClusterProfile
-    let jobs: [Job]
-
-    private var runningCount: Int {
-        jobs.filter { SlurmState(parsing: $0.state) == .running }.count
-    }
-
-    private var pendingCount: Int {
-        jobs.filter { SlurmState(parsing: $0.state) == .pending }.count
-    }
-
-    private var otherCount: Int {
-        max(jobs.count - runningCount - pendingCount, 0)
-    }
+    let rows: [JobRow]
+    let summary: JobQueueSummary
 
     private var stateSegments: [MeterSegment] {
         [
-            MeterSegment(id: "Running", value: runningCount, color: .green),
-            MeterSegment(id: "Pending", value: pendingCount, color: .orange),
-            MeterSegment(id: "Other", value: otherCount, color: .secondary.opacity(0.65))
+            MeterSegment(id: "Running", value: summary.running, color: .green),
+            MeterSegment(id: "Waiting", value: summary.pending, color: .orange),
+            MeterSegment(id: "Held", value: summary.held, color: .gray),
+            MeterSegment(id: "Other", value: summary.other, color: .secondary.opacity(0.65))
         ]
     }
 
-    /// Partitions ranked by job count. A partition reads as GPU when any of
-    /// its jobs is a GPU job, so the mix agrees with the cards and the GPU
-    /// tile; other partitions take their role icon from the profile.
+    /// Partitions ranked by job count (array tasks counted individually). A
+    /// partition reads as GPU when any of its jobs is a GPU job, so the mix
+    /// agrees with the cards and the GPU tile; other partitions take their
+    /// role icon from the profile.
     private var topPartitions: [(name: String, count: Int, isGPU: Bool)] {
-        Dictionary(grouping: jobs, by: \.partition)
+        Dictionary(grouping: rows, by: \.job.partition)
             .map { entry in
                 (
                     name: entry.key,
-                    count: entry.value.count,
-                    isGPU: entry.value.contains { $0.isGPUJob(on: profile) }
+                    count: entry.value.reduce(0) { $0 + $1.multiplicity },
+                    isGPU: entry.value.contains { $0.isGPU }
                 )
             }
             .sorted {
@@ -180,24 +511,34 @@ struct JobPulsePanel: View {
     }
 
     var body: some View {
+        let partitions = topPartitions
         HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: "Queue pulse", subtitle: "\(jobs.count) active records")
+                SectionHeader(title: "Queue mix", subtitle: "share of your \(pluralized(summary.total, "job"))")
                 SegmentedMeter(segments: stateSegments, height: 14)
-                HStack(spacing: 8) {
-                    InfoChip(label: "Run", value: "\(runningCount)", systemImage: "play.fill", color: .green)
-                    InfoChip(label: "Wait", value: "\(pendingCount)", systemImage: "clock.fill", color: .orange)
-                    InfoChip(label: "Other", value: "\(otherCount)", systemImage: "ellipsis", color: .secondary)
+                    .accessibilityLabel("Queue mix")
+                HStack(spacing: 12) {
+                    ForEach(stateSegments.filter { $0.value > 0 }) { segment in
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(segment.color)
+                                .frame(width: 7, height: 7)
+                            Text(segment.id)
+                        }
+                    }
                 }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             }
 
             Divider()
-                .frame(height: 106)
+                .frame(height: 76)
 
             VStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: "Partition mix", subtitle: "\(topPartitions.count) queues")
+                SectionHeader(title: "Partition mix", subtitle: pluralized(partitions.count, "queue"))
                 VStack(spacing: 7) {
-                    ForEach(Array(topPartitions.prefix(5)), id: \.name) { item in
+                    ForEach(Array(partitions.prefix(5)), id: \.name) { item in
                         HStack(spacing: 8) {
                             Image(systemName: partitionIcon(name: item.name, isGPU: item.isGPU))
                                 .foregroundStyle(item.isGPU ? AppTheme.gpu : AppTheme.cpu)
@@ -220,7 +561,7 @@ struct JobPulsePanel: View {
                         )
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel("Partition \(item.name)\(item.isGPU ? ", GPU" : "")")
-                        .accessibilityValue("\(item.count) job\(item.count == 1 ? "" : "s")")
+                        .accessibilityValue(pluralized(item.count, "job"))
                     }
                 }
             }
@@ -239,64 +580,65 @@ struct JobPulsePanel: View {
     }
 }
 
-struct JobCard: View {
-    let profile: ClusterProfile
-    let job: Job
-    var onSelect: (() -> Void)?
+// MARK: - Card
+
+/// A job card. Pure data — no closures — so it is Equatable and SwiftUI
+/// skips it when its row is unchanged; the Jobs grid wraps it in the Button
+/// that opens the sheet.
+struct JobCard: View, Equatable {
+    let row: JobRow
     @State private var isHovered = false
 
-    var body: some View {
-        Button {
-            onSelect?()
-        } label: {
-            cardContent
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            // Visual hover state only: pushing NSCursor here leaks a stuck
-            // pointing hand when the hovered card is removed by a refresh,
-            // because SwiftUI never delivers the terminal onHover(false).
-            isHovered = hovering
-        }
-        .animation(AppTheme.softSpring, value: isHovered)
-        .animation(AppTheme.smoothEase, value: job.state)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Job \(job.name), \(job.jobId)")
-        .accessibilityValue(accessibilitySummary)
-        .accessibilityAddTraits(.isButton)
-        .accessibilityHint("Opens job details")
+    nonisolated static func == (lhs: JobCard, rhs: JobCard) -> Bool {
+        lhs.row == rhs.row
     }
 
-    private var cardContent: some View {
+    var body: some View {
+        let accent = row.accentColor
+        let job = row.job
         VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Image(systemName: isGPU ? "memorychip" : "terminal")
+                        Image(systemName: row.isGPU ? "memorychip" : "terminal")
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(accentColor)
+                            .foregroundStyle(accent)
+                        // Middle truncation keeps the end of the name, which
+                        // is what tells pipeline stages apart
+                        // ("sweep-baseli…-fwd" / "…-score").
                         Text(job.name)
                             .font(.headline)
                             .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(job.name)
                     }
-                    Text(job.jobId)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Text(job.displayJobID)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if job.isArrayRemainder {
+                            Text("· \(pluralized(row.multiplicity, "task"))")
+                                .fixedSize()
+                        }
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 }
                 Spacer()
-                StatePill(state: job.state)
+                StatusCapsule(text: row.statusText, color: row.statusColor, help: row.statusHelp)
             }
 
             HStack(spacing: 12) {
-                Label(job.partition, systemImage: isGPU ? "memorychip" : "cpu")
+                Label(job.partition, systemImage: row.isGPU ? "memorychip" : "cpu")
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(accentColor.opacity(0.10), in: Capsule())
-                    .overlay(Capsule().stroke(accentColor.opacity(0.18), lineWidth: 1))
+                    .background(accent.opacity(0.10), in: Capsule())
+                    .overlay(Capsule().stroke(accent.opacity(0.18), lineWidth: 1))
                     .clipShape(Capsule())
-                Label("\(job.nodes) node\(job.nodes == "1" ? "" : "s")", systemImage: "server.rack")
+                Label(nodesText, systemImage: "server.rack")
+                    .lineLimit(1)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(.thinMaterial, in: Capsule())
@@ -307,23 +649,19 @@ struct JobCard: View {
             .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text("Elapsed")
-                    Spacer()
-                    Text(job.elapsed)
-                        .monospacedDigit()
+                if row.state.occupiesNodes {
+                    valueRow("Elapsed", elapsedText(job.elapsed), help: job.elapsed)
+                } else if row.state.isPending {
+                    // A queued job has no elapsed time; how long it has
+                    // waited, or when backfill expects it to start, says more.
+                    JobWaitRows(job: job)
                 }
-                HStack {
-                    Text("Limit")
-                    Spacer()
-                    Text(job.timeLimit)
-                        .monospacedDigit()
-                }
-                if let gpuRequest = job.gpuRequest {
+                valueRow("Limit", formatSlurmTimeLimit(job.timeLimit), help: job.timeLimit)
+                if let gpuText = row.gpuText {
                     HStack {
                         Text("GPUs")
                         Spacer()
-                        Text(gpuRequest.summary)
+                        Text(gpuText)
                             .monospacedDigit()
                             .foregroundStyle(AppTheme.gpu)
                     }
@@ -331,13 +669,7 @@ struct JobCard: View {
             }
             .font(.caption)
 
-            HStack {
-                Text(job.reasonOrNodeList)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-            }
+            footer
         }
         // GPU jobs carry an extra "GPUs" row; filling the grid row keeps
         // CPU-job cards beside them the same height instead of centred.
@@ -348,16 +680,16 @@ struct JobCard: View {
                 .fill(.regularMaterial)
                 .overlay {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(accentColor.opacity(cardTintOpacity))
+                        .fill(accent.opacity(isHovered ? 0.11 : 0.08))
                 }
         }
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(accentColor.opacity(isHovered ? 0.34 : 0.22), lineWidth: 1)
+                .stroke(accent.opacity(isHovered ? 0.34 : 0.22), lineWidth: 1)
         )
         .overlay(alignment: .top) {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(accentColor.opacity(0.70))
+                .fill(accent.opacity(0.70))
                 .frame(height: isHovered ? 4 : 3)
                 .padding(.horizontal, 10)
         }
@@ -365,49 +697,103 @@ struct JobCard: View {
         .shadow(color: Color.black.opacity(isHovered ? 0.10 : 0.04), radius: isHovered ? 12 : 6, x: 0, y: isHovered ? 6 : 2)
         .scaleEffect(isHovered ? 1.01 : 1)
         .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-
-    private var isGPU: Bool {
-        job.isGPUJob(on: profile)
-    }
-
-    private var accessibilitySummary: String {
-        var parts = [
-            SlurmState(parsing: job.state).label,
-            "partition \(job.partition)",
-            "elapsed \(job.elapsed)"
-        ]
-        if let gpuRequest = job.gpuRequest {
-            parts.append(gpuRequest.summary)
+        .onHover { hovering in
+            // Visual hover state only: pushing NSCursor here leaks a stuck
+            // pointing hand when the hovered card is removed by a refresh,
+            // because SwiftUI never delivers the terminal onHover(false).
+            isHovered = hovering
         }
-        return parts.joined(separator: ", ")
+        .animation(AppTheme.softSpring, value: isHovered)
+        .animation(AppTheme.smoothEase, value: job.state)
     }
 
-    /// One state-derived accent shared by the icon, tint, border, and top rail.
-    private var accentColor: Color {
-        switch SlurmState(parsing: job.state) {
-        case .running:
-            return isGPU ? AppTheme.gpu : .green
-        case .pending:
-            return .orange
-        case .unavailable:
-            return .red
-        default:
-            return .secondary
+    /// "1 node", or "1 node per task" for an array remainder.
+    private var nodesText: String {
+        let count = Int(row.job.nodes.trimmingCharacters(in: .whitespaces))
+        let base = count.map { pluralized($0, "node") } ?? "\(row.job.nodes) nodes"
+        return row.job.isArrayRemainder ? "\(base) per task" : base
+    }
+
+    /// Where it runs, or why it waits — labelled, never a bare "(Priority)".
+    @ViewBuilder
+    private var footer: some View {
+        if let nodes = row.nodeListText {
+            Label(nodes, systemImage: "server.rack")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help("Running on \(nodes)")
+        } else if let reason = row.reason {
+            Text("Reason: \(reason.explanation)")
+                .font(.caption)
+                .foregroundStyle(row.isHeld ? Color.primary : Color.secondary)
+                .lineLimit(2)
+                .help("Slurm reason: \(reason.raw)")
         }
     }
 
-    private var cardTintOpacity: Double {
-        isHovered ? 0.11 : 0.08
+    private func valueRow(_ title: String, _ value: String, help: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+                .monospacedDigit()
+                .help(help)
+        }
     }
 }
+
+/// "Waiting 2 h 5 min" (since submission) and, when backfill has an
+/// estimate, "Expected start in 40 min". Ticks once a minute on its own so
+/// the age never freezes while monitoring is paused.
+private struct JobWaitRows: View {
+    let job: Job
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            VStack(alignment: .leading, spacing: 5) {
+                if let submitted = job.submitTime.flatMap(SlurmTimestamp.parse) {
+                    HStack {
+                        Text("Waiting")
+                        Spacer()
+                        Text(slurmDurationText(seconds: max(Int(context.date.timeIntervalSince(submitted)), 0)))
+                            .monospacedDigit()
+                            .help("Submitted \(submitted.formatted(date: .abbreviated, time: .standard))")
+                    }
+                }
+                if let expected = job.startTime.flatMap(SlurmTimestamp.parse), expected > context.date {
+                    HStack {
+                        Text("Expected start")
+                        Spacer()
+                        Text(SlurmTimestamp.distanceText(to: expected, now: context.date))
+                            .monospacedDigit()
+                            .help("Slurm's backfill estimate: \(expected.formatted(date: .abbreviated, time: .standard)). Estimates move as other jobs finish early or new ones arrive.")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Detail sheet
 
 struct JobDetailView: View {
     @Environment(\.dismiss) private var dismiss
     /// The cluster the job lives on. Named on every remote action because the
     /// same job id can exist on another cluster as a different job.
     let profile: ClusterProfile
+    /// The current snapshot's version of the job, or its last-seen copy when
+    /// `isGone`.
     let job: Job
+    /// The job is no longer in the queue (finished, cancelled, or removed):
+    /// show the last-seen state and disable remote actions.
+    var isGone: Bool = false
+    /// When the job was last present in a snapshot.
+    var lastSeen: Date? = nil
+    /// Running tasks of the same array, for a pending remainder's cancel
+    /// dialog; nil when the caller does not know the rest of the queue.
+    var runningSiblings: [Job]? = nil
     var onTailOutput: (@MainActor (Job) -> Void)? = nil
     var onCancelJob: (@MainActor (Job) async throws -> Void)? = nil
     var onBrowseWorkDir: (@MainActor (Job) -> Void)? = nil
@@ -417,68 +803,81 @@ struct JobDetailView: View {
     @State private var cancelStatus: String?
     @State private var cancelFailed = false
 
+    /// The job parsed once, with the same state, reason and colour rules as
+    /// its card.
+    private var row: JobRow { JobRow(job: job, profile: profile) }
+
     var body: some View {
+        let row = self.row
+        let state = row.state
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(accentColor.opacity(0.14))
-                    Image(systemName: isGPU ? "memorychip" : "terminal")
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(accentColor)
-                }
-                .frame(width: 52, height: 52)
+            header(row)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(job.name)
-                        .font(.title2.weight(.semibold))
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        ClusterBadge(profile: profile, size: 16)
-                        Text("\(profile.displayName) • \(job.jobId) • \(job.partition)")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                }
-
-                Spacer()
-                StatePill(state: job.state)
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.bordered)
-                .keyboardShortcut(.cancelAction)
-                .disabled(isCancelling)
-                .accessibilityLabel("Close job details")
+            if isGone {
+                goneBanner
             }
 
             HStack(spacing: 12) {
-                DetailMetric(title: "Elapsed", value: job.elapsed, systemImage: "timer", accent: .blue)
-                DetailMetric(title: "Limit", value: job.timeLimit, systemImage: "hourglass", accent: .purple)
-                DetailMetric(title: "Nodes", value: job.nodes, systemImage: "server.rack", accent: .teal)
-                DetailMetric(title: "CPUs", value: number(job.numCpus), systemImage: "cpu", accent: .orange)
-                if let gpuRequest = job.gpuRequest {
-                    DetailMetric(title: "GPUs", value: gpuRequest.summary, systemImage: "memorychip", accent: AppTheme.gpu)
+                if state.occupiesNodes {
+                    DetailMetric(title: "Elapsed", value: elapsedText(job.elapsed), systemImage: "timer", accent: .blue)
+                } else if job.isArrayRemainder {
+                    DetailMetric(title: "Queued tasks", value: "\(job.taskMultiplicity)", systemImage: "square.stack.3d.down.right", accent: .orange)
+                }
+                DetailMetric(title: "Limit", value: formatSlurmTimeLimit(job.timeLimit), systemImage: "hourglass", accent: .purple)
+                DetailMetric(title: job.isArrayRemainder ? "Nodes per task" : "Nodes", value: job.nodes, systemImage: "server.rack", accent: .teal)
+                DetailMetric(title: job.isArrayRemainder ? "CPUs per task" : "CPUs", value: number(job.numCpus), systemImage: "cpu", accent: AppTheme.cpu)
+                if let gpuRequest = row.gpu {
+                    DetailMetric(title: job.isArrayRemainder ? "GPUs per task" : "GPUs", value: gpuRequest.summary, systemImage: "memorychip", accent: AppTheme.gpu)
                 }
             }
 
-            actionsRow
+            actionsRow(state: state)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     DetailSection(title: "Timeline", systemImage: "calendar.badge.clock") {
-                        DetailRow(label: "Submitted", value: job.submitTime)
-                        DetailRow(label: "Started", value: job.startTime)
-                        DetailRow(label: "Ends", value: job.endTime)
+                        TimestampRow(label: "Submitted", raw: job.submitTime)
+                        if state.isPending {
+                            // For a queued job Slurm's StartTime/EndTime are
+                            // backfill estimates, not facts; hide them when
+                            // Slurm has none.
+                            if job.startTime != nil {
+                                TimestampRow(label: "Expected start", raw: job.startTime, isEstimate: true)
+                            }
+                            if job.endTime != nil {
+                                TimestampRow(label: "Expected end", raw: job.endTime, isEstimate: true)
+                            }
+                        } else {
+                            TimestampRow(label: "Started", raw: job.startTime)
+                            TimestampRow(label: state.occupiesNodes ? "Ends by" : "Ended", raw: job.endTime)
+                        }
                         DetailRow(label: "Batch host", value: job.batchHost)
                     }
 
+                    if job.arrayJobID != nil || job.isArrayRemainder {
+                        DetailSection(title: "Job array", systemImage: "square.stack.3d.down.right") {
+                            DetailRow(label: "Array", value: job.arrayJobID.map(String.init) ?? job.jobId)
+                            if job.isArrayRemainder {
+                                DetailRow(label: "Queued tasks", value: queuedTasksText, monospaced: false)
+                                if let runningSiblings {
+                                    DetailRow(
+                                        label: "Running tasks",
+                                        value: runningSiblings.isEmpty ? "none right now" : siblingList(runningSiblings, limit: 8),
+                                        monospaced: false
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     DetailSection(title: "Resources", systemImage: "square.stack.3d.up") {
-                        DetailRow(label: "Node list", value: job.nodeList ?? job.reasonOrNodeList)
-                        DetailRow(label: "Tasks", value: number(job.numTasks))
+                        if let reason = row.reason {
+                            DetailRow(label: "Reason", value: reason.explanation, help: "Slurm reason: \(reason.raw)", monospaced: false)
+                        }
+                        // %R is a node list only for jobs on nodes; for a
+                        // queued job it is the reason shown above.
+                        DetailRow(label: "Node list", value: row.nodeListText)
+                        DetailRow(label: Self.slurmTasksLabel(for: job), value: number(job.numTasks), help: Self.slurmTasksHelp(for: job))
                         DetailRow(label: "Requested TRES", value: job.reqTres)
                         DetailRow(label: "Allocated TRES", value: job.allocTres)
                         DetailRow(label: "TRES per node", value: job.tresPerNode)
@@ -487,8 +886,8 @@ struct JobDetailView: View {
                     DetailSection(title: "Paths", systemImage: "folder") {
                         DetailRow(label: "Work directory", value: job.workDir)
                         DetailRow(label: "Command", value: job.command)
-                        DetailRow(label: "Stdout", value: job.stdoutPath)
-                        DetailRow(label: "Stderr", value: job.stderrPath)
+                        DetailRow(label: outputLabel("Stdout"), value: outputPath(job.stdoutPath), help: outputHelp)
+                        DetailRow(label: outputLabel("Stderr"), value: outputPath(job.stderrPath), help: outputHelp)
                     }
                 }
                 .padding(.bottom, 4)
@@ -509,18 +908,95 @@ struct JobDetailView: View {
         .interactiveDismissDisabled(isCancelling)
     }
 
-    /// Terminal-backed actions: tail the job's stdout, or scancel it after a
-    /// confirmation. Status of the last cancel attempt shows inline.
-    private var actionsRow: some View {
-        HStack(spacing: 10) {
+    private func header(_ row: JobRow) -> some View {
+        let accent = isGone ? Color.gray : row.accentColor
+        return HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(accent.opacity(0.14))
+                Image(systemName: row.isGPU ? "memorychip" : "terminal")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(accent)
+            }
+            .frame(width: 52, height: 52)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(job.name)
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(job.name)
+                HStack(spacing: 6) {
+                    ClusterBadge(profile: profile, size: 16)
+                    Text("\(profile.displayName) • \(job.displayJobID) • \(job.partition)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+
+            Spacer()
+            StatusCapsule(
+                text: isGone ? "Gone" : row.statusText,
+                color: isGone ? .gray : row.statusColor,
+                help: isGone ? "No longer in the queue; last state \(job.state)" : row.statusHelp
+            )
             Button {
-                onTailOutput?(job)
+                dismiss()
             } label: {
-                Label("Tail output", systemImage: "text.alignleft")
+                Image(systemName: "xmark")
             }
             .buttonStyle(.bordered)
-            .disabled(onTailOutput == nil || (job.stdoutPath ?? "").isEmpty || isPending)
-            .help(tailHelp)
+            .keyboardShortcut(.cancelAction)
+            .disabled(isCancelling)
+            .accessibilityLabel("Close job details")
+        }
+    }
+
+    private var goneBanner: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "tray")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("No longer in the queue")
+                    .font(.callout.weight(.semibold))
+                Text(goneDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(AppTheme.border, lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private var goneDetail: String {
+        let seen = lastSeen.map { "Last seen \($0.formatted(date: .omitted, time: .shortened)), " } ?? ""
+        return "\(seen)shown as it was then. It finished, was cancelled, or was removed; use sacct for its final state."
+    }
+
+    /// Terminal-backed actions: tail the job's stdout, or scancel it after a
+    /// confirmation. Status of the last cancel attempt shows inline.
+    private func actionsRow(state: JobState) -> some View {
+        HStack(spacing: 10) {
+            // The pending remainder of an array has no output file of its
+            // own (each task writes its own once it starts), so there is
+            // nothing to tail.
+            if !job.isArrayRemainder {
+                Button {
+                    onTailOutput?(job)
+                } label: {
+                    Label("Tail output", systemImage: "text.alignleft")
+                }
+                .buttonStyle(.bordered)
+                .disabled(onTailOutput == nil || (job.stdoutPath ?? "").isEmpty || state.isPending || isGone)
+                .help(tailHelp(state: state))
+            }
 
             Button {
                 // The callback closes this sheet (clearing selectedJob),
@@ -540,13 +1016,13 @@ struct JobDetailView: View {
             Button(role: .destructive) {
                 showCancelConfirmation = true
             } label: {
-                Label(isCancelling ? "Cancelling…" : "Cancel job", systemImage: "xmark.octagon")
+                Label(cancelButtonTitle, systemImage: "xmark.octagon")
             }
             .buttonStyle(.bordered)
             .tint(.red)
-            .disabled(onCancelJob == nil || isCancelling)
-            .help("Run scancel \(job.jobId) on \(profile.displayName)")
-            .accessibilityHint("Cancels this job on \(profile.displayName) after confirmation")
+            .disabled(onCancelJob == nil || isCancelling || isGone)
+            .help(cancelHelp)
+            .accessibilityHint(cancelAccessibilityHint)
 
             if isCancelling {
                 ProgressView()
@@ -565,18 +1041,78 @@ struct JobDetailView: View {
             Spacer(minLength: 0)
         }
         .animation(AppTheme.smoothEase, value: cancelStatus)
-        .alert("Cancel \(profile.displayName) job \(job.jobId)?", isPresented: $showCancelConfirmation) {
-            Button("Keep job", role: .cancel) {}
-            Button("Cancel job", role: .destructive) {
+        .alert(cancelAlertTitle, isPresented: $showCancelConfirmation) {
+            Button(job.isArrayRemainder ? "Keep tasks" : "Keep job", role: .cancel) {}
+            Button(cancelButtonTitle, role: .destructive) {
                 performCancel()
             }
         } message: {
-            Text("Cancel job \(job.jobId) \(job.name)? This runs scancel on \(profile.displayName) only.")
+            Text(cancelAlertMessage)
         }
     }
 
+    // MARK: Cancel wording
+
+    /// The array id `scancel --state=PENDING` targets for a remainder.
+    private var arrayID: String {
+        job.arrayJobID.map(String.init) ?? job.jobId
+    }
+
+    private var cancelButtonTitle: String {
+        if isCancelling {
+            return "Cancelling…"
+        }
+        return job.isArrayRemainder ? "Cancel queued tasks" : "Cancel job"
+    }
+
+    private var cancelAlertTitle: String {
+        if job.isArrayRemainder {
+            return "Cancel the queued tasks of \(profile.displayName) array \(arrayID)?"
+        }
+        return "Cancel \(profile.displayName) job \(job.jobId)?"
+    }
+
+    /// A remainder's cancel says exactly what happens to the running tasks:
+    /// `scancel <array id>` would kill them too, so the session runs
+    /// `scancel --state=PENDING <array id>`, which leaves them alone.
+    private var cancelAlertMessage: String {
+        if job.isArrayRemainder {
+            let tasks = pluralized(job.taskMultiplicity, "pending task")
+            let running: String
+            if let runningSiblings, !runningSiblings.isEmpty {
+                running = "Running tasks (\(siblingList(runningSiblings, limit: 4))) keep running."
+            } else {
+                running = "Tasks that are already running keep running."
+            }
+            return "Cancels the \(tasks) of array \(arrayID) (\(job.displayJobID)). \(running) This runs scancel --state=PENDING \(arrayID) on \(profile.displayName) only."
+        }
+        return "Cancel job \(job.jobId) \(job.name)? This runs scancel on \(profile.displayName) only."
+    }
+
+    private var cancelHelp: String {
+        if isGone {
+            return "This job is no longer in the queue"
+        }
+        if job.isArrayRemainder {
+            return "Run scancel --state=PENDING \(arrayID) on \(profile.displayName): cancels only the tasks still queued"
+        }
+        return "Run scancel \(job.jobId) on \(profile.displayName)"
+    }
+
+    private var cancelAccessibilityHint: String {
+        job.isArrayRemainder
+            ? "Cancels the queued tasks of this array on \(profile.displayName) after confirmation; running tasks keep running"
+            : "Cancels this job on \(profile.displayName) after confirmation"
+    }
+
+    private func siblingList(_ siblings: [Job], limit: Int) -> String {
+        let names = siblings.prefix(limit).map(\.jobId)
+        let extra = siblings.count - names.count
+        return names.joined(separator: ", ") + (extra > 0 ? " and \(extra) more" : "")
+    }
+
     private func performCancel() {
-        guard let onCancelJob, !isCancelling else {
+        guard let onCancelJob, !isCancelling, !isGone else {
             return
         }
         isCancelling = true
@@ -595,38 +1131,61 @@ struct JobDetailView: View {
         }
     }
 
-    private var isGPU: Bool {
-        job.isGPUJob(on: profile)
+    // MARK: Presentation
+
+    private var queuedTasksText: String {
+        var text = "\(job.arrayPendingTasks ?? missingValuePlaceholder) (\(pluralized(job.taskMultiplicity, "task")))"
+        if let throttle = job.arrayThrottle {
+            text += " · at most \(throttle) at once"
+        }
+        return text
+    }
+
+    /// Slurm expands `%a` in a pending remainder's output path to NO_VAL
+    /// (4294967294); show the per-task template instead of a path that will
+    /// never exist.
+    private func outputPath(_ path: String?) -> String? {
+        guard job.isArrayRemainder, let path else {
+            return path
+        }
+        return path.replacingOccurrences(of: "4294967294", with: "%a")
+    }
+
+    /// Slurm's ntasks. For an array remainder it is per array task, so the
+    /// bare word "Tasks" beside "Queued tasks 6" would contradict it.
+    nonisolated static func slurmTasksLabel(for job: Job) -> String {
+        job.isArrayRemainder ? "ntasks (per task)" : "Tasks"
+    }
+
+    nonisolated static func slurmTasksHelp(for job: Job) -> String? {
+        guard job.isArrayRemainder else {
+            return nil
+        }
+        return "Slurm's --ntasks for each array task; the array itself has \(pluralized(job.taskMultiplicity, "queued task"))."
+    }
+
+    private func outputLabel(_ base: String) -> String {
+        job.isArrayRemainder ? "\(base) (per task)" : base
+    }
+
+    private var outputHelp: String? {
+        job.isArrayRemainder ? "Each task writes its own file; %a is the task id." : nil
     }
 
     /// Slurm resolves the stdout path at submit time, but slurmstepd only
     /// creates the file once the job starts — tailing a pending job would
     /// just watch a path that does not exist yet.
-    private var isPending: Bool {
-        SlurmState(parsing: job.state) == .pending
-    }
-
-    private var tailHelp: String {
+    private func tailHelp(state: JobState) -> String {
+        if isGone {
+            return "This job is no longer in the queue"
+        }
         if (job.stdoutPath ?? "").isEmpty {
             return "This job has no stdout path"
         }
-        if isPending {
+        if state.isPending {
             return "Output file is created when the job starts"
         }
         return "Follow the job's stdout in the Terminal tab"
-    }
-
-    private var accentColor: Color {
-        switch SlurmState(parsing: job.state) {
-        case .running:
-            return isGPU ? AppTheme.gpu : .green
-        case .pending:
-            return .orange
-        case .unavailable:
-            return .red
-        default:
-            return .secondary
-        }
     }
 }
 
@@ -643,11 +1202,13 @@ struct DetailMetric: View {
                     .foregroundStyle(accent)
                 Text(title)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             .font(.caption)
             Text(value.isEmpty ? missingValuePlaceholder : value)
                 .font(.title3.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
+                .minimumScaleFactor(0.75)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .dashboardCard(accent: accent)
@@ -685,6 +1246,8 @@ struct DetailSection<Content: View>: View {
 struct DetailRow: View {
     let label: String
     let value: String?
+    var help: String? = nil
+    var monospaced = true
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
@@ -693,10 +1256,11 @@ struct DetailRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 108, alignment: .leading)
             Text(displayValue)
-                .font(.callout.monospaced())
+                .font(monospaced ? .callout.monospaced() : .callout)
                 .textSelection(.enabled)
                 .lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .help(help ?? "")
         }
     }
 
@@ -708,57 +1272,43 @@ struct DetailRow: View {
     }
 }
 
-// MARK: - GPU job detection
+/// A timestamp as a relative time ("41 min ago", "in 2 h") beside the
+/// absolute local time, instead of Slurm's raw ISO string. Ticks on its own
+/// so the relative part never freezes.
+struct TimestampRow: View {
+    let label: String
+    let raw: String?
+    /// A backfill estimate rather than a recorded time.
+    var isEstimate = false
 
-/// GPUs a job holds or asked for, read from its Slurm TRES strings.
-struct JobGPURequest: Equatable {
-    /// GPUs for the whole job; nil when Slurm names GPUs without a count.
-    let count: Int?
-    /// Raw gres type, e.g. "nvidia_h200" or "l40s"; nil for an untyped
-    /// request such as `--gres=gpu:2`.
-    let model: String?
-
-    var modelDisplayName: String? {
-        model.map(gpuModelDisplayName)
-    }
-
-    /// "2 × H200", "1 GPU", "H200 GPU", or just "GPU".
-    var summary: String {
-        switch (count, modelDisplayName) {
-        case let (count?, model?):
-            return "\(count) × \(model)"
-        case let (count?, nil):
-            return count == 1 ? "1 GPU" : "\(count) GPUs"
-        case let (nil, model?):
-            return "\(model) GPU"
-        case (nil, nil):
-            return "GPU"
+    var body: some View {
+        if let raw, let date = SlurmTimestamp.parse(raw) {
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 108, alignment: .leading)
+                    Text(SlurmTimestamp.distanceText(to: date, now: context.date))
+                        .font(.callout)
+                    Text(date.formatted(date: .abbreviated, time: .standard))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+                .help(isEstimate ? "Slurm's estimate; it moves as other jobs finish or arrive. Raw: \(raw)" : "Raw: \(raw)")
+                .accessibilityElement(children: .combine)
+            }
+        } else {
+            DetailRow(label: label, value: raw)
         }
     }
 }
 
-extension Job {
-    /// The job's GPUs, or nil when none of its TRES strings mention gres/gpu.
-    ///
-    /// Whole-job totals win: AllocTRES is what Slurm actually granted (a
-    /// running job), ReqTRES what a pending job asked for. TresPerNode is per
-    /// node, so it is only a fallback and is scaled by the node count.
-    var gpuRequest: JobGPURequest? {
-        let allocated = TRESGPUTally(allocTres)
-        let requested = TRESGPUTally(reqTres)
-        let perNode = TRESGPUTally(tresPerNode)
-        guard allocated.mentionsGPU || requested.mentionsGPU || perNode.mentionsGPU else {
-            return nil
-        }
-        let nodeCount = max(Int(nodes.trimmingCharacters(in: .whitespaces)) ?? 1, 1)
-        let count = allocated.count ?? requested.count ?? perNode.count.map { $0 * nodeCount }
-        // An explicit zero ("gres/gpu=0") is a CPU job that merely names the gres.
-        if count == 0 {
-            return nil
-        }
-        return JobGPURequest(count: count, model: allocated.model ?? requested.model ?? perNode.model)
-    }
+// MARK: - GPU job detection
 
+extension Job {
     /// Single source of truth for "is this a GPU job" on the Jobs tab.
     ///
     /// The TRES strings are authoritative and cluster-neutral. Without them
@@ -767,6 +1317,12 @@ extension Job {
     /// not know fall back to the historical "name contains gpu" heuristic —
     /// which still catches AIRE's `gpu` and Calder's `calder-gpu-hopper`.
     func isGPUJob(on profile: ClusterProfile) -> Bool {
+        isGPUJob(on: profile, gpuRequest: gpuRequest)
+    }
+
+    /// Same rule with an already-parsed GPU request (TRES parsing is the
+    /// expensive part).
+    func isGPUJob(on profile: ClusterProfile, gpuRequest: JobGPURequest?) -> Bool {
         if gpuRequest != nil {
             return true
         }
@@ -781,95 +1337,5 @@ extension Job {
             }
             return name.lowercased().contains("gpu")
         }
-    }
-}
-
-/// GPU entries found in one Slurm TRES string. Understands both shapes Slurm
-/// prints:
-/// - TRES lists (`ReqTRES`/`AllocTRES`): `cpu=8,gres/gpu=2,gres/gpu:nvidia_h200=2`
-/// - per-node GRES (`TresPerNode`): `gres/gpu:nvidia_h200:2` (23.02+),
-///   `gres:gpu:2` (21.08–22.05), or a bare `gpu:l40s:1` (older releases).
-private struct TRESGPUTally {
-    private(set) var mentionsGPU = false
-    private(set) var model: String?
-    private var untypedCount: Int?
-    private var typedCount: Int?
-
-    /// Slurm lists both the untyped total and the per-type split
-    /// (`gres/gpu=2,gres/gpu:nvidia_h200=2`); the untyped total wins so the
-    /// GPUs are not counted twice.
-    var count: Int? {
-        untypedCount ?? typedCount
-    }
-
-    init(_ raw: String?) {
-        guard let raw else {
-            return
-        }
-        for rawEntry in Self.entries(of: raw) {
-            var entry = rawEntry.trimmingCharacters(in: .whitespaces).lowercased()
-            // Drop index suffixes such as "(IDX:0-1)".
-            if let paren = entry.firstIndex(of: "(") {
-                entry = String(entry[..<paren])
-            }
-            var key = entry
-            var valueText: Substring?
-            if let equals = entry.firstIndex(of: "=") {
-                key = String(entry[..<equals])
-                valueText = entry[entry.index(after: equals)...]
-            }
-            for prefix in ["gres/", "gres:"] where key.hasPrefix(prefix) {
-                key = String(key.dropFirst(prefix.count))
-                break
-            }
-            var pieces = key.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-            // "gpumem"/"gpuutil" style TRES are not GPU counts.
-            guard pieces.first == "gpu" else {
-                continue
-            }
-            pieces.removeFirst()
-
-            var entryCount: Int?
-            if let valueText {
-                entryCount = Int(valueText.prefix { $0.isNumber })
-            } else if let last = pieces.last, let parsed = Int(last) {
-                entryCount = parsed
-                pieces.removeLast()
-            }
-            let entryModel = pieces.first { !$0.isEmpty }
-
-            mentionsGPU = true
-            if let entryModel {
-                model = model ?? entryModel
-                if let entryCount {
-                    typedCount = (typedCount ?? 0) + entryCount
-                }
-            } else if let entryCount {
-                untypedCount = (untypedCount ?? 0) + entryCount
-            }
-        }
-    }
-
-    /// Splits on commas that are not inside parentheses, so an index list
-    /// like "(IDX:0,2)" stays attached to its entry.
-    private static func entries(of raw: String) -> [Substring] {
-        var result: [Substring] = []
-        var depth = 0
-        var start = raw.startIndex
-        for index in raw.indices {
-            switch raw[index] {
-            case "(":
-                depth += 1
-            case ")":
-                depth = max(depth - 1, 0)
-            case "," where depth == 0:
-                result.append(raw[start..<index])
-                start = raw.index(after: index)
-            default:
-                break
-            }
-        }
-        result.append(raw[start...])
-        return result
     }
 }
