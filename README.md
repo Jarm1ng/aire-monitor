@@ -57,11 +57,15 @@ Partitions the app does not know (for example the `aire-*` nodes currently hoste
 ```bash
 git clone https://github.com/Jarm1ng/aire-monitor.git
 cd aire-monitor
-./scripts/run_macos_app.sh          # release build of the app and the widget into .runtime/, then opens the app
+./scripts/install_app.sh            # recommended: builds, installs "Leeds HPC Monitor" in /Applications, opens it
 ./scripts/run_desktop_widget.sh     # optional: the desktop widget (or the app's Widget button)
 ```
 
-The first build takes a few minutes. Running the script again rebuilds only what changed, and restarts a running app only when its bundle changed. Optional: a self-signed code-signing certificate named `Leeds HPC Monitor Local` stops the Keychain prompt after every rebuild ([how](MACOS_APP.md#build-and-run)).
+The first build takes a few minutes. From then on, open **Leeds HPC Monitor** like any other app: Launchpad, Spotlight, the Dock. The installed app still runs its helpers and keeps its data in the checkout, so leave the checkout where it is. After a `git pull`, run `./scripts/install_app.sh` again to update. It replaces the app only when something changed. A running app is asked to quit first, the normal way, so its quit prompt still protects running terminals and transfers. Without write access to `/Applications` it installs into `~/Applications`. `HPC_INSTALL_DIR` picks another folder, and `--uninstall` removes the app.
+
+If you pinned the app to the Dock or added it as a login item before installing, that entry still starts the old `.runtime/AIREMonitorApp.app` copy. Remove it, then pin or add the installed **Leeds HPC Monitor** instead.
+
+For development, `./scripts/run_macos_app.sh` builds and opens the app straight from `.runtime/`, or, once it is installed, updates the installed copy and opens that. Either way only what changed is rebuilt. Optional: a self-signed code-signing certificate named `Leeds HPC Monitor Local` stops the Keychain prompt after every rebuild ([how](MACOS_APP.md#build-and-run)).
 
 Then sign in from the sidebar:
 
@@ -121,7 +125,7 @@ Details: [SECURITY.md](SECURITY.md).
 | `Sources/AIREMonitorApp/` | The app. `ClusterProfile` (cluster definitions), `ClusterSession` (one cluster's lifecycle), `AppModel` (sign-in and coordination), `MonitorService` (SSH and the collector), then the views |
 | `Sources/HPCCore/` | Shared by the app and the widget: snapshot schema, Slurm state and GPU rules, cluster identities |
 | `Sources/AIREDesktopWidget/` | The standalone desktop widget |
-| `scripts/` | The snapshot collector, the SSH login helpers (`hpc_*`), and `build_bundle.sh`, which builds and signs both bundles for the `run_*` scripts |
+| `scripts/` | The snapshot collector, the SSH login helpers (`hpc_*`), `build_bundle.sh`, which builds and signs both bundles for the `run_*` scripts, and `install_app.sh`, which installs the app |
 | `Tests/`, `scripts/tests/` | Swift unit and layout tests with collector fixtures; the collector's Python tests and the mock-ssh login harness |
 
 ```bash

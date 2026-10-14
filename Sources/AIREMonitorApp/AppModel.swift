@@ -1179,36 +1179,42 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         !root.isEmpty && FileManager.default.fileExists(atPath: "\(root)/\(MonitorService.collectorScript)")
     }
 
-    /// Environment first, then the checkout this bundle or binary lives in
-    /// (the normal case), then the root the user last set by hand — which
-    /// therefore survives a relaunch exactly when auto-detection fails, the
-    /// case the "set Project root" message is about.
+    /// `ProjectRootLocator`'s rule (environment, the bundle's HPCProjectRoot
+    /// Info.plist key, working directory, the checkout this bundle lives in),
+    /// then the root the user last set by hand — which therefore survives a
+    /// relaunch exactly when auto-detection fails, the case the "set Project
+    /// root" message is about.
     private static func defaultProjectRoot(defaults: UserDefaults) -> String {
-        let environment = ProcessInfo.processInfo.environment
-        // AIRE_PROJECT_ROOT is the pre-multi-cluster name, still honoured.
-        for key in ["HPC_PROJECT_ROOT", "AIRE_PROJECT_ROOT"] {
-            if let root = environment[key], isValidProjectRoot(root) {
-                return root
-            }
-        }
+        defaultProjectRoot(
+            environment: ProcessInfo.processInfo.environment,
+            infoPlistValue: Bundle.main.object(forInfoDictionaryKey: ProjectRootLocator.infoPlistKey),
+            currentDirectory: FileManager.default.currentDirectoryPath,
+            bundlePath: Bundle.main.bundleURL.path,
+            savedRoot: defaults.string(forKey: projectRootKey)
+        )
+    }
 
-        let current = FileManager.default.currentDirectoryPath
-        if isValidProjectRoot(current) {
-            return current
+    /// The same with every input given (tests). Falls back to the working
+    /// directory, whose error message then tells the user what to set.
+    nonisolated static func defaultProjectRoot(
+        environment: [String: String],
+        infoPlistValue: Any?,
+        currentDirectory: String,
+        bundlePath: String,
+        savedRoot: String?
+    ) -> String {
+        if let root = ProjectRootLocator.locate(
+            environment: environment,
+            infoPlistValue: infoPlistValue,
+            currentDirectory: currentDirectory,
+            bundlePath: bundlePath,
+            isValid: isValidProjectRoot
+        ) {
+            return root
         }
-
-        let bundleRoot = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .path
-        if isValidProjectRoot(bundleRoot) {
-            return bundleRoot
+        if let savedRoot, isValidProjectRoot(savedRoot) {
+            return savedRoot
         }
-
-        if let saved = defaults.string(forKey: projectRootKey), isValidProjectRoot(saved) {
-            return saved
-        }
-
-        return current
+        return currentDirectory
     }
 }

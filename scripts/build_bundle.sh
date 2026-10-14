@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Builds Leeds HPC Monitor and/or its desktop widget and assembles signed .app
 # bundles in .runtime/. This is the only place that knows how a bundle is
-# made; scripts/run_macos_app.sh and scripts/run_desktop_widget.sh are thin
-# wrappers around it, so the two bundles can no longer drift apart.
+# made; scripts/run_macos_app.sh, scripts/run_desktop_widget.sh and
+# scripts/install_app.sh are thin wrappers around it, so the bundles can no
+# longer drift apart.
 #
-#   scripts/build_bundle.sh [--debug] [--open] PRODUCT [PRODUCT...]
+#   scripts/build_bundle.sh [--debug] [--open] [--for-install] PRODUCT [PRODUCT...]
 #
 #   PRODUCT   AIREMonitorApp (alias: app) or AIREDesktopWidget (alias: widget).
 #             Several products are built by one `swift build`.
@@ -15,14 +16,29 @@
 #             (--release, the default, is accepted for symmetry.)
 #   --open    Open the first PRODUCT afterwards (or bring it to the front if
 #             it is already running the current build).
+#   --for-install
+#             The app bundle is only the source for scripts/install_app.sh
+#             (see below); that script passes this on every run.
 #
 # A bundle is replaced only when its content would change (executable,
 # artwork, Info.plist fields, signing identity, or this script itself; see
 # bundle_stamp). Replacing a bundle stops any instance running from it and
 # starts it again on the new build, so a bundle is never left running stale
-# code and never left stopped. When nothing changed, nothing is restarted:
-# running the widget launcher while the widget is open just brings it forward,
-# and the app keeps its terminal sessions.
+# code and never left stopped; the old bundle is unregistered from
+# LaunchServices before it is deleted. When nothing changed, nothing is
+# restarted: running the widget launcher while the widget is open just
+# brings it forward, and the app keeps its terminal sessions.
+#
+# Once the app is installed (scripts/install_app.sh --installed-path), or
+# with --for-install, .runtime/AIREMonitorApp.app is only the build output
+# that install_app.sh copies: it is replaced without stopping a copy running
+# from it (install_app.sh asks that one to quit before it builds, so the
+# app's own quit confirmation protects its terminals), and it is never opened
+# or restarted. Once installed, LaunchServices also forgets it instead of
+# registering it, so it cannot compete with the installed app. Before the
+# first install it stays registered: install_app.sh unregisters it only after
+# the installed copy is in place, so a failed first install leaves the app
+# launchable. The widget is unaffected and stays in .runtime/.
 #
 # Environment:
 #   HPC_CODESIGN_IDENTITY  Code-signing identity (name or SHA-1, as for
@@ -37,6 +53,7 @@
 #                          .runtime/swift-widget-build.log for the widget alone).
 #   SDKROOT                Respected when exported; otherwise SwiftPM uses the
 #                          SDK that `xcrun --show-sdk-path` reports.
+#   HPC_LSREGISTER         The lsregister tool to call (default: the system's).
 #
 # Exit status: swift build's status when the build fails, 75 when another
 # build of this checkout held the lock for too long, 1 for any other error.
@@ -171,6 +188,17 @@ launch_bundle() {
     fi
     echo "macOS open failed; starting $product directly." >&2
     nohup "$bundle/Contents/MacOS/$product" </dev/null >/dev/null 2>&1 &
+}
+
+# True when PRODUCT's bundle is only the source of an install (see the
+# header): the app, once installed or with --for-install.
+is_install_source() {
+    [[ "$1" == "AIREMonitorApp" && "$APP_IS_INSTALL_SOURCE" == true ]]
+}
+
+# True when PRODUCT is the app and an install exists.
+is_installed() {
+    [[ "$1" == "AIREMonitorApp" && -n "$INSTALLED_APP" ]]
 }
 
 # --- Version and signing --------------------------------------------------
@@ -417,13 +445,17 @@ PLIST
     if [[ "$UI_ELEMENT" == true ]]; then
         plutil -insert LSUIElement -bool YES "$plist"
     fi
-    # Lets a bundle that was moved or copied out of .runtime (for example
-    # into /Applications, or registered as a login item) still find this
-    # checkout. Both the app and the widget check that the directory holds
-    # scripts/hpc_snapshot.py before trusting it, so a stale value after the
-    # checkout moves falls through to their other lookups.
+    # Lets a bundle that was moved or copied out of .runtime (installed into
+    # /Applications by scripts/install_app.sh, or registered as a login item)
+    # still find this checkout. Both the app and the widget check that the
+    # directory holds scripts/hpc_snapshot.py before trusting it, so a stale
+    # value after the checkout moves falls through to their other lookups.
+    # LSEnvironment applies only to launches through LaunchServices;
+    # HPCProjectRoot is read from the bundle itself (ProjectRootLocator in
+    # HPCCore), so it also works when the executable is started directly.
     plutil -insert LSEnvironment -xml "<dict/>" "$plist"
     plutil -insert LSEnvironment.HPC_PROJECT_ROOT -string "$ROOT_DIR" "$plist"
+    plutil -insert HPCProjectRoot -string "$ROOT_DIR" "$plist"
     # Build provenance, readable with `defaults read <bundle>/Contents/Info
     # HPCSourceRevision`. HPCBuildStamp identifies the bundle's content (see
     # bundle_stamp): two bundles with equal stamps are interchangeable.
@@ -462,16 +494,31 @@ install_bundle() {
     sign_bundle "$staged"
     codesign --verify --strict "$staged" >/dev/null 2>&1 || die "the signed $product.app does not verify."
 
-    if stop_instances "$bundle/Contents/MacOS/$product"; then
+    # An install source is never stopped here: asking a copy running from it
+    # to quit, with the app's own confirmation, is install_app.sh's job, and
+    # it does that before it builds.
+    if ! is_install_source "$product" && stop_instances "$bundle/Contents/MacOS/$product"; then
         RESTART_PRODUCTS+=("$product")
+    fi
+    # Unregistered while it still exists: LaunchServices keeps the record of
+    # a bundle deleted while registered, and `lsregister -u` on the path
+    # afterwards reaches only the new bundle there. (An install was left
+    # with the .runtime copy the app had been running from still listed.)
+    if [[ -d "$bundle" ]]; then
+        "$LSREGISTER" -u "$bundle" >/dev/null 2>&1 || true
     fi
     rm -rf "$bundle"
     mv "$staged" "$bundle"
     rmdir "$staging" 2>/dev/null || true
-    # Refresh LaunchServices' cached copy of the Info.plist (name, icon,
-    # LSEnvironment) now rather than whenever it next notices the change.
-    "$LSREGISTER" -f "$bundle" >/dev/null 2>&1 || true
-    echo "Installed $product.app ($CONFIGURATION, signed $(describe_identity))."
+    if is_installed "$product"; then
+        # Only the installed copy may be found by bundle identifier.
+        "$LSREGISTER" -u "$bundle" >/dev/null 2>&1 || true
+    else
+        # Refresh LaunchServices' cached copy of the Info.plist (name, icon,
+        # LSEnvironment) now rather than whenever it next notices the change.
+        "$LSREGISTER" -f "$bundle" >/dev/null 2>&1 || true
+    fi
+    echo "Built $product.app ($CONFIGURATION, signed $(describe_identity))."
     if [[ "$SIGN_IDENTITY" == "-" && "$product" == "AIREMonitorApp" ]]; then
         APP_SIGNED_AD_HOC=true
     fi
@@ -488,12 +535,14 @@ cleanup() {
 
 CONFIGURATION="release"
 OPEN_FIRST=false
+FOR_INSTALL=false
 PRODUCTS=()
 for argument in "$@"; do
     case "$argument" in
         --debug) CONFIGURATION="debug" ;;
         --release) CONFIGURATION="release" ;;
         --open) OPEN_FIRST=true ;;
+        --for-install) FOR_INSTALL=true ;;
         -h | --help)
             usage
             exit 0
@@ -556,11 +605,26 @@ done
 USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$RUNTIME_DIR/")"
 BUILD_DIR="${HPC_SWIFTPM_BUILD_DIR:-${AIRE_SWIFTPM_BUILD_DIR:-${USER_TMP%/}/aire-monitor-build}}"
 BIN_DIR="$BUILD_DIR/$CONFIGURATION"
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+LSREGISTER="${HPC_LSREGISTER:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
 STAGING_DIRS=()
 RESTART_PRODUCTS=()
 APP_SIGNED_AD_HOC=false
 trap cleanup EXIT
+
+# The app's bundle is an install source when install_app.sh says so, or
+# when an install exists (see the header).
+APP_IS_INSTALL_SOURCE=false
+INSTALLED_APP=""
+case " ${PRODUCTS[*]} " in
+    *" AIREMonitorApp "*)
+        if INSTALLED_APP="$("${BASH:-/bin/bash}" "$ROOT_DIR/scripts/install_app.sh" --installed-path 2>/dev/null)"; then
+            APP_IS_INSTALL_SOURCE=true
+        else
+            INSTALLED_APP=""
+            [[ "$FOR_INSTALL" == false ]] || APP_IS_INSTALL_SOURCE=true
+        fi
+        ;;
+esac
 
 resolve_version
 resolve_signing_identity
@@ -583,5 +647,11 @@ for product in ${RESTART_PRODUCTS[@]+"${RESTART_PRODUCTS[@]}"}; do
     launch_bundle "$RUNTIME_DIR/$product.app" "$product"
 done
 if [[ "$OPEN_FIRST" == true ]]; then
-    launch_bundle "$RUNTIME_DIR/${PRODUCTS[0]}.app" "${PRODUCTS[0]}"
+    if is_installed "${PRODUCTS[0]}"; then
+        echo "note: not opening .runtime/${PRODUCTS[0]}.app: the app is installed at $INSTALLED_APP. scripts/install_app.sh (or run_macos_app.sh) updates and opens that copy." >&2
+    elif is_install_source "${PRODUCTS[0]}"; then
+        echo "note: not opening .runtime/${PRODUCTS[0]}.app: with --for-install it is only what scripts/install_app.sh installs, and that script opens the installed copy." >&2
+    else
+        launch_bundle "$RUNTIME_DIR/${PRODUCTS[0]}.app" "${PRODUCTS[0]}"
+    fi
 fi

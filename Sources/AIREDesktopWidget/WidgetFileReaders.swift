@@ -167,39 +167,17 @@ struct WidgetAppStateReader {
 enum ProjectLocator {
     /// Present in every checkout of this repository; also what the app uses
     /// to recognise a project root.
-    static let markerScript = "scripts/hpc_snapshot.py"
+    static let markerScript = ProjectRootLocator.markerScript
 
-    /// The checkout the widget reads `.runtime/` from: HPC_PROJECT_ROOT (or
-    /// the pre-multi-cluster AIRE_PROJECT_ROOT), the working directory, or
-    /// the bundle's grandparent (`<root>/.runtime/AIREDesktopWidget.app`).
-    /// nil when none of them holds the collector: falling back to the
-    /// working directory (`/` under `open`) used to make a moved bundle watch
-    /// `/.runtime/clusters` and tell the user to connect in the app, which
-    /// could never help.
+    /// The checkout the widget reads `.runtime/` from, by the rule the app
+    /// uses too (see `ProjectRootLocator`): HPC_PROJECT_ROOT (or the
+    /// pre-multi-cluster AIRE_PROJECT_ROOT), the bundle's HPCProjectRoot
+    /// Info.plist key, the working directory, or the bundle's grandparent
+    /// (`<root>/.runtime/AIREDesktopWidget.app`). nil when none of them
+    /// holds the collector: falling back to the working directory (`/`
+    /// under `open`) used to make a moved bundle watch `/.runtime/clusters`
+    /// and tell the user to connect in the app, which could never help.
     static func findProjectRoot() -> String? {
-        let environment = ProcessInfo.processInfo.environment
-        for key in ["HPC_PROJECT_ROOT", "AIRE_PROJECT_ROOT"] {
-            if let value = environment[key], hasMarker(value) {
-                return value
-            }
-        }
-
-        let current = FileManager.default.currentDirectoryPath
-        if hasMarker(current) {
-            return current
-        }
-
-        let bundleRoot = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .path
-        if hasMarker(bundleRoot) {
-            return bundleRoot
-        }
-        return nil
-    }
-
-    private static func hasMarker(_ root: String) -> Bool {
-        FileManager.default.fileExists(atPath: "\(root)/\(markerScript)")
+        ProjectRootLocator.locateForCurrentProcess()
     }
 }
