@@ -1,0 +1,53 @@
+name: Windows desktop app
+
+on:
+  push:
+    branches: [main, 'feat/windows-app']
+    paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: 'windows/requirements*.txt'
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r windows\requirements-dev.txt
+      - name: Lint and type check
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m ruff check windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m ruff format --check windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m pyright -p windows
+      - name: Tests (offline and loopback only)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -c windows\pyproject.toml windows\tests -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe scripts\hpc_snapshot.py --self-test
+      - name: Package and smoke test
+        shell: pwsh
+        run: .\scripts\build_windows_app.ps1 -SkipInstall
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeedsHPCMonitor-Windows-x64
+          path: windows/dist/LeedsHPCMonitor-Windows-x64.zip
+          if-no-files-found: error
