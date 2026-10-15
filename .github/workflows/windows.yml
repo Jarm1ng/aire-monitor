@@ -2,7 +2,7 @@ name: Windows desktop app
 
 on:
   push:
-    branches: [main, 'feat/windows-app']
+    branches: [main, 'windows-branch']
     paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
   pull_request:
     paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
