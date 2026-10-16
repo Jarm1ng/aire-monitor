@@ -35,3 +35,11 @@ id_ed25519*
 
 # Python bytecode
 __pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+linux/build/
+linux/dist/
+linux/*.spec
+*.pyc
