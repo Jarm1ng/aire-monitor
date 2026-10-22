@@ -69,7 +69,7 @@ for the multi-cluster (AIRE + Calder) behaviour, without touching the network,
 ```sh
 python3 scripts/tests/test_login_flow.py    # the login harness alone
 python3 scripts/tests/test_snapshot.py      # the collector tests alone
-scripts/test_all.sh                         # every suite: swift, collector, login
+scripts/test_all.sh                         # every suite: swift, collector, login, desktop
 ```
 
 The login harness takes about a minute. It prints a PASS/FAIL table and exits

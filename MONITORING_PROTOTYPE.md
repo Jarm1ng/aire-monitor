@@ -1,8 +1,8 @@
 # Leeds HPC Monitoring Prototype
 
-`scripts/hpc_snapshot.py` (renamed from `aire_monitor_snapshot.py`) is the local-only monitoring collector behind Leeds HPC Monitor. One invocation gathers a read-only Slurm and storage snapshot from **one** cluster over SSH and prints it as JSON. The macOS app runs one collector per cluster (AIRE and Calder), each over that cluster's own ControlMaster; the menu bar monitor and the desktop widget show the results.
+`scripts/hpc_snapshot.py` (renamed from `aire_monitor_snapshot.py`) is the local-only monitoring collector behind Leeds HPC Monitor. One invocation gathers a read-only Slurm and storage snapshot from **one** cluster over SSH and prints it as JSON. The macOS app runs one collector per cluster (AIRE and Calder), each over that cluster's own ControlMaster; the menu bar monitor and the desktop widget show the results. The Windows and Linux app (`desktop/`) does not start it as a process: it imports the module and runs the same collection over its own SSH connection (see [Library API](#library-api)).
 
-The engine is cluster-agnostic. Everything that differs between clusters arrives on the command line: the cluster id and name (echoed in the output), the login host and route, and the storage layout (`--storage-spec`). Its only built-in cluster knowledge is a fallback name and login host for the ids `aire` and `calder`, used when `--cluster-name` or `--hostname` is omitted.
+The engine is cluster-agnostic. Everything that differs between clusters arrives on the command line: the cluster id and name (echoed in the output), the login host and route, and the storage layout (`--storage-spec`). Its only built-in cluster knowledge is a name and login host for the ids `aire` and `calder` (`KNOWN_CLUSTER_NAMES`, `KNOWN_CLUSTER_HOSTNAMES`), used when `--cluster-name` or `--hostname` is omitted, and the two clusters' storage specs (`AIRE_SPEC`, `CALDER_SPEC`). The command line never applies a spec on its own; the Windows and Linux app builds its cluster list from those four tables.
 
 ## Scope
 
@@ -35,7 +35,7 @@ It does not:
 - require any server-side agent
 - prompt for, receive or forward a password
 
-Every ssh invocation runs with `BatchMode=yes`, every authentication method disabled (password, keyboard-interactive, public key, GSSAPI) and `ControlMaster=no`. The collector can therefore only ride an already-authenticated ControlMaster, and it never creates or replaces one. When a `--control-path` is supplied, it first probes the master with `ssh -O check`, so a dead session produces an immediate "connection lost" error instead of a hanging round trip. Host, user and jump-host names that are not plain ssh words (for example anything starting with `-`) are refused before ssh runs.
+Every ssh invocation of the command line runs with `BatchMode=yes`, every authentication method disabled (password, keyboard-interactive, public key, GSSAPI) and `ControlMaster=no`. The collector can therefore only ride an already-authenticated ControlMaster, and it never creates or replaces one. When a `--control-path` is supplied, it first probes the master with `ssh -O check`, so a dead session produces an immediate "connection lost" error instead of a hanging round trip. Host, user and jump-host names that are not plain ssh words (for example anything starting with `-`) are refused before ssh runs.
 
 ## Command Line
 
@@ -56,7 +56,7 @@ Every ssh invocation runs with `BatchMode=yes`, every authentication method disa
 | `--pretty` | Pretty-print the JSON. |
 | `--self-test` | Run the unit tests in `scripts/tests/test_snapshot.py` and exit with their status. Never runs ssh. |
 
-`--timeout` is not a per-command limit. It covers the socket probe (at most 10 s) plus every round trip, so the JSON is always printed before a caller watchdog slightly longer than the budget fires: the app passes `--timeout 30` and kills the process after 40 s, and the widget's fallback allows the budget plus 20 s. When the budget runs out after every core section and the jobs listing have arrived, the snapshot is still usable: the timeout is reported as a warning naming the section it cut, and only the later sections (`node_details`, `job_details`, storage) may be missing or partial.
+`--timeout` is not a per-command limit. It covers the socket probe (at most 10 s) plus every round trip, so the JSON is always printed before a caller watchdog slightly longer than the budget fires: the macOS app passes `--timeout 30` and kills the process after 40 s, and the widget's fallback allows the budget plus 20 s. When the budget runs out after every core section and the jobs listing have arrived, the snapshot is still usable: the timeout is reported as a warning naming the section it cut, and only the later sections (`node_details`, `job_details`, storage) may be missing or partial.
 
 ## Storage Spec
 
@@ -90,7 +90,7 @@ If the quota command yields nothing usable, the row falls back to the filesystem
 
 **Validation.** At most 16 volumes and 16384 characters. An invalid spec becomes a single entry in `errors`, and no SSH connection is made.
 
-These are the specs the app passes, taken from `ClusterProfile.swift` (the app encodes them with sorted keys and an explicit `optional`):
+These are the specs the macOS app passes, taken from `ClusterProfile.swift` (the app encodes them with sorted keys and an explicit `optional`). The collector carries the same volumes as `AIRE_SPEC` and `CALDER_SPEC` for the Windows and Linux app (compact, with `optional` only where it is true); `CollectorContractTests` fails when they differ:
 
 ```bash
 AIRE_SPEC='[
@@ -112,7 +112,7 @@ AIRE's `/scratch-aire` and `/flash-aire` candidates come first so the profile fo
 
 From this repo. Replace `<username>` with your university username and `<hash>` with the socket hash described below.
 
-The simplest manual run replays the exact invocation the app uses for a cluster. The app writes it, password-free, to `.runtime/clusters/<id>/collector.json` after signing in:
+The simplest manual run replays the exact invocation the macOS app uses for a cluster. The app writes it, password-free, to `.runtime/clusters/<id>/collector.json` after signing in:
 
 ```bash
 python3 -c 'import json, subprocess, sys
@@ -188,7 +188,7 @@ python3 scripts/hpc_snapshot.py --self-test       # the same suite, via the coll
 
 **Contract fixtures.** `Tests/Fixtures/collector_snapshot.json` is the collector's real output for the canned Calder refresh in the test file: an array remainder next to its running tasks, an idle H200 with empty AllocTRES, an L40S node without GPU TRES, an NHC Reason containing `|`, NFS plus Lustre-project quotas, and Flash proven absent. `Tests/Fixtures/collector_contract.json` holds the collector's constants (default timeout, jump host, known cluster names and hosts, storage reasons). After an output change, regenerate both with `python3 scripts/tests/test_snapshot.py --write-fixture`; the Python suite fails while they are stale.
 
-**Swift side.** HPCCore (`Sources/HPCCore/SnapshotModels.swift`) decodes the schema leniently: a missing, null or wrong-typed field falls back to a neutral value, a malformed element is skipped and counted in `warnings`, unknown keys are ignored, and a `schema_version` newer than it supports is a warning, not a failure. In `Tests/AIREMonitorAppTests`, `CollectorContractTests` decodes the fixtures and checks that nothing is skipped, every emitted field survives a decode/encode round trip, array remainders and GPU figures mean the same on both sides, the constants match `HPCDefaults` and the cluster catalogue, and the fixtures are current. `CollectorArgumentsTests` checks the argument list the app passes and records in `collector.json`; `SnapshotDecodingTests` and `CoreSnapshotSchemaTests` cover decoding. Run them with `Tests/AIREMonitorAppTests/run_tests.sh`.
+**Swift side.** HPCCore (`Sources/HPCCore/SnapshotModels.swift`) decodes the schema leniently: a missing, null or wrong-typed field falls back to a neutral value, a malformed element is skipped and counted in `warnings`, unknown keys are ignored, and a `schema_version` newer than it supports is a warning, not a failure. In `Tests/AIREMonitorAppTests`, `CollectorContractTests` decodes the fixtures and checks that nothing is skipped, every emitted field survives a decode/encode round trip, array remainders and GPU figures mean the same on both sides, the constants match `HPCDefaults` and the cluster catalogue, and the fixtures are current. It also loads the collector module itself and checks that `AIRE_SPEC`/`CALDER_SPEC` (read through the collector's own `parse_storage_spec`) equal each profile's storage, that the collector reads the app's real `--storage-spec` argument back as the same volumes, and that `KNOWN_CLUSTER_NAMES`/`KNOWN_CLUSTER_HOSTNAMES` match the catalogue: the tables the Windows and Linux app builds its clusters from (`desktop/tests/test_core.py` pins that side). `CollectorArgumentsTests` checks the argument list the app passes and records in `collector.json`; `SnapshotDecodingTests` and `CoreSnapshotSchemaTests` cover decoding. Run them with `Tests/AIREMonitorAppTests/run_tests.sh`.
 
 ## Output Model
 
@@ -217,7 +217,7 @@ Main entities:
 
 - `schema_version`: always the first key, currently `1`. It is bumped only for an incompatible change (a key renamed, removed or retyped); new keys keep the version.
 - `collected_at`: the local clock when the last round trip returned, ISO 8601 in UTC, so it marks the moment the data describes. `started_at` is taken before the socket probe.
-- `cluster`: the `--cluster-id` and `--cluster-name` this snapshot belongs to. The desktop widget checks it, so a fallback collection is never shown under the wrong cluster.
+- `cluster`: the `--cluster-id` and `--cluster-name` this snapshot belongs to. The macOS desktop widget and the Windows and Linux app check it, so a snapshot is never shown under the wrong cluster.
 - `remote`: `host` (the configured login host, or the alias), plus the login node's `hostname`, `user`, `cwd` and `remote_time`
 - `jobs`: current jobs for the remote user, from `squeue --json` or from the pipe-format fallback enriched with `scontrol show job -o`; both yield the same ids and fields. Fields: `job_id`, `partition`, `name`, `user`, `state`, `elapsed`, `time_limit`, `nodes`, `reason_or_node_list`, the optional details `submit_time`, `start_time`, `end_time`, `work_dir`, `command`, `stdout_path`, `stderr_path`, `batch_host`, `node_list`, `num_cpus`, `num_tasks`, `req_tres`, `alloc_tres`, `tres_per_node`, and the array fields below
 - `partitions`: one row per partition and state group as `sinfo` prints them: `partition` (default-partition `*` stripped), `availability`, `node_count`, `state`, `gres`, `cpus_per_node`, `memory_mb_per_node`, `features`, and `time_limit`, the `sinfo %l` string such as `2-00:00:00` (Calder's limit) or `infinite`, or `null` when the remote output predates the column
@@ -266,7 +266,7 @@ A storage row looks like this (values elided):
 - `Remote output contained no sections (the remote shell ran nothing)`: ssh succeeded but no marker came back, for example from a login shell that is not POSIX sh
 - an internal collector error (`Collector internal error: ...`). The JSON is still printed, and the traceback goes to stderr.
 
-The app treats any error as a failed refresh. When the `remote` section answered, it counts the failure as Slurm trouble over a live session, not a lost connection, and keeps the previous rows of a core section that came back empty and is named in a `Section '<name>' ...` error, so keep that wording.
+The macOS app treats any error as a failed refresh (so does the Windows and Linux app). When the `remote` section answered, it counts the failure as Slurm trouble over a live session, not a lost connection, and keeps the previous rows of a core section that came back empty and is named in a `Section '<name>' ...` error, so keep that wording.
 
 `warnings` never fail a refresh. They include:
 
@@ -281,8 +281,47 @@ Remote output that is not valid UTF-8 is decoded leniently (invalid bytes become
 
 The command exits with status `0` when `errors` is empty, and `1` otherwise, while still printing whatever partial data was collected.
 
+## Library API
+
+The Windows and Linux app (`desktop/`) imports the module (with `scripts/` on `sys.path`) and runs every refresh through `run_collection` over its own Paramiko connection. The command line's `collect_snapshot` is that same function over `ssh` plus the ControlMaster probe, so both get one budget, cut-line trimming, jobs fallback and storage semantics. The module is standard library only and must stay Python 3.9-compatible (the Mac's `/usr/bin/python3`); the desktop app itself needs 3.11+.
+
+```python
+import hpc_snapshot as collector
+
+volumes, error = collector.parse_storage_spec(collector.CALDER_SPEC)  # error: str | None
+config = collector.SSHConfig(  # keyword arguments: fields may be added
+    host="calder", username="<username>", hostname=collector.KNOWN_CLUSTER_HOSTNAMES["calder"],
+    use_jump_host=False, jump_hostname=None, control_path=None, jump_control_path=None,
+    timeout=30,
+)
+cluster = collector.ClusterInfo("calder", collector.KNOWN_CLUSTER_NAMES["calder"])
+snapshot = collector.run_collection(run_remote, config, cluster, volumes, skip_storage=True)
+payload = collector.snapshot_payload(snapshot)  # the CLI's JSON object, schema_version first
+```
+
+`run_collection(run_remote, config, cluster, volumes, *, skip_storage=False, now=None, probe=None) -> ClusterSnapshot`:
+
+- **`run_remote(script, timeout) -> (stdout, error, timed_out)`** is the transport. It runs `script` (a `str`) as the stdin of `sh -s` on the login node and returns within about `timeout` seconds (a `float`):
+  - `stdout`: what arrived, as text. Decode invalid UTF-8 leniently (`errors="replace"`), as the CLI does. After a timeout, return the partial output with any cut last line left in place: `run_collection` drops it, because a cut `scontrol show node` record reads as "no GPUs allocated".
+  - `error`: `None` when the script ran and exited 0, otherwise a short reason. On a timeout, use the CLI's wording, `Timed out after <n>s: snapshot collection`, which becomes the [timeout warning](#errors-and-warnings) when the core sections were complete.
+  - `timed_out`: `True` when the timeout ended the run (with `error` set).
+  - Anything it raises propagates to the caller; the desktop app raises `ConnectionError` for a dead link. It is called once, or a second time for the jobs-only fallback; each call gets the time left as `timeout`.
+- **`config.timeout`** is the budget in seconds for everything (the probe and both round trips), so a caller's watchdog only has to exceed it slightly; both apps use 30. It also sizes the remote storage guard and the per-command `timeout -k` bounds. Of the other fields, an in-process caller needs only `username` (the account `whoami` should report, used when the `remote` section is missing) and `hostname` (echoed as `remote.host`); the rest configure the CLI's own `ssh`.
+- **`cluster`** (`ClusterInfo(id, name)`) is echoed in the snapshot; **`volumes`** is the parsed storage spec; **`skip_storage=True`** leaves the storage section out of the script.
+- **`probe(timeout) -> str | None`**, if given, runs first and returns an error to stop before any round trip (the CLI's `ssh -O check`). **`now`** (a `datetime`) is the reference for running jobs' elapsed time; the default is the local clock.
+
+The result is a `ClusterSnapshot` dataclass holding the [output model](#output-model)'s fields, `started_at`, `duration_ms` and `timings` included; `dataclasses.asdict` gives the JSON object without `schema_version`. An in-process caller must read it as the JSON's consumers do:
+
+- **`storage is None` means "not collected this time"** (`skip_storage`, the stuck-storage guard, or a round trip that ended before the section): keep the previous rows. `[]` means collected, no volumes. Treating `None` as `[]` would wipe the storage view on every skipped refresh; the desktop app's `validate_snapshot` keeps `None` and `rules.StorageTracker` merges the rows.
+- A row with **`unavailable_reason: "not-collected"`** was cut short, not proven missing: a consumer may keep that label's previous figures for a while (the desktop app: up to 600 s), and should show an `optional` one only where that label has had figures.
+- Non-empty `errors` means the refresh failed; `warnings` never do.
+
+**Cluster tables.** `AIRE_SPEC` and `CALDER_SPEC` (one `<ID>_SPEC` per cluster id) are the storage specs as JSON strings, the same volumes as the macOS app's `ClusterProfile.swift`. `KNOWN_CLUSTER_NAMES` and `KNOWN_CLUSTER_HOSTNAMES` give each id's display name and login host. The desktop app builds its cluster list from these four (`desktop/tests/test_core.py` pins that), and `CollectorContractTests` checks them against the Swift catalogue, so the three front ends describe the same clusters.
+
+**Keep stable:** `run_collection`, `assemble_snapshot`, `snapshot_payload`, `SSHConfig`, `ClusterInfo`, `StorageVolume`, `ClusterSnapshot`, `parse_storage_spec`, `AIRE_SPEC`/`CALDER_SPEC`, `KNOWN_CLUSTER_NAMES`/`KNOWN_CLUSTER_HOSTNAMES` and `_cluster_zone`. The last is private but relied on: the desktop app reads Slurm's zone-less times back in the zone the collector wrote them in (Europe/London, or `HPC_CLUSTER_TZ`).
+
 ## Consumers
 
 - The macOS app (`MonitorService.collectSnapshot`) runs this script with `/usr/bin/python3` for each cluster on every refresh and decodes the JSON through HPCCore. The arguments come from `MonitorService.collectorArguments`: explicit mode, the cluster id and name, the jump host, the cluster's ControlMaster socket, the shared jump socket on the rash route, the profile's storage spec, and `--timeout 30`. It adds `--skip-storage` on most refreshes: storage is collected on the first refresh after start or sign-in, on a manual Refresh, while the Storage tab is open, and once the last collected rows are 5 minutes old; after a requested storage section comes back missing, automatic refreshes wait 60 s before asking again. The app rewrites `.runtime/clusters/<id>/latest_snapshot.json` after every refresh that reaches the login node, with skipped storage (and, after a Slurm failure, the failed sections) carried over from the previous snapshot. It records the argument list, never with `--skip-storage`, in `.runtime/clusters/<id>/collector.json`.
-- The Windows and Linux app (`desktop/`) imports this module in-process and runs every refresh through `run_collection(run_remote, config, cluster, volumes, skip_storage=...)`, with a paramiko exec channel as `run_remote`; the CLI's `collect_snapshot` is the same function over `ssh` plus the ControlMaster probe. So the budget, the cut-line trimming, the jobs fallback and the storage semantics are shared, not re-implemented. Keep `run_collection`, `assemble_snapshot`, `SSHConfig`, `ClusterInfo`, `StorageVolume`, `parse_storage_spec`, `AIRE_SPEC`/`CALDER_SPEC` and `_cluster_zone` (the app reads Slurm's zone-less times in the zone the collector writes them) stable, and the module Python 3.9-compatible (the Mac's `/usr/bin/python3`); the app itself needs 3.11+.
-- The desktop widget follows `.runtime/clusters/*/latest_snapshot.json`. It runs the collector itself, with exactly the arguments in that cluster's `collector.json`, only while the app does not own the cluster (no fresh `app_state.json`; a paused or switched-off record holds at any age) and the snapshot is missing or stale. See [MACOS_APP.md](MACOS_APP.md).
+- The Windows and Linux app (`desktop/leeds_hpc_desktop/ssh.py`, `Session.collect`) imports this module and runs every refresh through `run_collection` with a Paramiko exec channel as `run_remote` and a 30 s budget (see [Library API](#library-api)). It passes `skip_storage=True` except on the first refresh after sign-in, on **Refresh now**, and once the rows on screen are 5 minutes old; after a requested storage section comes back missing or cut short, automatic refreshes wait 60 s before asking again. Its cluster list comes from `KNOWN_CLUSTER_NAMES`, `KNOWN_CLUSTER_HOSTNAMES` and `AIRE_SPEC`/`CALDER_SPEC`.
+- The macOS desktop widget follows `.runtime/clusters/*/latest_snapshot.json`. It runs the collector itself, with exactly the arguments in that cluster's `collector.json`, only while the app does not own the cluster (no fresh `app_state.json`; a paused or switched-off record holds at any age) and the snapshot is missing or stale. See [MACOS_APP.md](MACOS_APP.md).

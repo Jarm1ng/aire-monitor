@@ -1,6 +1,7 @@
 import copy
 import json
 
+import hpc_snapshot as collector
 import pytest
 
 from leeds_hpc_desktop import demo
@@ -55,6 +56,18 @@ def test_profiles_match_collector_specs():
     assert all(len(p.volumes) == 3 for p in PROFILES)
     assert PROFILES[0].color != PROFILES[1].color
     assert PROFILES[0].volumes[0] == PROFILES[1].volumes[0]
+
+
+def test_profiles_are_the_collectors_clusters():
+    # CollectorContractTests (Swift) checks the collector's cluster table and
+    # <ID>_SPEC storage specs against the macOS catalogue. This pins the
+    # other half: the desktop app shows exactly the collector's clusters,
+    # with those names, hosts and specs, so all three apps agree.
+    assert {p.id for p in PROFILES} == set(collector.KNOWN_CLUSTER_NAMES)
+    for p in PROFILES:
+        assert p.name == collector.KNOWN_CLUSTER_NAMES[p.id]
+        assert p.host == collector.KNOWN_CLUSTER_HOSTNAMES[p.id]
+        assert p.storage_spec == getattr(collector, f"{p.id.upper()}_SPEC")
 
 
 # The node availability rule is HPCCore's allow-list (NodeStateInfo): only

@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  macOS 13+ · Swift 6 · SwiftUI · MIT
+  macOS 13+ · Swift 6 · SwiftUI · MIT<br>
+  plus read-only <a href="#windows-and-linux">Windows and Linux ports</a>
 </p>
 
 ---
@@ -48,35 +49,7 @@ Each cluster has its own session, refresh loop, cache, notifications, terminals 
 | Home | `/users/<username>` (shared by both clusters) | same |
 | Scratch / flash | `/mnt/scratch/<username>`, Lustre user quota | `/scratch-calder/users/<username>`, `/flash-calder/users/<username>`, Lustre project quotas |
 
-Partitions the app does not know (for example the `aire-*` nodes currently hosted by Calder's scheduler) are still classified from Slurm's own data. You can switch either cluster off under **Advanced**. Adding a cluster means adding its identity (name, monogram, colour) to [`Catalog.swift`](Sources/HPCCore/Catalog.swift) and one profile (hosts, storage paths, partition roles) to [`ClusterProfile.swift`](Sources/AIREMonitorApp/ClusterProfile.swift).
-
-## Windows version
-
-A read-only Windows desktop port is available in [`desktop/`](desktop/) (one
-code base with the Linux port), with both clusters, SSH/Duo login, dashboards,
-local history, a tray icon and file/log previews. It reuses the Python
-collector; the macOS app below is unchanged.
-See [Windows setup, portable builds and limitations](WINDOWS_APP.md).
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r desktop\requirements.txt
-.\scripts\run_windows_app.ps1
-```
-
-## Linux version
-
-A read-only Linux desktop port is available in [`desktop/`](desktop/) (one
-code base with the Windows port), with both clusters, SSH/Duo login, dashboards,
-local history, a tray icon where the desktop has one, and file/log previews. It
-reuses the Python collector; the macOS app below is unchanged.
-See [Linux setup, portable builds and limitations](LINUX_APP.md).
-
-```bash
-python3 -m venv .venv
-./.venv/bin/python -m pip install -r desktop/requirements.txt
-./scripts/run_linux_app.sh
-```
+Partitions the app does not know (for example the `aire-*` nodes currently hosted by Calder's scheduler) are still classified from Slurm's own data. You can switch either cluster off under **Advanced**. Adding a cluster means adding its identity (name, monogram, colour) to [`Catalog.swift`](Sources/HPCCore/Catalog.swift), one profile (hosts, storage paths, partition roles) to [`ClusterProfile.swift`](Sources/AIREMonitorApp/ClusterProfile.swift), the same name, host and storage spec to the collector ([`scripts/hpc_snapshot.py`](scripts/hpc_snapshot.py)), and a colour to the Windows and Linux app's `PROFILES`. The tests fail until all of them agree; the steps are in [MACOS_APP.md](MACOS_APP.md).
 
 ## Quick start (macOS)
 
@@ -101,7 +74,32 @@ Then sign in from the sidebar:
 2. Enter your university username and password. With **Remember in Keychain** ticked (the default), the password is saved once a server has accepted it, never by a sign-in that only reused an open session.
 3. Click **Connect all** and approve the Duo pushes on your phone. They arrive one at a time; **Cancel sign-in** stops them. Once every cluster is live the form folds into one "Signed in as" line.
 
-## Signing in
+## Windows and Linux
+
+[`desktop/`](desktop/) is a read-only community port for Windows and Linux: one Python package (Qt through PySide6, SSH through Paramiko) that signs in to both clusters with your password and Duo and shows the overview, jobs, partitions, nodes, storage and trends, with previews of files and job output. It runs the same collector as the Mac and follows the Mac's rules for idle GPUs, job counts and storage, so both show the same numbers for the same snapshot. It has no terminal, file transfers, job cancellation or desktop widget. Sign-in follows the same rules (one Duo prompt at a time, no automatic retry, a rejected saved password never resent), but through its own SSH client rather than OpenSSH sessions, so its sessions end when it quits; the password can be saved in Windows Credential Manager or a Linux Secret Service keyring.
+
+> **Not yet verified against a live Leeds sign-in.** Its tests use fixtures and an SSH server on `127.0.0.1`. Nobody has yet confirmed a real AIRE or Calder password-and-Duo sign-in with it, so please report what happens when you try.
+
+| | Portable build | Guide |
+|---|---|---|
+| **Windows** 10/11, x64 | `LeedsHPCMonitor-Windows-x64.zip`, uploaded by each [Windows workflow](.github/workflows/windows.yml) run, or `scripts\build_windows_app.ps1` | [WINDOWS_APP.md](WINDOWS_APP.md) |
+| **Linux** x64, glibc 2.35+ | `LeedsHPCMonitor-Linux-x64.tar.gz`, uploaded by each [Linux workflow](.github/workflows/linux.yml) run, or `scripts/build_linux_app.sh` (which also builds on arm64) | [LINUX_APP.md](LINUX_APP.md) |
+
+From source, with Python 3.11–3.13 (add `-Demo` / `--demo` for synthetic data and no network):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r desktop\requirements.txt
+.\scripts\run_windows_app.ps1
+```
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r desktop/requirements.txt
+./scripts/run_linux_app.sh
+```
+
+## Signing in (macOS)
 
 | Route | Use it when | Duo approvals |
 |---|---|---|
@@ -138,11 +136,14 @@ flowchart LR
 - Quotas are the slowest part, so they are re-read every 5 minutes, on a manual Refresh and while the Storage tab is open; other refreshes keep the last figures.
 - Snapshots, history and preferences are cached under `.runtime/`, so the last data stays on screen while offline.
 
+The Windows and Linux app imports the same collector instead of running it as a process, and drives it over its own SSH connection ([how](MONITORING_PROTOTYPE.md#library-api)).
+
 ## Privacy and safety
 
 - **Background monitoring is read-only.** It never submits jobs or changes remote files. Only the Terminal, the file manager and the confirmed **Cancel job** can change anything, and only when you act.
-- **Your password stays out of files, logs and command lines.** It lives only in your Keychain. During sign-in it reaches the helper scripts on stdin, and ssh's password prompt through a private one-shot pipe. Every process the app starts (helpers, collector, terminals, transfers) gets an environment with any password variables removed.
+- **Your password stays out of files, logs and command lines.** On macOS it lives only in your Keychain. During sign-in it reaches the helper scripts on stdin, and ssh's password prompt through a private one-shot pipe. Every process the app starts (helpers, collector, terminals, transfers) gets an environment with any password variables removed.
 - **Local data stays local.** Snapshots and logs live in `.runtime/` (ignored by git) and SSH sockets in `~/.ssh/ctl/`, outside the checkout.
+- **Windows and Linux** work differently: the password can be saved only in Credential Manager or the Secret Service keyring (off by default), host keys are confirmed in the app, and data lives in the user's app-data folder. See [SECURITY.md](SECURITY.md#windows-and-linux-app) and the guides' privacy sections.
 
 Details: [SECURITY.md](SECURITY.md).
 
@@ -155,17 +156,20 @@ Details: [SECURITY.md](SECURITY.md).
 | `Sources/AIREDesktopWidget/` | The standalone desktop widget |
 | `scripts/` | The snapshot collector, the SSH login helpers (`hpc_*`), `build_bundle.sh`, which builds and signs both bundles for the `run_*` scripts, and `install_app.sh`, which installs the app |
 | `Tests/`, `scripts/tests/` | Swift unit and layout tests with collector fixtures; the collector's Python tests and the mock-ssh login harness |
-| `desktop/` | The Windows and Linux app (Python, PySide6, Paramiko): one package, built per platform by `build_windows_app.ps1` / `build_linux_app.sh`. See [WINDOWS_APP.md](WINDOWS_APP.md) and [LINUX_APP.md](LINUX_APP.md) |
+| `desktop/` | The Windows and Linux app (Python, PySide6, Paramiko): one package, its pytest suite in `desktop/tests/`, built per platform by `scripts/build_windows_app.ps1` / `build_linux_app.sh`. See [WINDOWS_APP.md](WINDOWS_APP.md) and [LINUX_APP.md](LINUX_APP.md) |
 
 ```bash
-scripts/test_all.sh                          # the next three plus a widget build, with a PASS/FAIL summary
+scripts/test_all.sh                          # the next four plus a widget build, with a PASS/FAIL/SKIP summary
 Tests/AIREMonitorAppTests/run_tests.sh       # Swift unit and layout tests (swift-testing)
 python3 scripts/tests/test_snapshot.py       # collector tests against local stubs
 python3 scripts/tests/test_login_flow.py     # login scripts against a fake ssh
+scripts/test_all.sh desktop                  # the Windows/Linux app's pytest suite
 scripts/render_previews.sh                   # offscreen PNGs of every screen, into .runtime/previews
 ```
 
-None of the tests use the network, your Keychain or `~/.ssh`. On a Mac with only the Command Line Tools, plain `swift test` cannot find swift-testing, so use the wrapper script. [CI](.github/workflows/tests.yml) runs `scripts/test_all.sh` on every pull request and push to `main`. Architecture, the login protocol and the runtime layout are documented in [MACOS_APP.md](MACOS_APP.md).
+The desktop suite needs a Python 3.11+ with pytest (`HPC_DESKTOP_PYTHON` picks one, e.g. a venv with `desktop/requirements-dev.txt`). Without PySide6 and Paramiko, as on most Macs, only its standard-library tests run, and the Qt and SSH tests are reported as SKIP. None of the tests use the network (the desktop SSH tests talk to a server on `127.0.0.1`), your Keychain or `~/.ssh`. On a Mac with only the Command Line Tools, plain `swift test` cannot find swift-testing, so use the wrapper script.
+
+CI: [Tests](.github/workflows/tests.yml) runs `scripts/test_all.sh` on macOS for every pull request and push to `main`, except changes confined to the desktop app. The [Windows](.github/workflows/windows.yml) and [Linux](.github/workflows/linux.yml) workflows run for changes to `desktop/`, the collector or their own build scripts: ruff, pyright (for both platforms), the full desktop suite, the collector suite on that platform, then a portable build with an offline startup check, uploaded as an artifact. Architecture, the login protocol and the runtime layout are documented in [MACOS_APP.md](MACOS_APP.md).
 
 For a plain terminal, [`config/aire_ssh_config.example`](config/aire_ssh_config.example) has ready-made `aire`, `calder`, `aire-jump` and `calder-jump` SSH aliases. The app does not need them.
 
@@ -176,6 +180,7 @@ The app was renamed but keeps its internal identifiers (bundle ID `local.aire.mo
 ## Documentation
 
 - [App internals](MACOS_APP.md) · [Security](SECURITY.md) · [Snapshot collector](MONITORING_PROTOTYPE.md) · [Login-script tests](scripts/tests/README.md)
+- Windows and Linux app: [Windows](WINDOWS_APP.md) · [Linux](LINUX_APP.md)
 - Cluster guides: **AIRE** ([English](AIRE_SERVER_GUIDE_EN.md), [中文](AIRE_SERVER_GUIDE.md)) · **Calder** ([English](CALDER_SERVER_GUIDE_EN.md), [中文](CALDER_SERVER_GUIDE.md))
 
 ## License

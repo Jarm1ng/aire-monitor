@@ -1,14 +1,16 @@
 name: Linux desktop app
 
 # Also runs for changes to what the job uses outside desktop/: the collector
-# and its tests (run below via --self-test), the build scripts, and the
-# licence and guide copied into the bundle.
+# and its tests (run below via --self-test), the collector fixture the
+# desktop tests read (Tests/Fixtures), the build scripts, and the licence and
+# guide copied into the bundle. tests.yml skips changes confined to these
+# desktop paths, so this workflow is their only check.
 on:
   push:
     branches: [main]
-    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'Tests/Fixtures/**', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
   pull_request:
-    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'Tests/Fixtures/**', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
   workflow_dispatch:
 
 permissions:
@@ -20,7 +22,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The oldest Ubuntu image on purpose. A PyInstaller bundle needs a glibc
+    # at least as new as the one its libpython and extension modules were
+    # built against; built on 24.04 it would need glibc 2.38+, which shuts
+    # out Ubuntu 22.04 and Debian 12. The floor step below fails the build
+    # if anything in the bundle needs more than 22.04's glibc 2.35.
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +52,11 @@ jobs:
         run: |
           ./.venv/bin/python -m ruff check desktop
           ./.venv/bin/python -m ruff format --check desktop
-          ./.venv/bin/python -m pyright -p desktop
+          # Both platforms on each runner: one package ships for both, and the
+          # standard library's stubs differ by platform (os.getuid or
+          # signal.SIGKILL exist only on POSIX, for example).
+          ./.venv/bin/python -m pyright -p desktop --pythonplatform Linux
+          ./.venv/bin/python -m pyright -p desktop --pythonplatform Windows
       - name: Tests (offline and loopback only)
         env:
           QT_QPA_PLATFORM: offscreen
@@ -57,6 +68,24 @@ jobs:
           ./.venv/bin/python scripts/hpc_snapshot.py --self-test
       - name: Package and smoke test
         run: ./scripts/build_linux_app.sh --skip-install
+      - name: Check the glibc floor
+        # LINUX_APP.md promises glibc 2.35 or newer (Ubuntu 22.04, Debian 12).
+        # The newest GLIBC_x.y symbol version any executable or library in
+        # the bundle imports is the oldest glibc it can start on.
+        shell: bash
+        run: |
+          limit=GLIBC_2.35
+          floor="$(find desktop/dist/LeedsHPCMonitor -type f \( -name '*.so*' -o -name LeedsHPCMonitor \) -print0 \
+            | xargs -0 objdump -T 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -n 1 || true)"
+          if [ -z "$floor" ]; then
+            echo "::error::No glibc symbol versions found in the bundle (is objdump installed?)"
+            exit 1
+          fi
+          echo "The bundle needs $floor or newer."
+          if [ "$(printf '%s\n' "$floor" "$limit" | sort -V | tail -n 1)" != "$limit" ]; then
+            echo "::error::The bundle needs $floor, newer than the documented $limit floor."
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: LeedsHPCMonitor-Linux-x64

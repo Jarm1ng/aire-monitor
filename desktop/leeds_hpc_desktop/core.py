@@ -35,9 +35,25 @@ class Profile:
         return volumes
 
 
+def _profile(cluster_id: str, color_name: str, color: str, storage_spec: str) -> Profile:
+    # The name and login host come from the collector's cluster table and the
+    # storage spec from its AIRE_SPEC/CALDER_SPEC. CollectorContractTests
+    # (Swift) checks both against the macOS app's catalogue and
+    # ClusterProfile.swift, so the three apps cannot drift apart; only the
+    # colours are this app's own.
+    return Profile(
+        cluster_id,
+        collector.KNOWN_CLUSTER_NAMES[cluster_id],
+        collector.KNOWN_CLUSTER_HOSTNAMES[cluster_id],
+        color_name,
+        color,
+        storage_spec,
+    )
+
+
 PROFILES = (
-    Profile("aire", "AIRE", "aire.leeds.ac.uk", "green", "#36c99c", collector.AIRE_SPEC),
-    Profile("calder", "Calder", "calder.leeds.ac.uk", "violet", "#aa94f6", collector.CALDER_SPEC),
+    _profile("aire", "green", "#36c99c", collector.AIRE_SPEC),
+    _profile("calder", "violet", "#aa94f6", collector.CALDER_SPEC),
 )
 USERNAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 

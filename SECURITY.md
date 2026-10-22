@@ -2,7 +2,9 @@
 
 Leeds HPC Monitor watches the University of Leeds AIRE and Calder clusters at the same time. Its automated monitoring is strictly read-only; the only write-capable paths are user-driven features (the embedded Terminal, the confirmation-gated `Cancel job` action, and the Files tab, described below). This document describes exactly where credentials travel, what is stored where, what the app cannot protect against, and how to report a problem.
 
-AIRE, Calder and the rash jump host (`rash.leeds.ac.uk`) all use the same university account and password, with keyboard-interactive login (password, then Duo). The app therefore holds **one** password, but each cluster gets its own independent SSH ControlMaster and runtime directory.
+**Scope.** Everything below describes the macOS app and its desktop widget, except the [Windows and Linux App](#windows-and-linux-app) section. That app (`desktop/`) shares the collector's read-only remote script, but has its own SSH client (Paramiko, no OpenSSH ControlMasters), credential store and data folder, so the macOS credential pipeline, Keychain, data inventory and known limits below do not apply to it.
+
+AIRE, Calder and the rash jump host (`rash.leeds.ac.uk`) all use the same university account and password, with keyboard-interactive login (password, then Duo). The app therefore holds **one** password, but on macOS each cluster gets its own independent SSH ControlMaster and runtime directory.
 
 ## Credential Pipeline
 
@@ -106,8 +108,8 @@ On the rash route, every cluster's target master reaches its login host through 
 
 ## Read-Only Monitoring
 
-- The collector (`scripts/hpc_snapshot.py`) makes one batched round trip per refresh (rarely a second, jobs-only one) over the cluster's existing master. It runs only read-only commands: `sinfo`, `squeue`, `scontrol show node|job`, `df`, `quota`, `lfs quota|project`, `test -d`, `ps`, `hostname` and `whoami`. It writes nothing on the cluster, submits or cancels nothing, and never receives a password.
-- It can only be a client: `BatchMode=yes`, password, keyboard-interactive, public-key and GSSAPI authentication off, `ControlMaster=no`, and the same hardened jump ProxyCommand. It checks the master with `ssh -O check` first and reports "control master is not running" instead of dialling out.
+- The collector (`scripts/hpc_snapshot.py`) makes one batched round trip per refresh (rarely a second, jobs-only one) over the cluster's existing master. It runs only read-only commands: `sinfo`, `squeue`, `scontrol show node|job`, `df`, `quota`, `lfs quota|project`, `test -d`, `ps`, `hostname` and `whoami`. It writes nothing on the cluster, submits or cancels nothing, and never receives a password. The Windows and Linux app imports it and sends the same script, through the same collection sequence, over its own Paramiko connection, so this and the storage bullet below hold there too.
+- The command-line collector the macOS app runs can only be a client: `BatchMode=yes`, password, keyboard-interactive, public-key and GSSAPI authentication off, `ControlMaster=no`, and the same hardened jump ProxyCommand. It checks the master with `ssh -O check` first and reports "control master is not running" instead of dialling out.
 - Usernames and hostnames must be plain SSH words (never starting with `-`), and storage path templates may expand only `$USER` and `$HOME`; everything else is single-quoted into the remote script.
 - Storage commands are bounded with coreutils `timeout` where the login node has it. Killing the local ssh does not stop a remote command stuck in filesystem I/O, so a `ps -u "$USER"` check skips the whole storage section while a `df`, `quota`, `lfs` or `test -d` from an earlier refresh is still stuck, instead of piling up more. It uses no lock file and writes nothing.
 - The desktop widget never handles a password. It reads the app's per-cluster snapshots. Only when the app is not feeding a cluster (no fresh `app_state.json`) does it run the collector itself, with the password-free arguments the app recorded in `collector.json`, and never when the control socket is missing. It executes only a script path that resolves inside the checkout (no absolute path, `~`, `..` or symlink escape).
@@ -149,11 +151,11 @@ macOS may ask whether Leeds HPC Monitor may use your confidential information af
 
 ## Data Inventory
 
-`<id>` is the cluster id (`aire`, `calder`). Each cluster has its own directory; nothing in it is shared between clusters.
+The macOS app's files. `<id>` is the cluster id (`aire`, `calder`). Each cluster has its own directory; nothing in it is shared between clusters.
 
 | Location | Contents | Secrets? |
 | --- | --- | --- |
-| macOS Keychain (`AIREMonitor.AIREPassword`, account `leeds:<username>`) | The university password | Yes. This is the only persistent credential store. |
+| macOS Keychain (`AIREMonitor.AIREPassword`, account `leeds:<username>`) | The university password | Yes. This is the macOS app's only persistent credential store (for Windows and Linux, see [below](#windows-and-linux-app)). |
 | App defaults (domain `local.aire.monitor`) | Project root, a per-username "saved password was rejected" flag, view preferences | No |
 | `.runtime/preferences.json` | Username, route, jump host, Duo option, the Remember in Keychain choice, per-cluster enabled flag and hostname, sidebar selection | Password-free by design |
 | `.runtime/clusters/<id>/latest_snapshot.json`, `snapshot_history.jsonl`, `job_state.json` | Latest snapshot, trend history (up to 1440 points) and the job-state baseline for notifications, with usernames, job names, node names, filesystem paths, quota numbers and Lustre project ids | No passwords, but private cluster details |
@@ -190,12 +192,49 @@ Askpass prompt logging is **off by default**. When `HPC_DEBUG=1` is set in the t
 
 ## Known Limits
 
+These are the macOS app's; the Windows and Linux app's are listed in [its section](#windows-and-linux-app).
+
 - Any process running as your macOS user can use a live master without a password (see above), and can read everything under `.runtime/`.
 - The helpers and the collector run from the project checkout, and the helpers receive the password. Anyone who can write to that checkout can change what receives it, so keep it writable only by you.
 - The app cannot wipe the password from its own memory: Swift strings are not zeroed after use.
 - Terminals, transfers and remote commands do not disable public-key authentication. If a master disappears between the `-O check` pre-flight and launch, ssh dials the host directly (bounded by `ConnectTimeout=5`) and may offer a local key, which the keyboard-interactive-only clusters refuse.
 - Trash folders are created with the login node's umask, not a private mode: an item trashed out of a private folder keeps its own permissions but no longer sits behind that folder. The staged argument list in `/tmp` also follows the umask; it holds paths only, and only until the script reads it.
 - After a route change from rash to direct, the shared jump master is left to close on its 24 h idle limit.
+
+## Windows and Linux App
+
+The Windows and Linux app in `desktop/` is one Python package; its guides' privacy sections ([Windows](WINDOWS_APP.md#privacy-and-trust), [Linux](LINUX_APP.md#privacy-and-trust)) say the same for users. It shares the collector's read-only remote script, but none of the macOS credential pipeline above: no helper scripts, FIFO, askpass, ControlMaster sockets or Keychain. It has not yet been verified against a live Leeds sign-in.
+
+**The same as on macOS**
+
+- One university password and keyboard-interactive login (password, then Duo) on rash, AIRE and Calder. Sign-ins run one at a time.
+- The password is sent at most once per server and never into a password-change prompt; an expired password stops the sign-in. A rejected or expired password, an unapproved Duo push, a cancelled prompt or a declined host key cancels the remaining queued sign-ins, and nothing is retried automatically.
+- A saved password that a server rejected, or that has expired, is flagged for that username (`saved_password_rejected` in `settings.json`, and in memory when the file cannot be written) and is not read or sent again until a typed password is accepted with no different one left saved. A Duo failure means the password was accepted and never sets the flag. Only a typed password a server has just accepted is ever saved; a sign-in that reused an open connection saves nothing.
+- Monitoring runs the collector's remote script through the same `run_collection` sequence as the macOS app (see [Read-Only Monitoring](#read-only-monitoring)): read-only commands, nothing written on the cluster, no password involved.
+
+**Different**
+
+- **SSH client.** Paramiko runs inside the app's own process. The password goes from the password field to Paramiko and over the encrypted connection, and nowhere else: no child process, command line, environment variable or file. Only password authentication is used (keyboard-interactive, or plain password where a server offers only that): no public keys, no SSH agent, no agent forwarding.
+- **rash route.** The app signs in to rash, then runs each cluster's SSH connection inside a `direct-tcpip` channel of that one rash connection. The cluster connection is encrypted end to end, so rash relays only ciphertext, and the password is sent to rash once and to each cluster once.
+- **Sessions live in the process.** There is no control socket, so no other local process can borrow an authenticated session the way any process of the same user can use a ControlMaster. Sessions end on Disconnect or Quit and do not survive a restart. A reused connection must answer an SSH keepalive within 10 s, and a link that stops answering is closed, not retried: Connect signs in afresh.
+- **Host keys** are never accepted silently (the macOS helpers use `StrictHostKeyChecking=accept-new`). A key that the user's own OpenSSH `known_hosts` (`~/.ssh/known_hosts`, or `%USERPROFILE%\.ssh\known_hosts`) lists for the host is trusted; that file is only ever read. Any other key needs explicit approval in a dialog showing its SHA-256 fingerprint before anything is sent, and is then recorded in the app's own `known_hosts`. A key that differs from one recorded in either file, or that the user's file marks `@revoked`, blocks the connection.
+- **Saved password.** Optional and off by default. It can be saved only in Windows Credential Manager or a freedesktop.org Secret Service keyring, chosen explicitly (never through `keyring.get_keyring()`, so never a plaintext or third-party fallback), under the service `LeedsHPCMonitor` with the lower-case username as the account. **Forget saved password** deletes it.
+- **Memory.** The password is a Python string, which cannot be zeroed. Once sign-in ends, the field is cleared and the app drops its references, including the copy Paramiko would otherwise keep for the life of the connection, but copies may linger in freed memory. Nothing is kept for automatic reconnection.
+
+**Data.** One folder per user: `%LOCALAPPDATA%\LeedsHPCMonitor` on Windows, with the profile's inherited permissions, or `${XDG_DATA_HOME:-~/.local/share}/LeedsHPCMonitor` on Linux, mode 0700 with 0600 files. `LEEDS_HPC_DATA_DIR` overrides it for development.
+
+| Location | Contents | Secrets? |
+| --- | --- | --- |
+| Credential Manager or Secret Service (service `LeedsHPCMonitor`, account `<username>`) | The university password, only when saving was ticked | Yes |
+| `settings.json` | Last username and route, and the usernames whose saved password a server rejected | No |
+| `known_hosts` | Host keys approved in the app | No |
+| `<username>-<cluster>.json` | The last snapshot and up to 8,640 history points: job names, commands, remote paths, quota figures, Lustre project ids | No passwords, but private cluster details; the file name contains the username |
+
+**Known limits**
+
+- Any process running as the same user can read that folder and, with debugging rights, the app's memory.
+- Whoever can write to the app's folder (the extracted build, or the checkout and its venv) can change what receives the password, so keep it writable only by you.
+- The portable builds are unsigned, and they pin only their direct dependencies: transitive packages and the GitHub Actions that build them are not hash-locked. Run only builds whose source and download you trust.
 
 ## Do Not Commit
 
@@ -211,12 +250,12 @@ Askpass prompt logging is **off by default**. When `HPC_DEBUG=1` is set in the t
 Before pushing, scan the staged diff for identifying material (replace `<your-username>` with your actual cluster username):
 
 ```bash
-git diff --cached | grep -inE '<your-username>|/users/[a-z0-9]+|/(mnt/scratch|mnt/flash|scratch-aire|flash-aire|scratch-calder|flash-calder)/(users/)?[a-z]*[0-9]|prj [0-9]+|-[0-9a-f]{12}\.sock'
+git diff --cached | grep -inE '<your-username>|/users/[a-z0-9]+|[a-z]:\\users\\[a-z0-9_.-]+|/home/[a-z0-9_.-]+|[a-z0-9_.-]+-(aire|calder)\.json|/(mnt/scratch|mnt/flash|scratch-aire|flash-aire|scratch-calder|flash-calder)/(users/)?[a-z]*[0-9]|prj [0-9]+|-[0-9a-f]{12}\.sock'
 ```
 
-The pattern flags home paths, and with `-i` also local macOS `/Users/<name>` paths. It flags personal directories under AIRE and Calder scratch/flash (`/mnt/scratch/`, `/mnt/flash/`, `/scratch-calder/`, `/flash-calder/`, and the future `/scratch-aire/`, `/flash-aire/`), Lustre project ids as printed by `lfs quota -p` (`prj <id>`), and real hashed control-socket names. Path templates such as `/scratch-calder/users/$USER` do not match.
+The pattern flags home paths, and with `-i` also local macOS `/Users/<name>` paths, Windows `C:\Users\<name>` and Linux `/home/<name>` paths (a pasted traceback or log from the Windows or Linux app carries them), and the desktop app's cache file names, `<username>-<cluster>.json`. It flags personal directories under AIRE and Calder scratch/flash (`/mnt/scratch/`, `/mnt/flash/`, `/scratch-calder/`, `/flash-calder/`, and the future `/scratch-aire/`, `/flash-aire/`), Lustre project ids as printed by `lfs quota -p` (`prj <id>`), and real hashed control-socket names. Path templates such as `/scratch-calder/users/$USER` do not match.
 
-The tests, fixtures and scripts deliberately use placeholders that this pattern also flags: the username `abcd1234` (and short stand-ins such as `alice`, `someone`, `u`, `x`, `me`), the project id `123456`, the socket hashes the Swift tests derive from `abcd1234`, and the example socket name in `scripts/hpc_ssh_common.zsh`. Hits on those placeholders are expected; investigate anything else.
+The tests, fixtures and scripts deliberately use placeholders that this pattern also flags: the username `abcd1234` (and short stand-ins such as `alice`, `someone`, `u`, `x`, `me`, and `demo` in the desktop app's demo data and tests, as in `/users/demo` and `demo-aire.json`), the project id `123456`, the socket hashes the Swift tests derive from `abcd1234`, and the example socket name in `scripts/hpc_ssh_common.zsh`. Hits on those placeholders are expected; investigate anything else.
 
 Concretely, check that the diff contains:
 

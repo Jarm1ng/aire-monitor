@@ -35,8 +35,10 @@ The module is also a library: the Windows and Linux app (desktop/) imports
 it in-process and runs each refresh through run_collection() over its own
 paramiko transport, so both front ends share one collection sequence. Keep
 run_collection, assemble_snapshot, SSHConfig, ClusterInfo, StorageVolume,
-parse_storage_spec and AIRE_SPEC/CALDER_SPEC stable, and the module Python
-3.9-compatible (the Mac runs it with /usr/bin/python3).
+parse_storage_spec, AIRE_SPEC/CALDER_SPEC, KNOWN_CLUSTER_NAMES/HOSTNAMES and
+_cluster_zone stable, and the module standard-library only and Python
+3.9-compatible (the Mac runs it with /usr/bin/python3). MONITORING_PROTOTYPE.md
+("Library API") documents that interface.
 
 Storage is data-driven: --storage-spec describes each volume (label,
 candidate directory templates, quota method) and the matching remote shell is
@@ -78,10 +80,11 @@ DEFAULT_CLUSTER_ID = "aire"
 # contract fixture Tests/Fixtures/collector_contract.json records it and
 # CollectorContractTests.swift fails when the two drift apart.
 DEFAULT_JUMP_HOSTNAME = "rash.leeds.ac.uk"
-# Display names / login hosts used only when the caller does not pass
-# --cluster-name / --hostname. The app always passes both explicitly. Kept in
-# step with ClusterIdentity.known (HPCCore) and ClusterCatalog (app) by the
-# same contract test.
+# Display names / login hosts: the CLI's defaults when the caller does not
+# pass --cluster-name / --hostname (the macOS app always passes both), and
+# the Windows and Linux app's cluster list (desktop/leeds_hpc_desktop/core.py
+# PROFILES). Kept in step with ClusterIdentity.known (HPCCore) and
+# ClusterCatalog (app) by the same contract test.
 KNOWN_CLUSTER_NAMES = {"aire": "AIRE", "calder": "Calder"}
 KNOWN_CLUSTER_HOSTNAMES = {"aire": "aire.leeds.ac.uk", "calder": "calder.leeds.ac.uk"}
 
@@ -1402,8 +1405,9 @@ def merge_node_summary(left: NodeSummary, right: NodeSummary) -> NodeSummary:
 # ---------------------------------------------------------------------------
 
 # Public: the Windows and Linux app (desktop/) imports this module and builds
-# its cluster profiles from these, and the tests use them. Keep them
-# identical to the storage of the macOS app's ClusterProfile.swift.
+# its cluster profiles from these, and the tests use them. One <ID>_SPEC per
+# cluster id, identical to the storage of the macOS app's ClusterProfile.swift
+# (CollectorContractTests.swift fails when they differ).
 AIRE_SPEC = (
     '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
     '{"label":"Scratch","paths":["/scratch-aire/users/$USER","/mnt/scratch/$USER","/mnt/scratch/users/$USER"],"quota":"lustre"},'

@@ -196,14 +196,136 @@ struct CollectorContractTests {
     /// scripts/test_all.sh and CI.
     @Test("the fixtures are what the collector prints today")
     func fixturesAreCurrent() throws {
+        let script = Self.repositoryRoot.appendingPathComponent("scripts/tests/test_snapshot.py").path
+        let run = try Self.runSystemPython([script, "-k", "ContractFixtureTests"])
+
+        #expect(run.succeeded,
+                "\(run.output.suffix(4000))\nRegenerate with: python3 scripts/tests/test_snapshot.py --write-fixture")
+        // A filter that matched nothing would "pass" with zero tests.
+        #expect(!run.output.contains("Ran 0 tests"), "no fixture test ran:\n\(run.output.suffix(2000))")
+    }
+
+    /// Three apps describe the same clusters. The macOS app sends each
+    /// profile's storage as `--storage-spec`; the Windows and Linux app
+    /// (desktop/) never sees the Swift profiles: it imports the collector
+    /// and takes its storage specs from `AIRE_SPEC`/`CALDER_SPEC` (one
+    /// `<ID>_SPEC` per cluster) and its cluster names and login hosts from
+    /// `KNOWN_CLUSTER_NAMES`/`KNOWN_CLUSTER_HOSTNAMES`, which
+    /// desktop/tests/test_core.py pins. So all three agree exactly when the
+    /// collector's tables equal the catalogue, which is what this checks,
+    /// against the module itself rather than a fixture: a spec edited on one
+    /// side only fails here, with the cluster named.
+    ///
+    /// Both specs are compared after the collector's own `parse_storage_spec`
+    /// (which fills in defaults such as `"optional": false`): that is what
+    /// the remote script is built from, so "equal" means "probes the same
+    /// paths with the same quota method". Running the app's real argument
+    /// through it also proves the collector reads every key the Swift
+    /// encoder writes.
+    @Test("the collector's storage specs, names and hosts (the desktop app's) equal the catalogue")
+    func desktopClusterTablesAgree() throws {
+        var sent: [String: String] = [:]
+        for id in catalogIDs {
+            let arguments = MonitorService.collectorArguments(settings: makeSettings(catalogProfile(id)))
+            sent[id.rawValue] = try #require(value(after: "--storage-spec", in: arguments))
+        }
+        let sentJSON = try #require(String(data: JSONSerialization.data(withJSONObject: sent), encoding: .utf8))
+        let collector = Self.repositoryRoot.appendingPathComponent("scripts/hpc_snapshot.py").path
+
+        let run = try Self.runSystemPython(["-c", Self.clusterTablesScript, collector, sentJSON])
+        try #require(run.succeeded, "\(run.output.suffix(4000))")
+        // The JSON is the last line; anything Python printed to stderr
+        // first (a warning, say) is not part of it.
+        let json = try #require(run.output.split(separator: "\n").last, "no output")
+        let tables = try JSONDecoder().decode(CollectorClusterTables.self, from: Data(json.utf8))
+
+        #expect(Set(tables.knownIDs) == Set(catalogIDs.map(\.rawValue)),
+                "KNOWN_CLUSTER_NAMES in scripts/hpc_snapshot.py lists \(tables.knownIDs)")
+        for id in catalogIDs {
+            let profile = catalogProfile(id)
+            let constant = "\(id.rawValue.uppercased())_SPEC"
+            let entry = try #require(tables.clusters[id.rawValue], "\(id)")
+            #expect(entry.collector.error == nil, "scripts/hpc_snapshot.py \(constant): \(entry.collector.error ?? "")")
+            #expect(entry.collector.volumes == profile.storage,
+                    "scripts/hpc_snapshot.py \(constant) differs from ClusterProfile.\(id.rawValue).storage")
+            #expect(entry.sent.error == nil, "the app's --storage-spec for \(id): \(entry.sent.error ?? "")")
+            #expect(entry.sent.volumes == profile.storage,
+                    "the collector reads the app's --storage-spec for \(id) differently from the profile")
+            #expect(entry.name == profile.displayName, "KNOWN_CLUSTER_NAMES[\(id.rawValue)]")
+            #expect(entry.hostname == profile.defaultHostname, "KNOWN_CLUSTER_HOSTNAMES[\(id.rawValue)]")
+        }
+    }
+
+    /// argv: the collector's path, then a JSON object of cluster id -> the
+    /// `--storage-spec` the app sends. Prints `CollectorClusterTables` JSON
+    /// on one line.
+    /// Standard library only, and Python 3.9 (the Mac's /usr/bin/python3).
+    private static let clusterTablesScript = #"""
+        import importlib.util, json, sys
+
+        path, sent = sys.argv[1], json.loads(sys.argv[2])
+        spec = importlib.util.spec_from_file_location("hpc_snapshot", path)
+        hs = importlib.util.module_from_spec(spec)
+        sys.modules["hpc_snapshot"] = hs  # dataclasses resolve annotations through it
+        spec.loader.exec_module(hs)
+
+        def parsed(text):
+            if not isinstance(text, str):
+                return {"error": "missing"}
+            volumes, error = hs.parse_storage_spec(text)
+            if error:
+                return {"error": error}
+            return {"volumes": [{"label": v.label, "paths": list(v.paths), "quota": v.quota,
+                                 "optional": v.optional} for v in volumes]}
+
+        clusters = {
+            cluster_id: {
+                "collector": parsed(getattr(hs, cluster_id.upper() + "_SPEC", None)),
+                "sent": parsed(spec_text),
+                "name": hs.KNOWN_CLUSTER_NAMES.get(cluster_id),
+                "hostname": hs.KNOWN_CLUSTER_HOSTNAMES.get(cluster_id),
+            }
+            for cluster_id, spec_text in sent.items()
+        }
+        print(json.dumps({"clusters": clusters, "known_ids": sorted(hs.KNOWN_CLUSTER_NAMES)}))
+        """#
+
+    private struct CollectorClusterTables: Decodable {
+        struct Spec: Decodable {
+            let volumes: [StorageVolumeSpec]?
+            let error: String?
+        }
+
+        struct Cluster: Decodable {
+            let collector: Spec
+            let sent: Spec
+            let name: String?
+            let hostname: String?
+        }
+
+        let clusters: [String: Cluster]
+        let knownIDs: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case clusters
+            case knownIDs = "known_ids"
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Runs the Mac's /usr/bin/python3 (the interpreter the app runs the
+    /// collector with) isolated (`-I`: no user site, no PYTHON* variables, no
+    /// current directory on sys.path) from the repository root, with
+    /// `arguments` after `-I`. stdout and stderr are combined.
+    private static func runSystemPython(_ arguments: [String]) throws -> (succeeded: Bool, output: String) {
         let python = "/usr/bin/python3"
         try #require(FileManager.default.isExecutableFile(atPath: python), "\(python) is required by the app")
-        let script = Self.repositoryRoot.appendingPathComponent("scripts/tests/test_snapshot.py").path
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = ["-I", script, "-k", "ContractFixtureTests"]
-        process.currentDirectoryURL = Self.repositoryRoot
+        process.arguments = ["-I"] + arguments
+        process.currentDirectoryURL = repositoryRoot
         // Without xcrun's SDKROOT, which sends /usr/bin/python3 through
         // xcodebuild on a Mac with full Xcode (see FileScriptTests).
         var environment = ProcessInfo.processInfo.environment
@@ -227,14 +349,9 @@ struct CollectorContractTests {
         process.waitUntilExit()
         watchdog.cancel()
 
-        let text = String(decoding: data, as: UTF8.self)
-        #expect(process.terminationReason == .exit && process.terminationStatus == 0,
-                "\(text.suffix(4000))\nRegenerate with: python3 scripts/tests/test_snapshot.py --write-fixture")
-        // A filter that matched nothing would "pass" with zero tests.
-        #expect(!text.contains("Ran 0 tests"), "no fixture test ran:\n\(text.suffix(2000))")
+        let succeeded = process.terminationReason == .exit && process.terminationStatus == 0
+        return (succeeded, String(decoding: data, as: UTF8.self))
     }
-
-    // MARK: - Helpers
 
     /// Records every key `raw` has (non-null) that `decoded` lacks or holds
     /// a different value for, except the known not-yet-decoded keys.

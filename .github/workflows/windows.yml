@@ -1,14 +1,16 @@
 name: Windows desktop app
 
 # Also runs for changes to what the job uses outside desktop/: the collector
-# and its tests (run below via --self-test), the build scripts, and the
-# licence and guide copied into the bundle.
+# and its tests (run below via --self-test), the collector fixture the
+# desktop tests read (Tests/Fixtures), the build scripts, and the licence and
+# guide copied into the bundle. tests.yml skips changes confined to these
+# desktop paths, so this workflow is their only check.
 on:
   push:
     branches: [main]
-    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'Tests/Fixtures/**', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
   pull_request:
-    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'Tests/Fixtures/**', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
   workflow_dispatch:
 
 permissions:
@@ -41,7 +43,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\.venv\Scripts\python.exe -m ruff format --check desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\.venv\Scripts\python.exe -m pyright -p desktop
+          # Both platforms on each runner: one package ships for both, and the
+          # standard library's stubs differ by platform (os.getuid or
+          # signal.SIGKILL exist only on POSIX, for example).
+          .\.venv\Scripts\python.exe -m pyright -p desktop --pythonplatform Windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m pyright -p desktop --pythonplatform Linux
       - name: Tests (offline and loopback only)
         shell: pwsh
         env:

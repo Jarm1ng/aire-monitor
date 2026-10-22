@@ -1,12 +1,39 @@
 # Runs every suite (Swift unit and layout tests, collector self-tests, the
 # login-flow harness against a fake ssh) through scripts/test_all.sh.
-# Nothing here reaches the Leeds clusters or needs credentials.
+# Nothing here reaches the Leeds clusters or needs credentials. The desktop
+# suite runs at most its standard-library tests here (SKIP when the runner's
+# python3 has no pytest); windows.yml and linux.yml run it in full.
 name: Tests
 
+# A change that touches only the Windows and Linux app (desktop/, its guides,
+# build scripts and workflows) is tested in full by windows.yml and
+# linux.yml, and nothing else this job runs reads those files, so it does not
+# also hold a macOS runner for up to 45 minutes. paths-ignore skips the run
+# only when EVERY changed file matches, so a pull request that also touches
+# anything else (the collector, Swift, the README, this file) still runs
+# here. If this workflow is ever made a required status check, a skipped run
+# leaves such a pull request waiting: drop this filter then, or require
+# windows.yml/linux.yml instead.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'desktop/**'
+      - 'WINDOWS_APP.md'
+      - 'LINUX_APP.md'
+      - 'scripts/*windows*.ps1'
+      - 'scripts/*linux*.sh'
+      - '.github/workflows/windows.yml'
+      - '.github/workflows/linux.yml'
   pull_request:
+    paths-ignore:
+      - 'desktop/**'
+      - 'WINDOWS_APP.md'
+      - 'LINUX_APP.md'
+      - 'scripts/*windows*.ps1'
+      - 'scripts/*linux*.sh'
+      - '.github/workflows/windows.yml'
+      - '.github/workflows/linux.yml'
   workflow_dispatch:
 
 permissions:

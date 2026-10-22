@@ -1,19 +1,28 @@
 # Leeds HPC Monitor for Linux
 
 A Linux desktop port of the read-only monitoring features. The macOS SwiftUI
-application is unchanged. The Linux app uses Python, Qt (PySide6) and Paramiko,
-and imports the same `scripts/hpc_snapshot.py` collector and parsers as the Mac.
+application is the main app; this port is a read-only community port. The Linux
+app uses Python, Qt (PySide6) and Paramiko, and runs the same collector as the
+Mac: `scripts/hpc_snapshot.py`, imported as a library rather than started as a
+process, so both apps read a cluster the same way and show the same figures.
 It shares its code, in `desktop/`, with the [Windows app](WINDOWS_APP.md).
 It does not need OpenSSH ControlMaster, Xcode, or anything installed on the
 cluster.
 
+> **Not yet verified against a live Leeds sign-in.** The tests use fixtures and
+> an SSH server on `127.0.0.1`; nobody has yet confirmed a real AIRE or Calder
+> password-and-Duo sign-in with this app. If you try it, please report what
+> happens.
+
 ## Run the portable app
 
-Linux (64-bit `x86_64` or `aarch64` with X11/XWayland or Wayland). Extract the
-**entire** `LeedsHPCMonitor-Linux-x64.tar.gz` (or `-arm64.tar.gz`) archive into a
-folder you can write to, then launch `./LeedsHPCMonitor/LeedsHPCMonitor`. Keep
-`_internal` next to the executable. Python is bundled; a separate Python
-installation is not needed.
+64-bit `x86_64` Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, or
+newer) and X11/XWayland or Wayland. Extract the **entire**
+`LeedsHPCMonitor-Linux-x64.tar.gz` archive into a folder you can write to, then
+launch `./LeedsHPCMonitor/LeedsHPCMonitor`. Keep `_internal` next to the
+executable. Python is bundled; a separate Python installation is not needed.
+CI builds `x86_64` only; on `aarch64`, build the archive yourself (see
+[Develop from source](#develop-from-source)).
 
 There is no root installer or auto-updater. Only run builds whose source and
 download you trust.
@@ -76,9 +85,10 @@ example snapshots into the live cache.
   the Mac) and recent CPU/queue/node-health history, in local time.
 - Ten-second refreshes over persistent authenticated SSH connections. Storage
   (`df`, `quota`, `lfs quota` on shared filesystems) is collected after
-  sign-in, on **Refresh now** and every five minutes; in between, the last rows
-  stay on screen with their collection time. One cluster's refresh failure
-  does not discard the other's data.
+  sign-in, on **Refresh now** and every five minutes; after a collection that
+  did not come back, automatic refreshes wait a minute before asking again. In
+  between, the last rows stay on screen with their collection time. One
+  cluster's refresh failure does not discard the other's data.
 - System tray icon, minimize-to-tray, and notifications when a job starts or
   leaves the active queue, where the desktop provides a tray (stock GNOME needs
   the AppIndicator extension). Without one the button reads **Minimize** and
@@ -174,8 +184,19 @@ The scripts use the venv directly; activation is unnecessary.
 The build produces `desktop/dist/LeedsHPCMonitor-Linux-x64.tar.gz` (or
 `LeedsHPCMonitor-Linux-arm64.tar.gz` on `aarch64`), prints its SHA-256 hash, and
 runs an offline frozen-executable startup check. Dependency licence texts are
-included alongside the executable. GitHub Actions performs the same checks and
-uploads a tarball artifact; it does not publish a release.
+included alongside the executable. A bundle needs at least the glibc of the
+machine that built it, so build on the oldest distribution you want to
+support.
+
+GitHub Actions (`.github/workflows/linux.yml`) performs the same checks, with
+pyright run for both Linux and Windows, on every push to `main` and pull
+request that touches `desktop/`, the collector or the Linux build scripts. It
+builds on Ubuntu 22.04, fails if the bundle needs a newer glibc than 2.35, and
+uploads the tarball as a workflow artifact; it does not publish a release.
+
+`scripts/test_all.sh desktop` runs the same pytest suite with a PASS/FAIL/SKIP
+summary. It uses `./.venv/bin/python` when that has pytest; `HPC_DESKTOP_PYTHON`
+names another interpreter.
 
 The tests use fixtures, an isolated cache, offscreen Qt widgets and a real SSH
 server bound only to `127.0.0.1`. They never contact AIRE, Calder or rash, and do
@@ -198,7 +219,7 @@ by platform.
 | `desktop/leeds_hpc_desktop/app.py` | Desktop UI, background tasks, prompts, tray |
 | `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, liveness and cancellation, SFTP, the collector's transport |
 | `desktop/leeds_hpc_desktop/login.py` | Sign-in rules (standard library only): which prompts get the password, and never resending a rejected saved password |
-| `desktop/leeds_hpc_desktop/core.py` | Profiles, snapshot validation, local cache |
+| `desktop/leeds_hpc_desktop/core.py` | Cluster profiles (names, hosts and storage specs from the collector), snapshot validation, local cache |
 | `desktop/leeds_hpc_desktop/rules.py` | The macOS app's rules, ported: node states, GPU pools, job counts, storage tone and cadence, times |
 | `desktop/leeds_hpc_desktop/platform_support.py` | Data folder, file permissions, credential store, tray check, platform wording |
 | `desktop/leeds_hpc_desktop/demo.py` | Explicit offline examples |

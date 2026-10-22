@@ -7,8 +7,11 @@ Run (from anywhere):
     python3 scripts/hpc_snapshot.py --self-test            the same, via the collector
     python3 scripts/tests/test_snapshot.py --write-fixture regenerate the contract fixtures
 
-The Swift test target runs this file too (CollectorContractTests.swift), so
-`Tests/AIREMonitorAppTests/run_tests.sh` covers the collector.
+The Swift test target runs only the fixture-currency part of this file
+(`-k ContractFixtureTests`, from CollectorContractTests.swift), and checks
+AIRE_SPEC/CALDER_SPEC and the cluster table against the macOS catalogue;
+run this file, `--self-test` or `scripts/test_all.sh collector` for the
+full suite.
 
 Nothing here runs ssh or touches ~/.ssh. Four layers are covered:
   * the parsers, against canned Slurm/df/quota/lfs output modelled on what
