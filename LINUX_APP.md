@@ -94,6 +94,9 @@ example snapshots into the live cache.
   the AppIndicator extension). Without one the button reads **Minimize** and
   job changes appear in the window's banner instead. Leaving the queue is
   **not** described as successful completion: its final status is unknown.
+  Changes from while a cluster was not watched (the app closed, or
+  disconnected) come as one summary after more than 10 minutes, and not at all
+  after more than a day.
 - Local, account-scoped snapshots and up to 8,640 history points per cluster.
   Offline data always remains labelled as cached/stale.
 
@@ -135,8 +138,9 @@ end on **Quit**; they do not survive app restarts. **Minimize to tray** (or
 - A new host key needs explicit approval **before** authentication. A key
   already in your own OpenSSH `~/.ssh/known_hosts` file is trusted
   without a prompt; that file is only read, never written. A key that differs
-  from the one recorded in either file, or that your file marks `@revoked`, is
-  blocked, not silently accepted. If a key really changed, verify it with Leeds
+  from the one recorded in either file, or that your file marks `@revoked`
+  (for any host pattern, `@revoked *` included), is blocked, not silently
+  accepted. If a key really changed, verify it with Leeds
   IT before editing the file concerned.
 - There is no SSH agent forwarding. Only fixed Leeds hostnames are contacted.
   No telemetry or public service receives your snapshots or credentials.

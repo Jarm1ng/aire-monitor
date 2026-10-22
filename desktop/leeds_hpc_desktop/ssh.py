@@ -73,8 +73,9 @@ def default_user_known_hosts() -> Path | None:
 @dataclass
 class KnownHosts:
     keys: paramiko.HostKeys = field(default_factory=paramiko.HostKeys)
-    # Keys the file marks "@revoked": refused whatever else it says.
-    revoked: paramiko.HostKeys = field(default_factory=paramiko.HostKeys)
+    # The keys (their wire bytes, PKey.asbytes()) of every line the file
+    # marks "@revoked": refused for any host, whatever else it says.
+    revoked: set[bytes] = field(default_factory=set)
 
 
 def load_known_hosts(path: Path | None) -> KnownHosts:
@@ -86,6 +87,12 @@ def load_known_hosts(path: Path | None) -> KnownHosts:
     raises InvalidHostKey). Lines that cannot be read are skipped; certificate
     authorities and wildcard patterns are not supported, so their hosts
     simply get the app's own first-use prompt.
+
+    "@revoked" lines are the exception: their host field is ignored and the
+    key is refused for every host. The usual form is "@revoked * <key>"
+    (revocation is about the key, not a host), and paramiko's lookups match
+    only literal or hashed names, so honouring the pattern would need
+    OpenSSH's matching; refusing a revoked key everywhere is never less safe.
     """
     known = KnownHosts()
     if path is None:
@@ -96,9 +103,9 @@ def load_known_hosts(path: Path | None) -> KnownHosts:
         return known
     for number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
-        target = known.keys
-        if line.startswith("@revoked"):
-            line, target = line[len("@revoked") :].strip(), known.revoked
+        revoked = line.startswith("@revoked")
+        if revoked:
+            line = line[len("@revoked") :].strip()
         if not line or line.startswith(("#", "@")):
             continue
         try:
@@ -107,8 +114,11 @@ def load_known_hosts(path: Path | None) -> KnownHosts:
             continue
         if entry is None or entry.key is None:
             continue
+        if revoked:
+            known.revoked.add(entry.key.asbytes())
+            continue
         for name in entry.hostnames:
-            target.add(name, entry.key.get_name(), entry.key)
+            known.keys.add(name, entry.key.get_name(), entry.key)
     return known
 
 
@@ -166,7 +176,9 @@ class HostVerifier:
         with self.lock:
             keys = self._app_keys()
             user = load_known_hosts(self.user_known_hosts)
-            if user.revoked.check(host, key):
+            # Before anything else, the app's own approval included: a key
+            # the user revoked stays refused even if it was approved here.
+            if key.asbytes() in user.revoked:
                 raise paramiko.SSHException(
                     f"The host key of {host} is marked @revoked in {self.user_known_hosts}. "
                     "Connection blocked. No credentials were sent."
@@ -590,19 +602,30 @@ class ConnectionManager:
         self.username = self.route = None
         return dead
 
-    def connect(self, profile, username, password, route) -> tuple[Session, bool]:
+    def connect(
+        self, profile, username, password, route, generation: int | None = None
+    ) -> tuple[Session, bool]:
         """Sign in to profile's cluster, or reuse its live session.
 
         Returns (session, verified): verified is True when this call sent
         the password and a server accepted it. Reusing a session sends
         nothing, so it proves nothing about the password.
+
+        generation is self.generation as read when the user pressed Connect.
+        One Connect signs in to several clusters one after another, each
+        with its own call: a Disconnect after the first must cancel the rest
+        too, so a call carrying an older generation raises Cancelled before
+        anything is opened or sent. None means "as of this call".
         """
         username = validate_username(username)
         with self.lock:
             with self.state_lock:
                 if self.stopping.is_set():
                     raise Cancelled("App is closing.")
-                generation = self.generation
+                if generation is None:
+                    generation = self.generation
+                elif generation != self.generation:
+                    raise Cancelled("Disconnected while signing in.")
                 dead = self._release_if_signed_out()
                 if self.username not in (None, username) or self.route not in (None, route):
                     raise ValueError("Disconnect before changing your account or route.")

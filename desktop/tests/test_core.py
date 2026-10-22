@@ -1,5 +1,7 @@
 import copy
 import json
+import re
+from pathlib import Path
 
 import hpc_snapshot as collector
 import pytest
@@ -13,6 +15,8 @@ from leeds_hpc_desktop.core import (
     validate_username,
 )
 from leeds_hpc_desktop.rules import cluster_figures
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
@@ -67,7 +71,26 @@ def test_profiles_are_the_collectors_clusters():
     for p in PROFILES:
         assert p.name == collector.KNOWN_CLUSTER_NAMES[p.id]
         assert p.host == collector.KNOWN_CLUSTER_HOSTNAMES[p.id]
-        assert p.storage_spec == getattr(collector, f"{p.id.upper()}_SPEC")
+        # A "-" in an id (allowed: MACOS_APP.md, "Adding a cluster") is "_"
+        # in the constant's name, as in CollectorContractTests.
+        assert p.storage_spec == getattr(collector, f"{p.id.upper().replace('-', '_')}_SPEC")
+
+
+def test_the_collector_names_this_app_uses_are_documented_as_stable():
+    # MONITORING_PROTOTYPE.md ("Keep stable") and the collector's docstring
+    # tell whoever changes the collector for the macOS app which names this
+    # app needs. A name used here but missing from either list could be
+    # renamed in good faith, and this package would then fail to import.
+    used = set()
+    for source in (REPO / "desktop" / "leeds_hpc_desktop").glob("*.py"):
+        used |= set(re.findall(r"\bcollector\.([A-Za-z_]\w*)", source.read_text(encoding="utf-8")))
+    assert {"run_collection", "DEFAULT_TIMEOUT", "_cluster_zone"} <= used
+    guide = (REPO / "MONITORING_PROTOTYPE.md").read_text(encoding="utf-8")
+    keep_stable = next(line for line in guide.splitlines() if line.startswith("**Keep stable:**"))
+    docstring = collector.__doc__ or ""
+    for name in sorted(used):
+        assert re.search(rf"\b{name}\b", keep_stable), f"{name} is missing from MONITORING_PROTOTYPE.md"
+        assert re.search(rf"\b{name}\b", docstring), f"{name} is missing from the hpc_snapshot.py docstring"
 
 
 # The node availability rule is HPCCore's allow-list (NodeStateInfo): only

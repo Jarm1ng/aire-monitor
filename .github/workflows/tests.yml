@@ -7,8 +7,11 @@ name: Tests
 
 # A change that touches only the Windows and Linux app (desktop/, its guides,
 # build scripts and workflows) is tested in full by windows.yml and
-# linux.yml, and nothing else this job runs reads those files, so it does not
-# also hold a macOS runner for up to 45 minutes. paths-ignore skips the run
+# linux.yml, so it does not also hold a macOS runner for up to 45 minutes.
+# The only other reader of those files here is the Swift suite's `bash -n`
+# check of every scripts/*.sh (ShellSyntaxTests); linux.yml runs that same
+# check on scripts/*linux*.sh, so skipping this job loses nothing. Nothing
+# here reads the PowerShell scripts. paths-ignore skips the run
 # only when EVERY changed file matches, so a pull request that also touches
 # anything else (the collector, Swift, the README, this file) still runs
 # here. If this workflow is ever made a required status check, a skipped run

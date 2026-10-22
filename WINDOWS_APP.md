@@ -89,7 +89,9 @@ example snapshots into the live cache.
   cluster's refresh failure does not discard the other's data.
 - Windows notification-area icon, minimize-to-tray, and notifications when a
   job starts or leaves the active queue. Leaving the queue is **not** described
-  as successful completion: its final status is unknown.
+  as successful completion: its final status is unknown. Changes from while a
+  cluster was not watched (the app closed, or disconnected) come as one
+  summary after more than 10 minutes, and not at all after more than a day.
 - Local, account-scoped snapshots and up to 8,640 history points per cluster.
   Offline data always remains labelled as cached/stale.
 
@@ -129,8 +131,9 @@ the process and sessions running; closing the window quits.
 - A new host key needs explicit approval **before** authentication. A key
   already in your own OpenSSH `%USERPROFILE%\.ssh\known_hosts` file is trusted
   without a prompt; that file is only read, never written. A key that differs
-  from the one recorded in either file, or that your file marks `@revoked`, is
-  blocked, not silently accepted. If a key really changed, verify it with Leeds
+  from the one recorded in either file, or that your file marks `@revoked`
+  (for any host pattern, `@revoked *` included), is blocked, not silently
+  accepted. If a key really changed, verify it with Leeds
   IT before editing the file concerned.
 - There is no SSH agent forwarding. Only fixed Leeds hostnames are contacted.
   No telemetry or public service receives your snapshots or credentials.

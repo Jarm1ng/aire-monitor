@@ -48,6 +48,16 @@ jobs:
         run: |
           python3 -m venv .venv
           ./.venv/bin/python -m pip install -r desktop/requirements-dev.txt
+      - name: Shell syntax
+        # tests.yml skips changes confined to these scripts, and its Swift
+        # suite's `bash -n` check of scripts/*.sh is all that otherwise parses
+        # run_linux_app.sh (nothing here runs it), so check them here.
+        shell: bash
+        run: |
+          for script in scripts/*linux*.sh; do
+            echo "bash -n $script"
+            bash -n "$script"
+          done
       - name: Lint and type check
         run: |
           ./.venv/bin/python -m ruff check desktop

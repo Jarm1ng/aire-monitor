@@ -218,6 +218,68 @@ def test_refreshes_collect_storage_only_when_due(qt_app, tmp_path, monkeypatch):
     finish(window)
 
 
+@pytest.mark.parametrize("on_screen", [False, True])
+def test_a_slurm_failure_still_counts_its_storage(qt_app, tmp_path, monkeypatch, on_screen):
+    # slurmctld down (or squeue --json unusable with no fallback budget): the
+    # round trip works, the snapshot has errors. Its storage is recorded as
+    # on the Mac, so the next refreshes skip df/quota/lfs instead of running
+    # them on the shared filesystems every 10 s for the whole outage.
+    window = MainWindow(LocalStore(tmp_path))
+    window.account = "demo"
+    good = demo.snapshots()["aire"]
+    if on_screen:
+        window.receive("aire", good, None)
+        # The rows on screen are due again: 400 s old.
+        window.storage["aire"].last_collection = time.monotonic() - 400
+    requests = []
+    failed = demo.snapshots()["aire"]
+    failed["collected_at"] = (
+        datetime.fromisoformat(good["collected_at"]) + timedelta(seconds=400)
+    ).isoformat()
+    failed["jobs"] = []
+    failed["errors"] = ["Section 'jobs' failed with exit 1"]
+    failed["storage"][0] = {**failed["storage"][0], "used_percent": 77}
+
+    class FakeSession:
+        connected = True
+
+        def collect(self, username, skip_storage=False):
+            requests.append(skip_storage)
+            return {**failed, "storage": None} if skip_storage else copy.deepcopy(failed)
+
+        def close(self):
+            pass
+
+    window.manager.sessions = {"aire": FakeSession()}
+    monkeypatch.setattr(window, "submit", lambda work, done: done(work(), None))
+    window.refresh_all()
+    window.refresh_all()
+    assert requests == [False, True]
+    assert window.states["aire"] == "STALE / REFRESH FAILED"
+    if on_screen:
+        # The last good jobs stay; the storage rows are the new ones.
+        assert window.snapshots["aire"]["jobs"] == good["jobs"]
+        assert window.snapshots["aire"]["storage"] == failed["storage"]
+        assert window.snapshots["aire"]["storage_collected_at"] == failed["collected_at"]
+    else:
+        assert "aire" not in window.snapshots
+    finish(window)
+
+
+def test_a_transport_failure_records_no_storage(qt_app, tmp_path):
+    # No remote answer: nothing was collected, so the schedule is unchanged.
+    window = MainWindow(LocalStore(tmp_path))
+    window.account = "demo"
+    lost = demo.snapshots()["aire"]
+    lost["remote"] = {"host": "aire", "hostname": "", "user": "", "cwd": ""}
+    lost["errors"] = ["The SSH channel closed before the snapshot command reported its exit status."]
+    window.receive("aire", lost, None)
+    window.receive("calder", None, ConnectionError("closed"))
+    assert window.storage["aire"].due and window.storage["calder"].due
+    assert window.snapshots == {}
+    finish(window)
+
+
 class FakeVault:
     def __init__(self, saved=None):
         self.saved = dict(saved or {})
@@ -265,7 +327,7 @@ def test_rejected_saved_password_is_never_sent_again(qt_app, tmp_path, monkeypat
     problems = synchronous(window, monkeypatch)
     sent = []
 
-    def refuse(profile, username, password, route):
+    def refuse(profile, username, password, route, generation=None):
         sent.append(password)
         raise PasswordRejected(f"{profile.host} rejected the password.")
 
@@ -292,7 +354,7 @@ def test_rejected_saved_password_is_never_sent_again(qt_app, tmp_path, monkeypat
     assert "rejected" in problems[-1]
 
     # A typed password a server accepts, with Save ticked, replaces it.
-    def accept(profile, username, password, route):
+    def accept(profile, username, password, route, generation=None):
         sent.append(password)
         return FakeClusterSession(profile), True
 
@@ -313,7 +375,11 @@ def test_password_is_saved_only_once_a_server_accepted_it(qt_app, tmp_path, monk
     monkeypatch.setattr(platform_support, "credential_backend", lambda: vault)
     window = MainWindow(LocalStore(tmp_path))
     synchronous(window, monkeypatch)
-    window.manager.connect = lambda profile, username, password, route: (FakeClusterSession(profile), False)
+
+    def reuse(profile, username, password, route, generation=None):
+        return FakeClusterSession(profile), False
+
+    window.manager.connect = reuse
     window.username.setText("demo")
     window.password.setText("never-checked")
     window.remember.setChecked(True)
@@ -364,6 +430,90 @@ def test_disconnect_cancels_a_sign_in_and_connect_is_never_silently_ignored(qt_a
     pending[0]([("aire", demo.snapshots()["aire"], None)], None)
     assert not window.connecting and window.connect_button.isEnabled()
     assert "aire" not in window.snapshots
+    finish(window)
+
+
+@pytest.mark.parametrize("ending", ["raises", "error snapshot"])
+@pytest.mark.parametrize("route", [0, 1])
+def test_disconnect_during_a_sign_in_stops_the_clusters_not_reached_yet(
+    qt_app, tmp_path, monkeypatch, ending, route
+):
+    # AIRE signs in and its first collection runs while both cards read
+    # "SIGNING IN"; the user presses Disconnect. That collection then fails
+    # (or comes back with an error) on the closed connection, and the worker
+    # must not go on to Calder (or rash again): no password sent, no Duo.
+    window = MainWindow(LocalStore(tmp_path))
+    synchronous(window, monkeypatch)
+    window.route.setCurrentIndex(route)
+    opened = []
+
+    def open_transport(host, username, password, generation, sock=None):
+        opened.append(host)
+        return MagicMock(), True
+
+    def collect(session, username, skip_storage=False):
+        window.disconnect()
+        if ending == "raises":
+            raise ConnectionError("The connection to AIRE stopped responding.")
+        snapshot = demo.snapshots()[session.profile.id]
+        snapshot["errors"] = ["The SSH channel closed before the snapshot command reported its exit status."]
+        return snapshot
+
+    window.manager._open = open_transport
+    monkeypatch.setattr(Session, "collect", collect)
+    window.username.setText("demo")
+    window.password.setText("test-only")
+    window.connect_all()
+    assert opened == ([] if route == 0 else ["rash.leeds.ac.uk"]) + [PROFILES[0].host]
+    assert window.manager.sessions == {} and window.manager.jump is None
+    assert window.states["aire"] == window.states["calder"] == "SIGN-IN CANCELLED"
+    assert not window.connecting and window.connect_button.isEnabled()
+    assert window.username.isEnabled() and window.route.isEnabled()
+    finish(window)
+
+
+def test_a_disconnect_before_the_worker_starts_signs_in_nowhere(qt_app, tmp_path, monkeypatch):
+    # A busy thread pool: the worker starts only after Disconnect was pressed.
+    window = MainWindow(LocalStore(tmp_path))
+    pending = []
+    monkeypatch.setattr(window, "submit", lambda work, done: pending.append((work, done)))
+    window.manager._open = MagicMock(return_value=(MagicMock(), True))
+    window.username.setText("demo")
+    window.password.setText("test-only")
+    window.connect_all()
+    window.disconnect()
+    work, done = pending[0]
+    done(work(), None)
+    window.manager._open.assert_not_called()
+    assert window.manager.sessions == {}
+    assert window.states["aire"] == window.states["calder"] == "SIGN-IN CANCELLED"
+    finish(window)
+
+
+def test_job_notices_ignore_a_days_old_baseline(qt_app, tmp_path, monkeypatch):
+    # The cached snapshot is the first baseline after Connect. Jobs that
+    # ended while the app was closed are not news; after a shorter gap they
+    # come as one catch-up summary (the macOS rules).
+    monkeypatch.setattr(platform_support, "tray_available", lambda: False)
+    store = LocalStore(tmp_path)
+    cached = demo.snapshots()["aire"]
+    cached["collected_at"] = (datetime.fromisoformat(cached["collected_at"]) - timedelta(days=3)).isoformat()
+    store.save("demo", "aire", cached, [])
+    store.write("settings.json", {"username": "demo", "route": "direct"})
+    window = MainWindow(store)
+    assert window.states["aire"] == "CACHED / OFFLINE"
+    fresh = demo.snapshots()["aire"]
+    fresh["jobs"] = []
+    window.receive("aire", fresh, None)
+    assert window.states["aire"] == "CONNECTED"
+    assert "jobs:" not in window.banner.text()
+    half_an_hour = datetime.fromisoformat(fresh["collected_at"]) - timedelta(minutes=30)
+    window.snapshots["aire"] = {**cached, "collected_at": half_an_hour.isoformat()}
+    window.receive("aire", fresh, None)
+    assert (
+        "AIRE jobs: While AIRE was not watched (30 min): 2 jobs ended or left the queue"
+        in window.banner.text()
+    )
     finish(window)
 
 

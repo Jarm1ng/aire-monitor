@@ -323,6 +323,55 @@ def test_no_settings_file_means_no_flag(tmp_path):
     assert not LocalStore(tmp_path).saved_password_rejected("demo")
 
 
+@pytest.mark.parametrize("content", ["", "not json", "[]"])
+def test_replacing_an_unreadable_settings_file_keeps_failing_closed(tmp_path, content):
+    # e.g. settings.json cut short by a power cut. Every Connect rewrites it
+    # (username, route); that must not quietly drop the flags it may hold,
+    # or the next empty-field Connect resends a rejected saved password.
+    (tmp_path / SETTINGS_FILE).write_text(content)
+    store = LocalStore(tmp_path)
+    store.update_settings(username="demo", route="direct")
+    assert store.saved_password_rejected("demo")
+    assert store.saved_password_rejected("other")
+    settings = json.loads((tmp_path / SETTINGS_FILE).read_text())
+    assert settings["username"] == "demo" and settings["route"] == "direct"
+    # A typed password a server accepted lifts that account only, and later
+    # rewrites keep both answers.
+    store.set_saved_password_rejected("Demo", False)
+    store.update_settings(route="jump")
+    assert not store.saved_password_rejected("demo")
+    assert store.saved_password_rejected("other")
+    # A new rejection still counts for an account lifted before.
+    store.set_saved_password_rejected("demo", True)
+    assert store.saved_password_rejected("demo")
+
+
+def test_unreadable_flags_in_a_readable_file_keep_failing_closed(tmp_path):
+    (tmp_path / SETTINGS_FILE).write_text('{"saved_password_rejected": "demo", "route": "jump"}')
+    store = LocalStore(tmp_path)
+    store.update_settings(username="demo")
+    settings = json.loads((tmp_path / SETTINGS_FILE).read_text())
+    assert settings["route"] == "jump" and settings["username"] == "demo"
+    assert store.saved_password_rejected("demo") and store.saved_password_rejected("other")
+
+
+def test_a_typed_password_after_an_unreadable_file_does_not_unblock_the_saved_one(tmp_path):
+    # The finding's sequence: the flag was in a file that became unreadable,
+    # the user types a password (accepted, not saved); the different saved
+    # password, possibly the rejected one, must stay blocked.
+    vault = FakeVault({("Svc", "demo"): "old-pass"})
+    guard, store = guard_with(tmp_path, vault)
+    (tmp_path / SETTINGS_FILE).write_text("")
+    assert guard.choose("demo", "new-pass") == ("new-pass", False)
+    store.update_settings(username="demo", route="direct")
+    assert guard.verified("demo", "new-pass", False, "save failed") is None
+    with pytest.raises(ValueError, match="rejected"):
+        guard.choose("demo", "")
+    # Saving the typed password replaces the saved one and lifts the flag.
+    assert guard.verified("demo", "new-pass", True, "save failed") is None
+    assert guard.choose("demo", "") == ("new-pass", True)
+
+
 def test_concurrent_settings_writes_lose_nothing(tmp_path):
     store = LocalStore(tmp_path)
     names = [f"user{i}" for i in range(20)]

@@ -1130,6 +1130,92 @@ def test_a_job_seen_running_for_the_first_time_is_not_a_start():
     assert job_change_messages([], [{"job_id": "1", "state": "RUNNING"}]) == []
 
 
+def jobs_at(stamp, jobs):
+    return {"collected_at": stamp, "jobs": jobs}
+
+
+BASELINE = jobs_at(
+    "2026-10-13T12:00:00+00:00",
+    [{"job_id": "1", "state": "RUNNING"}, {"job_id": "2", "state": "PENDING"}],
+)
+LATER_JOBS = [{"job_id": "2", "state": "RUNNING"}]
+
+
+@pytest.mark.parametrize(
+    "stamp,delivery",
+    [
+        ("2026-10-13T12:05:00+00:00", ("individual", 300.0)),
+        ("2026-10-13T12:10:00+00:00", ("individual", 600.0)),
+        ("2026-10-13T12:30:00+00:00", ("summary", 1800.0)),
+        ("2026-10-14T12:00:00+00:00", ("summary", 86400.0)),
+        ("2026-10-14T13:00:00+00:00", None),
+        ("not a time", None),
+        (None, None),
+    ],
+)
+def test_job_notices_follow_the_macos_gap_windows(stamp, delivery):
+    # JobEventTests.gapRules: short gaps alert individually, long gaps
+    # summarise, very long gaps (or an unreadable time) re-seed silently.
+    assert rules.job_change_delivery(BASELINE["collected_at"], stamp) == delivery
+
+
+def test_a_short_gap_reports_each_change():
+    current = jobs_at("2026-10-13T12:05:00+00:00", LATER_JOBS)
+    assert rules.job_notice_lines("AIRE", BASELINE, current) == [
+        "2: PENDING → RUNNING",
+        "1: left the active queue (final status unknown)",
+    ]
+
+
+def test_a_long_gap_reports_one_catch_up_summary_first():
+    current = jobs_at("2026-10-13T12:30:00+00:00", LATER_JOBS)
+    assert rules.job_notice_lines("AIRE", BASELINE, current) == [
+        "While AIRE was not watched (30 min): 1 job ended or left the queue, 1 started",
+        "1: left the active queue (final status unknown)",
+        "2: PENDING → RUNNING",
+    ]
+    three_ended = jobs_at("2026-10-13T15:00:00+00:00", [])
+    baseline = jobs_at(BASELINE["collected_at"], [{"job_id": str(n), "state": "RUNNING"} for n in (3, 4, 5)])
+    assert rules.job_notice_lines("Calder", baseline, three_ended)[0] == (
+        "While Calder was not watched (3 h): 3 jobs ended or left the queue"
+    )
+
+
+def test_a_baseline_older_than_a_day_announces_nothing():
+    # e.g. the cached snapshot after the app was closed over a weekend: the
+    # jobs that ended meanwhile are not news.
+    current = jobs_at("2026-10-14T13:00:00+00:00", LATER_JOBS)
+    assert rules.job_notice_lines("AIRE", BASELINE, current) == []
+    assert rules.job_notice_lines("AIRE", jobs_at("", BASELINE["jobs"]), current) == []
+
+
+def test_nothing_changed_is_nothing_to_announce_after_any_gap():
+    current = jobs_at("2026-10-13T12:30:00+00:00", BASELINE["jobs"])
+    assert rules.job_notice_lines("AIRE", BASELINE, current) == []
+
+
+@pytest.mark.parametrize(
+    "seconds,text",
+    [
+        (0, "0 min"),
+        (45, "45 s"),
+        (60, "1 min"),
+        (90, "1 min 30 s"),
+        (1_500, "25 min"),
+        (3_600, "1 h"),
+        (3_605, "1 h"),
+        (5_400, "1 h 30 min"),
+        (86_400, "1 day"),
+        (129_600, "1 day 12 h"),
+        (172_800, "2 days"),
+        (90_061, "1 day 1 h 1 min"),
+    ],
+)
+def test_durations_read_as_words(seconds, text):
+    # CoreTimeTests' table for slurmDurationText.
+    assert rules.slurm_duration_text(seconds) == text
+
+
 # ---------------------------------------------------------------------------
 # CPUs and history (OverviewClusterStats, TrendPoint)
 # ---------------------------------------------------------------------------
@@ -1387,6 +1473,72 @@ def test_cached_rows_teach_which_volumes_had_figures():
     tracker.note_cached({"storage": [HOME, {"label": "Flash", "source": "lfs quota"}]})
     assert tracker.labels_with_figures == {"Home", "Flash"}
     assert tracker.wants_storage(False, 0)
+
+
+def failed_slurm(stamp, storage):
+    # A refresh that reached the login node but whose Slurm sections failed.
+    return {
+        **snap(stamp, storage),
+        "remote": {"hostname": "login1"},
+        "jobs": [],
+        "errors": ["Section 'jobs' failed with exit 1"],
+    }
+
+
+def test_a_slurm_failure_still_counts_its_storage():
+    # The macOS app: noteStorageAttempt on a scheduler error, and the rows
+    # merged. Otherwise every 10 s refresh of an outage runs df/quota/lfs.
+    tracker = StorageTracker()
+    shown = {**tracker.receive(None, snap("00:00", [HOME]), True, 0), "jobs": [{"job_id": "1", "state": "R"}]}
+    assert tracker.wants_storage(False, 300)
+    kept = tracker.keep_with_storage(shown, failed_slurm("05:00", [HOME, SCRATCH]), True, 300)
+    assert kept is not None
+    # The last good jobs and time stay; the rows are this refresh's, with
+    # their own (newer) collection time.
+    assert kept["jobs"] == shown["jobs"] and kept["collected_at"] == shown["collected_at"]
+    assert kept["storage"] == [HOME, SCRATCH]
+    assert rules.storage_rows_time(kept) == "2026-10-13T12:05:00+00:00"
+    assert not tracker.wants_storage(False, 310)
+    assert not tracker.wants_storage(False, 599)
+    assert tracker.wants_storage(False, 600)
+    # A failure that skipped storage changes neither the rows nor their time.
+    again = tracker.keep_with_storage(kept, failed_slurm("05:10", None), False, 310)
+    assert again == kept
+
+
+def test_a_slurm_failure_without_storage_is_a_miss():
+    tracker = StorageTracker()
+    shown = tracker.receive(None, snap("00:00", [HOME]), True, 0)
+    kept = tracker.keep_with_storage(shown, failed_slurm("05:00", None), True, 300)
+    assert kept == shown
+    assert "storage_collected_at" not in kept
+    assert not tracker.wants_storage(False, 359)
+    assert tracker.wants_storage(False, 360)
+
+
+def test_a_slurm_failure_with_nothing_on_screen_backs_off_a_minute():
+    # Signing in during an outage with no cached snapshot: the rows cannot
+    # be shown, so they are no collection, but the request still backs off
+    # instead of being repeated on every refresh.
+    tracker = StorageTracker()
+    assert tracker.keep_with_storage(None, failed_slurm("00:00", [HOME]), True, 0) is None
+    assert not tracker.wants_storage(False, 10)
+    assert tracker.wants_storage(False, 60)
+
+
+@pytest.mark.parametrize(
+    "remote,reached",
+    [
+        ({"hostname": "login1", "user": "demo"}, True),
+        ({"hostname": " ", "user": ""}, False),
+        ({"hostname": ""}, False),
+        (None, False),
+    ],
+)
+def test_reached_login_node(remote, reached):
+    # RefreshClassification.classify: an answered remote section is a
+    # Slurm error, none is a transport failure.
+    assert rules.reached_login_node({"remote": remote}) is reached
 
 
 # ---------------------------------------------------------------------------

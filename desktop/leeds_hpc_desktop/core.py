@@ -192,6 +192,12 @@ KNOWN_HOSTS_FILE = "known_hosts"
 # settings.json key: the accounts whose saved password a server rejected
 # (login.SavedPasswordGuard). Usernames only, never a password.
 REJECTED_SAVED_PASSWORDS = "saved_password_rejected"
+# settings.json key, present only after a settings file whose flags could not
+# be read (cut short by a power cut, edited by hand) was replaced. Which
+# accounts were flagged is then unknown, so every account counts as rejected
+# except the ones listed here: those whose typed password a server has
+# accepted since (SavedPasswordGuard.verified lifts them one at a time).
+REJECTED_UNKNOWN_EXCEPT = "saved_password_rejected_unknown_except"
 
 
 class LocalStore:
@@ -206,18 +212,51 @@ class LocalStore:
     def update_settings(self, **changes: Any) -> None:
         """Merge changes into settings.json, keeping every other key."""
         with self._settings_lock:
-            settings = self.read(SETTINGS_FILE, {})
-            if not isinstance(settings, dict):
-                settings = {}
+            settings = self._settings_to_update()
             settings.update(changes)
             self.write(SETTINGS_FILE, settings)
+
+    def _settings_to_update(self) -> dict:
+        """settings.json for a read-modify-write (call with _settings_lock).
+
+        A file that exists but cannot be read, or whose rejected flags are
+        unreadable, must not be replaced by one without them: that would
+        quietly lift the fail-closed answer saved_password_rejected gives
+        for it, and the next empty-field Connect would resend a saved
+        password a server may already have refused (another lockout
+        attempt). So its flags become "unknown": every account stays
+        rejected until a typed password is accepted (REJECTED_UNKNOWN_EXCEPT).
+        """
+        try:
+            text = (self.root / SETTINGS_FILE).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            text = None
+        settings = None
+        if text is not None:
+            try:
+                settings = json.loads(text)
+            except ValueError:
+                pass
+        if not isinstance(settings, dict):
+            return {REJECTED_UNKNOWN_EXCEPT: []}
+        if not isinstance(settings.get(REJECTED_SAVED_PASSWORDS, []), list):
+            settings.pop(REJECTED_SAVED_PASSWORDS)
+            settings.setdefault(REJECTED_UNKNOWN_EXCEPT, [])
+        if REJECTED_UNKNOWN_EXCEPT in settings and not isinstance(settings[REJECTED_UNKNOWN_EXCEPT], list):
+            # Nobody known to be cleared: every account stays rejected.
+            settings[REJECTED_UNKNOWN_EXCEPT] = []
+        return settings
 
     def saved_password_rejected(self, username: str) -> bool:
         """Whether a server rejected this account's saved password.
 
         Fails closed: a settings file that exists but cannot be read or
         parsed counts as "rejected", because wrongly answering "no" would
-        send a password that may already have been refused.
+        send a password that may already have been refused. So does an
+        account not cleared since such a file was replaced
+        (REJECTED_UNKNOWN_EXCEPT).
         """
         try:
             text = (self.root / SETTINGS_FILE).read_text(encoding="utf-8")
@@ -234,22 +273,38 @@ class LocalStore:
         names = settings.get(REJECTED_SAVED_PASSWORDS, [])
         if not isinstance(names, list):
             return True
-        return any(same_account(name, username) for name in names)
+        if any(same_account(name, username) for name in names):
+            return True
+        if REJECTED_UNKNOWN_EXCEPT not in settings:
+            return False
+        cleared = settings[REJECTED_UNKNOWN_EXCEPT]
+        return not isinstance(cleared, list) or not any(same_account(name, username) for name in cleared)
 
     def set_saved_password_rejected(self, username: str, rejected: bool) -> None:
         with self._settings_lock:
-            settings = self.read(SETTINGS_FILE, {})
-            if not isinstance(settings, dict):
-                settings = {}
-            names = settings.get(REJECTED_SAVED_PASSWORDS)
-            names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
-            names = [n for n in names if not same_account(n, username)]
+            settings = self._settings_to_update()
+            names = [
+                n
+                for n in settings.get(REJECTED_SAVED_PASSWORDS, [])
+                if isinstance(n, str) and not same_account(n, username)
+            ]
             if rejected:
                 names.append(username.lower())
             if names:
                 settings[REJECTED_SAVED_PASSWORDS] = sorted(names)
             else:
                 settings.pop(REJECTED_SAVED_PASSWORDS, None)
+            if REJECTED_UNKNOWN_EXCEPT in settings:
+                # Flags lost with an unreadable file: lifting this account's
+                # leaves every other account rejected.
+                cleared = [
+                    n
+                    for n in settings[REJECTED_UNKNOWN_EXCEPT]
+                    if isinstance(n, str) and not same_account(n, username)
+                ]
+                if not rejected:
+                    cleared.append(username.lower())
+                settings[REJECTED_UNKNOWN_EXCEPT] = sorted(cleared)
             self.write(SETTINGS_FILE, settings)
 
     def read(self, name: str, default: Any = None) -> Any:

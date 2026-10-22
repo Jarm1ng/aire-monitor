@@ -34,11 +34,14 @@ the snapshot then says `storage_skipped` and the caller keeps its last rows.
 The module is also a library: the Windows and Linux app (desktop/) imports
 it in-process and runs each refresh through run_collection() over its own
 paramiko transport, so both front ends share one collection sequence. Keep
-run_collection, assemble_snapshot, SSHConfig, ClusterInfo, StorageVolume,
-parse_storage_spec, AIRE_SPEC/CALDER_SPEC, KNOWN_CLUSTER_NAMES/HOSTNAMES and
-_cluster_zone stable, and the module standard-library only and Python
-3.9-compatible (the Mac runs it with /usr/bin/python3). MONITORING_PROTOTYPE.md
-("Library API") documents that interface.
+run_collection, assemble_snapshot, snapshot_payload, SSHConfig, ClusterInfo,
+StorageVolume, ClusterSnapshot, parse_storage_spec, AIRE_SPEC/CALDER_SPEC,
+KNOWN_CLUSTER_NAMES/KNOWN_CLUSTER_HOSTNAMES, DEFAULT_TIMEOUT (the desktop
+app's collection budget, read at import) and _cluster_zone stable, and the
+module standard-library only and Python 3.9-compatible (the Mac runs it with
+/usr/bin/python3). MONITORING_PROTOTYPE.md ("Library API") documents that
+interface and keeps the same list; desktop/tests/test_core.py checks that both
+lists name everything the desktop app uses.
 
 Storage is data-driven: --storage-spec describes each volume (label,
 candidate directory templates, quota method) and the matching remote shell is
@@ -1406,7 +1409,8 @@ def merge_node_summary(left: NodeSummary, right: NodeSummary) -> NodeSummary:
 
 # Public: the Windows and Linux app (desktop/) imports this module and builds
 # its cluster profiles from these, and the tests use them. One <ID>_SPEC per
-# cluster id, identical to the storage of the macOS app's ClusterProfile.swift
+# cluster id (upper case, any "-" spelled "_": aire-2 is AIRE_2_SPEC),
+# identical to the storage of the macOS app's ClusterProfile.swift
 # (CollectorContractTests.swift fails when they differ).
 AIRE_SPEC = (
     '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'

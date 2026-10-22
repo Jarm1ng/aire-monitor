@@ -112,6 +112,25 @@ def test_revoked_key_in_the_users_file_is_blocked(tmp_path, key):
     ask.assert_not_called()
 
 
+@pytest.mark.parametrize("hosts", ["*", "*.leeds.ac.uk,!rash.leeds.ac.uk", "other.test"])
+def test_revoked_key_is_blocked_whatever_its_host_field(tmp_path, key, hosts):
+    # "@revoked * <key>" is the usual form (sshd(8)): revocation is about the
+    # key. paramiko matches only literal names, so the host field is ignored
+    # and the key refused everywhere, even after an approval in the app.
+    ask = MagicMock(return_value=True)
+    verifier = verifier_for(tmp_path, ask)
+    verifier.verify("aire.test", key)
+    verifier.user_known_hosts.write_text(f"@revoked {hosts} {key.get_name()} {key.get_base64()}\n")
+    with pytest.raises(paramiko.SSHException, match="revoked"):
+        verifier.verify("aire.test", key)
+    with pytest.raises(paramiko.SSHException, match="revoked"):
+        verifier.verify("calder.test", key)
+    assert ask.call_count == 1
+    # Other keys are unaffected.
+    verifier.verify("calder.test", paramiko.RSAKey.generate(2048))
+    assert ask.call_count == 2
+
+
 def test_other_key_type_in_the_users_file_still_needs_approval(tmp_path, key):
     ask = MagicMock(return_value=True)
     verifier = verifier_for(tmp_path, ask, [entry("aire.test", paramiko.ECDSAKey.generate())])
@@ -441,6 +460,28 @@ def test_session_opened_after_a_disconnect_is_not_kept():
         manager.connect(PROFILES[0], "demo", "test-only", "direct")
     transport.close.assert_called()
     assert manager.sessions == {}
+
+
+@pytest.mark.parametrize("route", ["direct", "jump"])
+def test_a_sign_in_from_before_a_disconnect_opens_nothing(route):
+    # One Connect signs in to each cluster with its own connect() call; the
+    # generation read at the press, not at each call, decides. After a
+    # Disconnect the next cluster must not be sent the password (nor rash
+    # again, on the jump route) or raise a Duo prompt.
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    pressed = manager.generation
+    manager._open = MagicMock(side_effect=[(MagicMock(), True) for _ in range(4)])
+    manager.connect(PROFILES[0], "demo", "test-only", route, generation=pressed)
+    opened = manager._open.call_count
+    manager.disconnect()
+    with pytest.raises(Cancelled):
+        manager.connect(PROFILES[1], "demo", "test-only", route, generation=pressed)
+    assert manager._open.call_count == opened
+    assert manager.sessions == {} and manager.jump is None
+    assert manager.username is None and manager.route is None
+    # A Connect pressed after the Disconnect signs in as usual.
+    session, _ = manager.connect(PROFILES[1], "demo", "test-only", route, generation=manager.generation)
+    assert manager.sessions == {"calder": session}
 
 
 def test_disconnect_closes_rash_first_and_any_sign_in_in_progress():

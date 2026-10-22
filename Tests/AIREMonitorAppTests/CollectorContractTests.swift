@@ -209,7 +209,8 @@ struct CollectorContractTests {
     /// profile's storage as `--storage-spec`; the Windows and Linux app
     /// (desktop/) never sees the Swift profiles: it imports the collector
     /// and takes its storage specs from `AIRE_SPEC`/`CALDER_SPEC` (one
-    /// `<ID>_SPEC` per cluster) and its cluster names and login hosts from
+    /// `<ID>_SPEC` per cluster, `-` in the id spelled `_`: `aire-2` is
+    /// `AIRE_2_SPEC`) and its cluster names and login hosts from
     /// `KNOWN_CLUSTER_NAMES`/`KNOWN_CLUSTER_HOSTNAMES`, which
     /// desktop/tests/test_core.py pins. So all three agree exactly when the
     /// collector's tables equal the catalogue, which is what this checks,
@@ -243,7 +244,9 @@ struct CollectorContractTests {
                 "KNOWN_CLUSTER_NAMES in scripts/hpc_snapshot.py lists \(tables.knownIDs)")
         for id in catalogIDs {
             let profile = catalogProfile(id)
-            let constant = "\(id.rawValue.uppercased())_SPEC"
+            // The collector's constant: ids may contain "-", identifiers may not.
+            let constantID = id.rawValue.uppercased().replacingOccurrences(of: "-", with: "_")
+            let constant = "\(constantID)_SPEC"
             let entry = try #require(tables.clusters[id.rawValue], "\(id)")
             #expect(entry.collector.error == nil, "scripts/hpc_snapshot.py \(constant): \(entry.collector.error ?? "")")
             #expect(entry.collector.volumes == profile.storage,
@@ -280,7 +283,7 @@ struct CollectorContractTests {
 
         clusters = {
             cluster_id: {
-                "collector": parsed(getattr(hs, cluster_id.upper() + "_SPEC", None)),
+                "collector": parsed(getattr(hs, cluster_id.upper().replace("-", "_") + "_SPEC", None)),
                 "sent": parsed(spec_text),
                 "name": hs.KNOWN_CLUSTER_NAMES.get(cluster_id),
                 "hostname": hs.KNOWN_CLUSTER_HOSTNAMES.get(cluster_id),

@@ -55,14 +55,15 @@ from .rules import (
     gpu_fleet,
     history_gpu_text,
     history_point,
-    job_change_messages,
     job_details_text,
     job_display_fields,
+    job_notice_lines,
     job_sort_key,
     local_time_text,
     node_display_fields,
     partition_display_fields,
     pool_lines,
+    reached_login_node,
     storage_display_fields,
     storage_rows_time,
     storage_summary,
@@ -220,6 +221,9 @@ class SignIn:
     password: str | None
     from_saved: bool
     remember: bool
+    # ConnectionManager.generation when Connect was pressed. Disconnect bumps
+    # it, which ends this sign-in for every cluster it has not reached yet.
+    generation: int = 0
 
 
 class PromptBridge(QObject):
@@ -913,7 +917,18 @@ class MainWindow(QMainWindow):
             self.problem(str(exc))
             return
         route = self.route.currentData()
-        plan = SignIn(username, route, selected, password, from_saved, self.remember.isChecked())
+        # The generation is read here, on the UI thread that alone runs
+        # Disconnect, so a Disconnect pressed any time after this, even
+        # before the worker has started, cancels the whole sign-in.
+        plan = SignIn(
+            username,
+            route,
+            selected,
+            password,
+            from_saved,
+            self.remember.isChecked(),
+            generation=self.manager.generation,
+        )
         del password
         self.password.clear()
         try:
@@ -948,8 +963,19 @@ class MainWindow(QMainWindow):
         verified = False
         try:
             for p in plan.selected:
+                if plan.generation != self.manager.generation:
+                    # Disconnect was pressed. However the cluster before
+                    # this one ended (its collection fails, or comes back
+                    # with an error, once its connection is closed), no
+                    # further cluster may be sent the password or raise a
+                    # Duo prompt for a sign-in the window shows as cancelled.
+                    break
                 try:
-                    session, fresh = self.manager.connect(p, plan.username, plan.password, plan.route)
+                    # connect() also refuses a stale generation itself, so a
+                    # Disconnect between this check and its sign-in counts.
+                    session, fresh = self.manager.connect(
+                        p, plan.username, plan.password, plan.route, generation=plan.generation
+                    )
                     verified = verified or fresh
                     # The first refresh after sign-in always collects storage.
                     results.append((p.id, session.collect(plan.username), None))
@@ -1068,6 +1094,11 @@ class MainWindow(QMainWindow):
         if error or (value and value.get("errors")):
             self.errors[cluster] = str(error) if error else "; ".join(value["errors"])
             self.states[cluster] = "STALE / REFRESH FAILED"
+            if not error and reached_login_node(value):
+                # Slurm failed, but the round trip worked: its storage
+                # counts, as on the Mac. A failure without a round trip
+                # (an exception, no remote answer) has no storage to count.
+                self.keep_storage(cluster, value, requested_storage)
         elif value:
             try:
                 validate_snapshot(value, cluster, self.account)
@@ -1093,11 +1124,34 @@ class MainWindow(QMainWindow):
                 self.errors[cluster] = str(exc)
         self.render()
 
+    def keep_storage(self, cluster, value, requested_storage):
+        """A refresh whose Slurm sections failed over a working connection:
+        the snapshot on screen stays (stale), but this refresh's storage is
+        recorded by the schedule and its rows are shown (keep_with_storage),
+        so a Slurm outage does not make every refresh run df/quota/lfs."""
+        try:
+            validate_snapshot(value, cluster, self.account)
+        except ValueError:
+            # Another account's or a malformed snapshot: nothing of it counts.
+            return
+        kept = self.storage[cluster].keep_with_storage(
+            self.snapshots.get(cluster), value, requested_storage, time.monotonic()
+        )
+        if kept is not None:
+            # Not cached here, so the banner keeps the Slurm error rather
+            # than a cache write's: the next accepted refresh caches these
+            # rows with the rest (a skipped storage section keeps them).
+            self.snapshots[cluster] = kept
+
     def notify_jobs(self, cluster, old, new):
         # Starts and endings as the macOS app reports them: an array's
         # pending remainder vanishing because its last task started is not
         # "left the queue", and its newly running tasks count as starts.
-        changes = job_change_messages(old["jobs"], new["jobs"])
+        # Bounded by the baseline's age as on the Mac: old may be a cached
+        # snapshot from days ago, whose ended jobs are not news. After more
+        # than 10 minutes one catch-up summary, after a day nothing.
+        name = next((p.name for p in PROFILES if p.id == cluster), cluster.upper())
+        changes = job_notice_lines(name, old, new)
         if self.tray is not None and QSystemTrayIcon.supportsMessages():
             if changes:
                 self.tray.showMessage(

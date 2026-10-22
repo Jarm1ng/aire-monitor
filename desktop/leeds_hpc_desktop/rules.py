@@ -18,7 +18,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, tzinfo
+from datetime import datetime, timezone, tzinfo
 from typing import Iterable
 
 import hpc_snapshot as collector
@@ -115,6 +115,23 @@ def local_time_text(raw: object, pattern: str = "%d %b %Y %H:%M:%S %Z") -> str:
         return stamp.astimezone().strftime(pattern)
     except (ValueError, OverflowError, OSError):
         return _text(raw)
+
+
+def slurm_duration_text(seconds: int) -> str:
+    """A length of time in words: "45 s", "3 h 5 min", "2 days 1 h"
+    (HPCCore slurmDurationText). Seconds only under an hour."""
+    total = max(0, int(seconds))
+    days, hours, minutes, rest = total // 86_400, total % 86_400 // 3600, total % 3600 // 60, total % 60
+    parts = []
+    if days:
+        parts.append("1 day" if days == 1 else f"{days} days")
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes:
+        parts.append(f"{minutes} min")
+    if rest and not days and not hours:
+        parts.append(f"{rest} s")
+    return " ".join(parts) or "0 min"
 
 
 # ---------------------------------------------------------------------------
@@ -900,9 +917,18 @@ class JobQueueCounts:
 
 
 def job_change_messages(previous: Iterable[dict], current: Iterable[dict]) -> list[str]:
-    """Starts (pending -> running) and endings (a terminal state, or the job
-    left squeue) between two refreshes, as notification lines
-    (JobStateDiff.compute in the macOS app).
+    """Starts, then endings, between two job lists, as notification lines
+    (see job_changes). Not bounded by how old previous is: job_notice_lines
+    applies that rule."""
+    started, ended = job_changes(previous, current)
+    return started + ended
+
+
+def job_changes(previous: Iterable[dict], current: Iterable[dict]) -> tuple[list[str], list[str]]:
+    """(started, ended): starts (pending -> running) and endings (a terminal
+    state, or the job left squeue) between two refreshes, as notification
+    lines (JobStateDiff.compute in the macOS app). Endings are in job id
+    order.
 
     Job arrays: the pending remainder ("123", tasks "0-58") sheds one "123_N"
     row per task that starts, so a running task whose array had a pending
@@ -952,7 +978,75 @@ def job_change_messages(previous: Iterable[dict], current: Iterable[dict]) -> li
         ended.append(
             (_natural_key(job_id), f"{display_job_id(old)}: left the active queue (final status unknown)")
         )
-    return started + [message for _, message in sorted(ended, key=lambda item: item[0])]
+    return started, [message for _, message in sorted(ended, key=lambda item: item[0])]
+
+
+# When job changes are announced (JobStateDiff.plan). The baseline is the
+# snapshot on screen, which after a restart is the cached one and after a
+# Disconnect the last one before it: possibly days old. Compared as it is,
+# every job that ended meanwhile would be announced as if it had just left
+# the queue.
+#
+# A baseline up to this old (seconds) is compared job by job: a couple of
+# missed refreshes, a short VPN blip.
+JOB_NOTICE_INDIVIDUAL_WINDOW = 10 * 60
+# Up to this old, one catch-up summary instead of a burst. Older than this a
+# comparison would mostly report long-resolved jobs, so the new snapshot just
+# becomes the baseline, silently.
+JOB_NOTICE_SUMMARY_WINDOW = 24 * 60 * 60
+
+
+def _instant(raw: object) -> datetime | None:
+    """A snapshot's collected_at as an aware datetime, or None. Zone-less
+    values are UTC, as the cards' "snapshot ... ago" reads them."""
+    try:
+        stamp = datetime.fromisoformat(_text(raw))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+
+
+def job_change_delivery(
+    previous_collected_at: object, current_collected_at: object
+) -> tuple[str, float] | None:
+    """How to announce the job changes between two snapshots of one
+    account, from the time between them (JobStateDiff.plan):
+    ("individual", gap) up to 10 minutes, ("summary", gap) up to 24 hours,
+    and None beyond that or when either time cannot be read: with no bound
+    on how old the baseline is, re-seeding is safer than replaying it."""
+    previous, current = _instant(previous_collected_at), _instant(current_collected_at)
+    if previous is None or current is None:
+        return None
+    gap = (current - previous).total_seconds()
+    if gap > JOB_NOTICE_SUMMARY_WINDOW:
+        return None
+    return ("summary" if gap > JOB_NOTICE_INDIVIDUAL_WINDOW else "individual"), gap
+
+
+def job_notice_lines(cluster_name: str, previous: dict, current: dict) -> list[str]:
+    """The notification lines for the job changes from previous to current
+    (two snapshots of one account), within job_change_delivery's windows.
+
+    After a short gap, one line per start or ending, as they happen. After a
+    longer one, a heading first ("While AIRE was not watched (3 h): 2 jobs
+    ended or left the queue, 1 started", the macOS catch-up summary), then
+    the endings and starts, so a tray that shows only the first lines still
+    says what happened. After more than a day, nothing.
+    """
+    delivery = job_change_delivery(previous.get("collected_at"), current.get("collected_at"))
+    if delivery is None:
+        return []
+    kind, gap = delivery
+    started, ended = job_changes(previous.get("jobs") or [], current.get("jobs") or [])
+    if kind == "individual" or not (started or ended):
+        return started + ended
+    counts = []
+    if ended:
+        counts.append(f"{len(ended)} job{'' if len(ended) == 1 else 's'} ended or left the queue")
+    if started:
+        counts.append(f"{len(started)} started")
+    heading = f"While {cluster_name} was not watched ({slurm_duration_text(int(gap))}): {', '.join(counts)}"
+    return [heading, *ended, *started]
 
 
 # ---------------------------------------------------------------------------
@@ -1176,6 +1270,48 @@ class StorageTracker:
         else:
             result["storage_collected_at"] = rows_time
         return result
+
+    def keep_with_storage(
+        self, kept: dict | None, incoming: dict, requested: bool, now: float
+    ) -> dict | None:
+        """A refresh that reached the login node but whose Slurm sections
+        failed (the macOS app's scheduler error, see reached_login_node):
+        its storage still counts, as on the Mac (noteStorageAttempt, then
+        the storage rows merged into what is shown).
+
+        So the schedule records the attempt like any other: otherwise a
+        Slurm outage leaves the cluster "due" and every 10 s refresh runs
+        df/quota/lfs on the shared filesystems again, and throws the rows
+        away. kept (the snapshot on screen, which stays: its jobs and nodes
+        are the last good ones) is returned with this refresh's storage
+        merged in and the rows' own collection time.
+
+        Without a kept snapshot there is nowhere to show the rows, so a
+        requested section counts only as a miss (asked again a minute
+        later): recording it as a collection would leave the first good
+        refresh after the outage without storage for five minutes.
+        """
+        if kept is None:
+            self.note_attempt(None, requested, now)
+            return None
+        merged = self.receive(kept, incoming, requested, now)
+        result = {**kept, "storage": merged["storage"]}
+        rows_time = storage_rows_time(merged)
+        if result["storage"] is None or rows_time is None or rows_time == kept.get("collected_at"):
+            result.pop("storage_collected_at", None)
+        else:
+            # Newer than kept's own time when this refresh collected them.
+            result["storage_collected_at"] = rows_time
+        return result
+
+
+def reached_login_node(snapshot: dict | None) -> bool:
+    """Whether a refresh's round trip worked: the collector's `remote`
+    section answered with the login node's hostname. A snapshot with errors
+    that did is a Slurm failure over a healthy connection; one that did not
+    is a transport failure (RefreshClassification.classify)."""
+    remote = (snapshot or {}).get("remote")
+    return isinstance(remote, dict) and bool(_text(remote.get("hostname")).strip())
 
 
 # ---------------------------------------------------------------------------
