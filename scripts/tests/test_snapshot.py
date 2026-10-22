@@ -10,13 +10,15 @@ Run (from anywhere):
 The Swift test target runs this file too (CollectorContractTests.swift), so
 `Tests/AIREMonitorAppTests/run_tests.sh` covers the collector.
 
-Nothing here runs ssh or touches ~/.ssh. Three layers are covered:
+Nothing here runs ssh or touches ~/.ssh. Four layers are covered:
   * the parsers, against canned Slurm/df/quota/lfs output modelled on what
     AIRE and Calder really print (usernames and paths anonymised);
   * the generated remote shell script, executed by the LOCAL /bin/sh (and
     dash, bash, zsh where installed) against stub squeue/sinfo/scontrol/df/
     quota/lfs/timeout/ps commands in a temp directory;
-  * collect_snapshot end to end, with a stub in place of the ssh client.
+  * collect_snapshot end to end, with a stub in place of the ssh client;
+  * run_collection, the library entry point the desktop app drives over
+    paramiko, with a scripted transport in place of any SSH.
 
 The contract fixtures under Tests/Fixtures/ are generated from the canned
 round trip below (CANNED_*), and test_fixture_is_current fails when the
@@ -1759,6 +1761,175 @@ class CollectorStubSSHTests(unittest.TestCase):
     def test_lenient_decoding(self):
         decoded = hs.run_captured(["/bin/sh", "-c", "printf 'caf\\351\\n'"], 10).stdout
         self.assertEqual(decoded, "caf�\n")
+
+
+# ---------------------------------------------------------------------------
+# run_collection over a scripted transport (what the desktop app uses)
+# ---------------------------------------------------------------------------
+
+
+# The pipe-format fallback round trip's output, as build_jobs_fallback_script
+# prints it.
+FALLBACK_OUTPUT = "\n".join([
+    "=====HPC-TIME:start:1760270500.000=====",
+    "=====HPC-TIME:prelude:1760270500.010=====",
+    "=====HPC-SECTION:jobs=====", CANNED_JOBS_PIPE, "=====HPC-STATUS:jobs:0=====",
+    "=====HPC-TIME:jobs:1760270500.060=====",
+    "=====HPC-SECTION:job_details=====", CANNED_JOB_DETAILS, "=====HPC-STATUS:job_details:0=====",
+    "=====HPC-TIME:job_details:1760270500.270=====",
+]) + "\n"
+
+# A node_details record cut by the budget in the middle of its AllocTRES.
+CUT_NODE_RECORD = "NodeName=calder-h200-01 CfgTRES=cpu=128,mem=1546664M,gres/gpu=8 AllocTRES=cpu=64,gr"
+
+
+class ScriptedRemote:
+    """run_collection's transport, scripted: each call returns the next
+    (stdout, error, timed_out) and records the script and the timeout it was
+    given. `delay` seconds pass inside each call (budget tests)."""
+
+    def __init__(self, *results, delay=0.0):
+        self.results = list(results)
+        self.calls = []
+        self.delay = delay
+
+    def __call__(self, script, timeout):
+        self.calls.append((script, timeout))
+        if self.delay:
+            time.sleep(self.delay)
+        return self.results.pop(0)
+
+
+class RunCollectionTests(unittest.TestCase):
+    def collect(self, remote, **kwargs):
+        kwargs.setdefault("now", FIXTURE_NOW)
+        return hs.run_collection(remote, calder_config(timeout=kwargs.pop("timeout", 5)), CALDER,
+                                 calder_volumes(), **kwargs)
+
+    def test_single_round_trip(self):
+        remote = ScriptedRemote((round_trip_output(), None, False))
+        snapshot = self.collect(remote)
+        self.assertEqual((snapshot.errors, snapshot.warnings), ([], []))
+        self.assertEqual(len(remote.calls), 1)
+        script, timeout = remote.calls[0]
+        self.assertIn("section storage", script)
+        # The whole budget goes to the round trip when nothing probed first.
+        self.assertLessEqual(timeout, 5)
+        self.assertGreater(timeout, 4)
+        self.assertEqual([row.label for row in snapshot.storage], ["Home", "Scratch"])
+        self.assertEqual(len(snapshot.jobs), 5)
+        self.assertFalse(snapshot.storage_skipped)
+        self.assertIn("round_trip", snapshot.timings)
+        self.assertNotIn("probe", snapshot.timings)
+        self.assertEqual(snapshot.timings["jobs_json"], 357)
+        datetime.fromisoformat(snapshot.started_at)
+        datetime.fromisoformat(snapshot.collected_at)
+        self.assertGreaterEqual(snapshot.duration_ms, 0)
+
+    def test_cut_record_is_dropped_not_read_as_idle(self):
+        head = round_trip_output().split("=====HPC-SECTION:node_details=====")[0]
+        cut = head + "=====HPC-SECTION:node_details=====\n" + CUT_NODE_RECORD
+        # Parsed as it arrived, the cut record would claim all 8 GPUs idle.
+        raw = assemble(cut, error="Timed out after 5s: snapshot collection", timed_out=True)
+        self.assertEqual({n.node: n.gpu_allocated for n in raw.nodes}["calder-h200-01"], 0)
+        remote = ScriptedRemote((cut, "Timed out after 5s: snapshot collection", True))
+        snapshot = self.collect(remote)
+        self.assertEqual(snapshot.errors, [])
+        node = {n.node: n for n in snapshot.nodes}["calder-h200-01"]
+        self.assertIsNone(node.gpu_allocated)
+        self.assertIsNone(node.gpu_idle)
+        self.assertIn("GPU allocation unknown for 4 GPU nodes (node_details unavailable)", snapshot.warnings)
+        self.assertTrue(any("cut during node_details" in warning for warning in snapshot.warnings))
+        self.assertIsNone(snapshot.storage)
+
+    def test_whole_lines_survive_a_timeout(self):
+        # complete_lines only drops a cut line: a timed-out output that ends
+        # on a newline (or one a transport already trimmed) loses nothing.
+        complete = round_trip_output().split("=====HPC-SECTION:storage=====")[0]
+        remote = ScriptedRemote((complete, "Timed out after 5s: snapshot collection", True))
+        snapshot = self.collect(remote)
+        self.assertEqual(snapshot.errors, [])
+        self.assertEqual({n.node: n.gpu_allocated for n in snapshot.nodes}["calder-h200-01"], 5)
+        self.assertTrue(any("cut after node_details" in warning for warning in snapshot.warnings))
+
+    def test_unusable_json_takes_one_fallback_round_trip(self):
+        remote = ScriptedRemote((round_trip_output(jobs_json='{"jobs": [1, 2]}'), None, False),
+                                (FALLBACK_OUTPUT, None, False))
+        snapshot = self.collect(remote)
+        self.assertEqual(snapshot.errors, [])
+        self.assertEqual(len(remote.calls), 2)
+        (_, first_timeout), (fallback_script, fallback_timeout) = remote.calls
+        self.assertIn("# hpc-round-trip: jobs-fallback", fallback_script)
+        self.assertNotIn("section storage", fallback_script)
+        # The fallback only gets what is left of the same budget.
+        self.assertLessEqual(fallback_timeout, first_timeout)
+        self.assertEqual(sorted(job.job_id for job in snapshot.jobs), ["35796", "35796_1", "35796_2", "40188", "9918"])
+        self.assertIn("Jobs read with the pipe-format fallback (squeue --json has a job record that is not an object)",
+                      snapshot.warnings)
+        self.assertIn("jobs_fallback_round_trip", snapshot.timings)
+        self.assertEqual([row.label for row in snapshot.storage], ["Home", "Scratch"])
+
+    def test_no_fallback_without_budget(self):
+        # 2 s budget, 0.1 s spent: under MIN_FALLBACK_BUDGET (2 s) remains,
+        # so the unusable JSON stays a core error for the next refresh.
+        remote = ScriptedRemote((round_trip_output(jobs_json='{"jobs": [1]}'), None, False), delay=0.1)
+        snapshot = self.collect(remote, timeout=2)
+        self.assertEqual(len(remote.calls), 1)
+        self.assertEqual(len(snapshot.errors), 1)
+        self.assertIn("no pipe-format listing arrived", snapshot.errors[0])
+
+    def test_no_fallback_after_a_failed_round_trip(self):
+        remote = ScriptedRemote(("", "Command failed with exit 255: snapshot collection", False))
+        snapshot = self.collect(remote)
+        self.assertEqual(len(remote.calls), 1)
+        self.assertEqual(snapshot.errors, ["Command failed with exit 255: snapshot collection"])
+        self.assertIsNone(snapshot.storage)
+
+    def test_cut_fallback_is_trimmed_and_reported(self):
+        cut = FALLBACK_OUTPUT.split("=====HPC-STATUS:jobs:0=====")[0] + "9918|calder-gpu-hop"
+        remote = ScriptedRemote((round_trip_output(jobs_json='{"jobs": [1]}'), None, False),
+                                (cut, "Timed out after 4s: snapshot collection", True))
+        snapshot = self.collect(remote)
+        self.assertIn("Timed out after 4s: snapshot collection (pipe-format jobs fallback)", snapshot.errors)
+        self.assertTrue(any("Section 'jobs' missing from remote output" in error for error in snapshot.errors),
+                        snapshot.errors)
+        self.assertEqual(snapshot.jobs, [])
+
+    def test_skip_storage(self):
+        remote = ScriptedRemote((round_trip_output(include_storage=False), None, False))
+        snapshot = self.collect(remote, skip_storage=True)
+        self.assertNotIn("section storage", remote.calls[0][0])
+        self.assertEqual((snapshot.errors, snapshot.warnings), ([], []))
+        self.assertIsNone(snapshot.storage)
+        self.assertTrue(snapshot.storage_skipped)
+
+    def test_probe_error_stops_before_any_round_trip(self):
+        remote = ScriptedRemote()
+        probes = []
+
+        def probe(timeout):
+            probes.append(timeout)
+            return "connection lost: test"
+
+        snapshot = self.collect(remote, probe=probe)
+        self.assertEqual(remote.calls, [])
+        self.assertEqual(probes, [5])
+        self.assertEqual(snapshot.errors, ["connection lost: test"])
+        self.assertIn("probe", snapshot.timings)
+
+    def test_healthy_probe_then_round_trip(self):
+        remote = ScriptedRemote((round_trip_output(), None, False))
+        snapshot = self.collect(remote, probe=lambda timeout: None)
+        self.assertEqual(snapshot.errors, [])
+        self.assertEqual(len(remote.calls), 1)
+        self.assertTrue({"probe", "round_trip"} <= set(snapshot.timings))
+
+    def test_transport_exceptions_propagate(self):
+        def broken(script, timeout):
+            raise OSError("link down")
+
+        with self.assertRaises(OSError):
+            self.collect(broken)
 
 
 # ---------------------------------------------------------------------------

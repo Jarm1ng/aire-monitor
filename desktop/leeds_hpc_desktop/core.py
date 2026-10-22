@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import hpc_snapshot as collector
+
+from . import platform_support
 
 
 @dataclass(frozen=True)
@@ -149,22 +150,16 @@ def metrics(snapshot: dict) -> dict:
     }
 
 
-def default_data_dir() -> Path:
-    if "LEEDS_HPC_DATA_DIR" in os.environ:
-        return Path(os.environ["LEEDS_HPC_DATA_DIR"])
-    xdg = os.environ.get("XDG_DATA_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    return base / "LeedsHPCMonitor"
+# File names inside the data folder. Existing installs already have files
+# with these names, so they are part of the on-disk format.
+SETTINGS_FILE = "settings.json"
+KNOWN_HOSTS_FILE = "known_hosts"
 
 
 class LocalStore:
     def __init__(self, root: Path | None = None):
-        self.root = root or default_data_dir()
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            os.chmod(self.root, 0o700)
-        except OSError:
-            pass
+        self.root = root or platform_support.data_dir()
+        platform_support.make_private_dir(self.root)
 
     def read(self, name: str, default: Any = None) -> Any:
         try:
@@ -176,10 +171,8 @@ class LocalStore:
         target = self.root / name
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-        try:
-            os.chmod(temporary, 0o600)
-        except OSError:
-            pass
+        # Before the rename, so the final name never exists with looser modes.
+        platform_support.make_private_file(temporary)
         temporary.replace(target)
 
     def cache_name(self, username: str, cluster_id: str) -> str:

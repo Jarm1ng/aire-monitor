@@ -1,22 +1,40 @@
-"""Include installed licence texts for the runtime and its dependencies."""
+"""Include installed licence texts for the runtime and its dependencies.
+
+Both build scripts run this after PyInstaller, with the bundle's licences/
+folder as the argument.
+"""
 
 import importlib.metadata
 import shutil
 import sys
 from pathlib import Path
 
-RUNTIME = (
+# Bundled on every platform: a missing one means a broken build environment,
+# so the build stops rather than ship a component without its licence.
+REQUIRED = (
     "PySide6",
-    "PySide6-Essentials",
-    "PySide6-Addons",
     "shiboken6",
     "paramiko",
     "cryptography",
     "bcrypt",
     "pynacl",
     "keyring",
-    "SecretStorage",
-    "jeepney",
+    "PyInstaller",
+)
+# Bundled on one platform only, so required there: the Windows build
+# collects tzdata's zone files (Apache-2.0 §4 requires shipping its licence)
+# and keyring's Credential Manager backend needs pywin32-ctypes; the Linux
+# build bundles SecretStorage and jeepney for the Secret Service backend.
+PLATFORM_REQUIRED = {
+    "win32": ("tzdata", "pywin32-ctypes"),
+    "linux": ("SecretStorage", "jeepney"),
+}
+# Transitive dependencies whose presence depends on upstream releases (cffi
+# 2.0 made pycparser conditional, for example) or that only a dev tool pulls
+# in (typing_extensions comes with pyright): collected when installed.
+OPTIONAL = (
+    "PySide6-Essentials",
+    "PySide6-Addons",
     "cffi",
     "pycparser",
     "invoke",
@@ -24,12 +42,15 @@ RUNTIME = (
     "jaraco.context",
     "jaraco.functools",
     "more-itertools",
-    "PyInstaller",
     "setuptools",
     "packaging",
     "typing_extensions",
     "altgraph",
 )
+
+
+def platform_key(platform: str) -> str:
+    return "linux" if platform.startswith("linux") else platform
 
 
 def _copy_python_license(destination: Path) -> None:
@@ -53,15 +74,27 @@ def _copy_python_license(destination: Path) -> None:
     )
 
 
-def collect(destination):
+def collect(destination, platform: str = sys.platform):
     destination = Path(destination)
+    required = REQUIRED + PLATFORM_REQUIRED.get(platform_key(platform), ())
+    # The other platform's components are collected too if they happen to
+    # be installed; they are simply not required here.
+    optional = OPTIONAL + tuple(
+        name for names in PLATFORM_REQUIRED.values() for name in names if name not in required
+    )
+    distributions = {}
+    missing = []
+    for name in required + optional:
+        try:
+            distributions[name] = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            if name in required:
+                missing.append(name)
+    if missing:
+        raise SystemExit(f"Cannot include the licences of {', '.join(missing)}: not installed.")
     destination.mkdir(parents=True, exist_ok=True)
     manifest = []
-    for name in RUNTIME:
-        try:
-            distribution = importlib.metadata.distribution(name)
-        except importlib.metadata.PackageNotFoundError:
-            continue
+    for name, distribution in distributions.items():
         manifest.append(f"{name}=={distribution.version}")
         for file in distribution.files or []:
             if any(token in file.name.lower() for token in ("license", "copying", "notice")):

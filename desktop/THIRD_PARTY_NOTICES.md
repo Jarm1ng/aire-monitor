@@ -1,6 +1,7 @@
 # Third-party software
 
-Leeds HPC Monitor is MIT-licensed. The Linux distribution also includes:
+Leeds HPC Monitor is MIT-licensed. The Windows and Linux distributions also
+include:
 
 - Python — PSF License: https://docs.python.org/3/license.html
 - PySide6, Shiboken6 and Qt — LGPLv3/GPLv3/commercial licensing:
@@ -12,10 +13,18 @@ Leeds HPC Monitor is MIT-licensed. The Linux distribution also includes:
 - PyNaCl — Apache-2.0: https://github.com/pyca/pynacl
 - bcrypt — Apache-2.0: https://github.com/pyca/bcrypt
 - keyring — MIT: https://github.com/jaraco/keyring
-- SecretStorage — BSD-3-Clause: https://github.com/mitya57/secretstorage
-- jeepney — MIT: https://gitlab.com/takluyver/jeepney
 - PyInstaller bootloader — GPL with an exception for bundled applications:
   https://pyinstaller.org/en/stable/license.html
+
+The Windows distribution only:
+
+- tzdata (IANA time-zone database) — Apache-2.0: https://github.com/python/tzdata
+- pywin32-ctypes — BSD-3-Clause: https://github.com/enthought/pywin32-ctypes
+
+The Linux distribution only:
+
+- SecretStorage — BSD-3-Clause: https://github.com/mitya57/secretstorage
+- jeepney — MIT: https://gitlab.com/takluyver/jeepney
 
 The portable folder intentionally keeps Qt/Python shared libraries separate
 under `_internal`, rather than statically linking them. Keep that folder with

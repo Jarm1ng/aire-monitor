@@ -31,6 +31,13 @@ past the budget costs only the storage rows (a warning), never the snapshot.
 Quotas change slowly, so a caller may pass --skip-storage on most refreshes;
 the snapshot then says `storage_skipped` and the caller keeps its last rows.
 
+The module is also a library: the Windows and Linux app (desktop/) imports
+it in-process and runs each refresh through run_collection() over its own
+paramiko transport, so both front ends share one collection sequence. Keep
+run_collection, assemble_snapshot, SSHConfig, ClusterInfo, StorageVolume,
+parse_storage_spec and AIRE_SPEC/CALDER_SPEC stable, and the module Python
+3.9-compatible (the Mac runs it with /usr/bin/python3).
+
 Storage is data-driven: --storage-spec describes each volume (label,
 candidate directory templates, quota method) and the matching remote shell is
 generated from it. Path templates may only reference $USER and $HOME; every
@@ -56,7 +63,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 # Bump only for an incompatible change (a key renamed, removed or retyped).
@@ -580,8 +587,11 @@ def run_ssh(
     try:
         completed = run_captured(command, effective_timeout)
     except subprocess.TimeoutExpired as exc:
-        # The partial output arrives as raw bytes even in text mode.
-        partial = complete_lines(_as_text(exc.stdout)).strip()
+        # The partial output arrives as raw bytes even in text mode. Not
+        # stripped: run_collection trims a timed-out output again (other
+        # transports hand it raw), and complete_lines is a no-op only on
+        # text that still ends with its newline.
+        partial = complete_lines(_as_text(exc.stdout))
         return partial, f"Timed out after {effective_timeout:.0f}s: snapshot collection", True
 
     stdout = completed.stdout.strip()
@@ -1391,8 +1401,8 @@ def merge_node_summary(left: NodeSummary, right: NodeSummary) -> NodeSummary:
 # The clusters' storage specs
 # ---------------------------------------------------------------------------
 
-# Public: the Windows and Linux apps (windows/, linux/) import this module and
-# build their cluster profiles from these, and the tests use them. Keep them
+# Public: the Windows and Linux app (desktop/) imports this module and builds
+# its cluster profiles from these, and the tests use them. Keep them
 # identical to the storage of the macOS app's ClusterProfile.swift.
 AIRE_SPEC = (
     '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
@@ -2604,34 +2614,72 @@ def _elapsed_ms(start: float, end: float) -> int:
     return max(int(round((end - start) * 1000)), 0)
 
 
-def collect_snapshot(
+def run_collection(
+    run_remote: Callable[[str, float], tuple[str, str | None, bool]],
     config: SSHConfig,
     cluster: ClusterInfo,
     volumes: list[StorageVolume],
+    *,
     skip_storage: bool = False,
+    now: datetime | None = None,
+    probe: Callable[[float], str | None] | None = None,
 ) -> ClusterSnapshot:
+    """One whole collection over any transport: the library entry point.
+
+    The CLI (collect_snapshot) drives it with an ssh subprocess over a
+    ControlMaster; the Windows and Linux apps with a paramiko channel. Both
+    therefore get the same budget, cut-line trimming, jobs fallback and
+    storage semantics, instead of each re-assembling the steps.
+
+    run_remote(script, timeout) runs one POSIX sh script on the login node
+    (its stdin) and returns (stdout, error, timed_out): stdout as received,
+    error None when the script ran and exited 0, timed_out True when the
+    timeout (seconds) ended it early. Exceptions it raises propagate.
+
+    config.timeout is the budget for EVERYTHING here (probe + round trips),
+    so a caller's watchdog only has to exceed it by a little; it is also the
+    budget the remote storage guard is sized from. In order:
+      * probe(timeout), if given, returns an error to stop before any round
+        trip (the CLI's `ssh -O check`); otherwise None.
+      * One round trip with the full script (core sections, enrichment,
+        then storage unless skip_storage). On a timeout a cut last line is
+        dropped (complete_lines): a cut `scontrol show node` record would
+        otherwise read as "no GPUs allocated".
+      * When that finished cleanly but its squeue --json payload is unusable
+        here (jobs_need_fallback_round_trip) and at least
+        MIN_FALLBACK_BUDGET seconds remain, one short jobs-only round trip
+        fetches the pipe-format listing; its output is appended, and a
+        failure is reported as "<error> (pipe-format jobs fallback)".
+      * assemble_snapshot. skip_storage leaves storage None with
+        storage_skipped True (the consumer keeps its previous rows).
+    timings gets "probe" (when probed), "round_trip" and, when it ran,
+    "jobs_fallback_round_trip", plus the remote sections' own times;
+    started_at and duration_ms cover the whole collection. `now` is the
+    reference for running jobs' elapsed time (default: the local clock).
+    """
     started_at = utc_now_iso()
     started = time.monotonic()
-    # config.timeout is the budget for EVERYTHING below, so the collector
-    # always prints its JSON before a caller watchdog of timeout + a few
-    # seconds fires (the app: --timeout 30, 40 s watchdog). A hung storage
+    # The CLI: --timeout 30 with a 40 s watchdog in the app. A hung storage
     # command then costs the storage rows (a warning), never the snapshot.
     deadline = started + config.timeout
     timings: dict[str, int] = {}
 
-    probe_error = probe_master(config, timeout=min(PROBE_TIMEOUT, config.timeout))
-    probed = time.monotonic()
-    timings["probe"] = _elapsed_ms(started, probed)
-    if probe_error:
-        return empty_snapshot(config, cluster, utc_now_iso(), probe_error,
-                              started_at=started_at, duration_ms=_elapsed_ms(started, probed),
-                              timings=timings)
+    probed = started
+    if probe is not None:
+        probe_error = probe(min(PROBE_TIMEOUT, config.timeout))
+        probed = time.monotonic()
+        timings["probe"] = _elapsed_ms(started, probed)
+        if probe_error:
+            return empty_snapshot(config, cluster, utc_now_iso(), probe_error,
+                                  started_at=started_at, duration_ms=_elapsed_ms(started, probed),
+                                  timings=timings)
 
     remaining = max(1.0, deadline - time.monotonic())
-    output, error, timed_out = run_ssh(
-        config, build_remote_script(volumes, config.timeout, include_storage=not skip_storage),
-        run_timeout=remaining,
+    output, error, timed_out = run_remote(
+        build_remote_script(volumes, config.timeout, include_storage=not skip_storage), remaining
     )
+    if timed_out:
+        output = complete_lines(output)
     returned = time.monotonic()
     timings["round_trip"] = _elapsed_ms(probed, returned)
 
@@ -2640,9 +2688,11 @@ def collect_snapshot(
         remaining = deadline - time.monotonic()
         if remaining >= MIN_FALLBACK_BUDGET and jobs_need_fallback_round_trip(output, remote_user):
             fallback_started = time.monotonic()
-            fallback_output, fallback_error, fallback_timed_out = run_ssh(
-                config, build_jobs_fallback_script(), run_timeout=remaining
+            fallback_output, fallback_error, fallback_timed_out = run_remote(
+                build_jobs_fallback_script(), remaining
             )
+            if fallback_timed_out:
+                fallback_output = complete_lines(fallback_output)
             # A failed fallback leaves 'jobs' missing or failed, which
             # resolve_jobs reports as the core error it is; its own error
             # (e.g. the budget ran out) is reported alongside.
@@ -2655,9 +2705,26 @@ def collect_snapshot(
     return assemble_snapshot(
         config, cluster, volumes, utc_now_iso(), output, error, timed_out,
         skip_storage=skip_storage,
+        now=now,
         started_at=started_at,
         duration_ms=_elapsed_ms(started, returned),
         local_timings=timings,
+    )
+
+
+def collect_snapshot(
+    config: SSHConfig,
+    cluster: ClusterInfo,
+    volumes: list[StorageVolume],
+    skip_storage: bool = False,
+) -> ClusterSnapshot:
+    """The CLI's collection: run_collection over `ssh` through the
+    ControlMaster, after an `ssh -O check` probe of that master."""
+    return run_collection(
+        lambda script, timeout: run_ssh(config, script, run_timeout=timeout),
+        config, cluster, volumes,
+        skip_storage=skip_storage,
+        probe=lambda timeout: probe_master(config, timeout=timeout),
     )
 
 

@@ -1,15 +1,22 @@
 name: Linux desktop app
 
+# Also runs for changes to what the job uses outside desktop/: the collector
+# and its tests (run below via --self-test), the build scripts, and the
+# licence and guide copied into the bundle.
 on:
   push:
-    branches: [main, 'linux-branch', 'linux']
-    paths: ['linux/**', 'scripts/hpc_snapshot.py', 'scripts/*linux*.sh', '.github/workflows/linux.yml']
+    branches: [main]
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
   pull_request:
-    paths: ['linux/**', 'scripts/hpc_snapshot.py', 'scripts/*linux*.sh', '.github/workflows/linux.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*linux*.sh', 'LICENSE', 'LINUX_APP.md', '.github/workflows/linux.yml']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -21,7 +28,7 @@ jobs:
         with:
           python-version: '3.13'
           cache: pip
-          cache-dependency-path: 'linux/requirements*.txt'
+          cache-dependency-path: 'desktop/requirements*.txt'
       - name: Install system Qt runtime libraries
         run: |
           sudo apt-get update
@@ -33,22 +40,25 @@ jobs:
       - name: Install
         run: |
           python3 -m venv .venv
-          ./.venv/bin/python -m pip install -r linux/requirements-dev.txt
+          ./.venv/bin/python -m pip install -r desktop/requirements-dev.txt
       - name: Lint and type check
         run: |
-          ./.venv/bin/python -m ruff check linux
-          ./.venv/bin/python -m ruff format --check linux
-          ./.venv/bin/python -m pyright -p linux
+          ./.venv/bin/python -m ruff check desktop
+          ./.venv/bin/python -m ruff format --check desktop
+          ./.venv/bin/python -m pyright -p desktop
       - name: Tests (offline and loopback only)
         env:
           QT_QPA_PLATFORM: offscreen
+          # Every desktop test must run here: a missing PySide6 or paramiko
+          # is an error, not a reason to skip the SSH and widget suites.
+          LEEDS_HPC_FULL_TESTS: '1'
         run: |
-          ./.venv/bin/python -m pytest -c linux/pyproject.toml linux/tests -q
+          ./.venv/bin/python -m pytest -c desktop/pyproject.toml desktop/tests -q
           ./.venv/bin/python scripts/hpc_snapshot.py --self-test
       - name: Package and smoke test
         run: ./scripts/build_linux_app.sh --skip-install
       - uses: actions/upload-artifact@v4
         with:
           name: LeedsHPCMonitor-Linux-x64
-          path: linux/dist/LeedsHPCMonitor-Linux-x64.tar.gz
+          path: desktop/dist/LeedsHPCMonitor-Linux-x64.tar.gz
           if-no-files-found: error

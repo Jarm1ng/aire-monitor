@@ -7,22 +7,22 @@ if (-not (Test-Path $python)) {
     if ($LASTEXITCODE -ne 0) { throw 'Python 3.11+ is required.' }
 }
 if (-not $SkipInstall) {
-    & $python -m pip install -r (Join-Path $repo 'windows\requirements-dev.txt')
+    & $python -m pip install -r (Join-Path $repo 'desktop\requirements-dev.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 }
 Push-Location $repo
 try {
     & $python -m PyInstaller --noconfirm --clean --windowed --noupx --onedir `
-        --name LeedsHPCMonitor --paths windows --paths scripts `
+        --name LeedsHPCMonitor --paths desktop --paths scripts `
         --hidden-import keyring.backends.Windows --copy-metadata keyring `
         --collect-data tzdata `
-        --distpath windows/dist --workpath windows/build --specpath windows `
+        --distpath desktop/dist --workpath desktop/build --specpath desktop `
         --add-data "$(Join-Path $repo 'LICENSE');." `
-        --add-data "$(Join-Path $repo 'windows\THIRD_PARTY_NOTICES.md');." windows/main.py
+        --add-data "$(Join-Path $repo 'desktop\THIRD_PARTY_NOTICES.md');." desktop/main.py
     if ($LASTEXITCODE -ne 0) { throw 'Packaging failed.' }
-    $output = Join-Path $repo 'windows\dist'
+    $output = Join-Path $repo 'desktop\dist'
     Copy-Item (Join-Path $repo 'WINDOWS_APP.md') (Join-Path $output 'LeedsHPCMonitor\WINDOWS_APP.md')
-    & $python (Join-Path $repo 'windows\collect_licenses.py') (Join-Path $output 'LeedsHPCMonitor\licenses')
+    & $python (Join-Path $repo 'desktop\collect_licenses.py') (Join-Path $output 'LeedsHPCMonitor\licenses')
     if ($LASTEXITCODE -ne 0) { throw 'Could not collect dependency licences.' }
     $env:QT_QPA_PLATFORM = 'offscreen'
     try {

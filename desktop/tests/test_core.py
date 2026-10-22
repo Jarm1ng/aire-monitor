@@ -3,12 +3,11 @@ import json
 
 import pytest
 
-from aire_linux import demo
-from aire_linux.core import (
+from leeds_hpc_desktop import demo
+from leeds_hpc_desktop.core import (
     LocalStore,
     PROFILES,
     clean_history,
-    default_data_dir,
     metrics,
     validate_snapshot,
     validate_username,
@@ -51,14 +50,6 @@ def test_free_capacity_and_jobs():
     m = metrics(demo.snapshots()["aire"])
     assert m["gpu_idle"] == 8
     assert m["running"] == m["pending"] == 1
-
-
-def test_default_data_dir_respects_xdg_and_override(monkeypatch, tmp_path):
-    monkeypatch.delenv("LEEDS_HPC_DATA_DIR", raising=False)
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    assert default_data_dir() == tmp_path / "xdg" / "LeedsHPCMonitor"
-    monkeypatch.setenv("LEEDS_HPC_DATA_DIR", str(tmp_path / "custom"))
-    assert default_data_dir() == tmp_path / "custom"
 
 
 def test_cache_scoped_by_account_and_cluster(tmp_path):

@@ -4,10 +4,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aire_windows import demo
-from aire_windows.app import MainWindow
-from aire_windows.core import LocalStore
-from aire_windows.ssh import AuthenticationRejected, Cancelled
+from leeds_hpc_desktop import demo, platform_support
+from leeds_hpc_desktop.app import MainWindow
+from leeds_hpc_desktop.core import LocalStore
+from leeds_hpc_desktop.ssh import AuthenticationRejected, Cancelled
 
 
 def finish(window):
@@ -113,4 +113,36 @@ def test_corrupt_saved_username_ignored(qt_app, tmp_path):
     store.write("settings.json", {"username": ["bad"]})
     window = MainWindow(store)
     assert window.username.text() == ""
+    finish(window)
+
+
+def test_without_a_tray_the_window_is_never_hidden(qt_app, tmp_path, monkeypatch):
+    # e.g. stock GNOME: hiding into a tray that does not exist would leave no
+    # way back to the window, with the SSH sessions still open.
+    monkeypatch.setattr(platform_support, "tray_available", lambda: False)
+    window = MainWindow(LocalStore(tmp_path))
+    window.show()
+    assert window.tray is None
+    assert window.minimize_button.text() == "Minimize"
+    window.minimize()
+    assert not window.isHidden()
+    # Job changes go to the banner instead of a tray notification.
+    window.account = "demo"
+    first = demo.snapshots()["aire"]
+    window.receive("aire", first, None)
+    second = copy.deepcopy(first)
+    second["jobs"][1]["state"] = "RUNNING"
+    window.receive("aire", second, None)
+    assert "AIRE jobs: 8100: PENDING → RUNNING" in window.banner.text()
+    finish(window)
+
+
+def test_with_a_tray_minimize_hides_into_it(qt_app, tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_support, "tray_available", lambda: True)
+    window = MainWindow(LocalStore(tmp_path))
+    window.show()
+    assert window.tray is not None
+    assert window.minimize_button.text() == "Minimize to tray"
+    window.minimize()
+    assert window.isHidden()
     finish(window)

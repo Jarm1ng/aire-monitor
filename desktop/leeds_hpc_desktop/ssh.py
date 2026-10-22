@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 import socket
 import stat
 import threading
@@ -14,11 +13,17 @@ from typing import Callable
 import hpc_snapshot as collector
 import paramiko
 
-from .core import Profile, now_iso, validate_username
+from . import platform_support
+from .core import Profile, validate_username
 
 MAX_OUTPUT = 32 * 1024 * 1024
 PREVIEW_LIMIT = 128 * 1024
 JUMP_HOST = "rash.leeds.ac.uk"
+# The whole collection's budget in seconds (both round trips), the same as
+# the CLI collector's default and the macOS app's --timeout.
+COLLECT_BUDGET = collector.DEFAULT_TIMEOUT
+# Upper bound for opening one exec channel on a live transport.
+CHANNEL_OPEN_TIMEOUT = 10
 
 
 class AuthenticationRejected(Exception):
@@ -58,10 +63,7 @@ class HostVerifier:
                 raise Cancelled("Host key was not trusted. No credentials were sent.")
             keys.add(host, key.get_name(), key)
             keys.save(str(self.path))
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
+            platform_support.make_private_file(self.path)
 
 
 def authenticate(transport, host: str, username: str, password: str, ask: Callable) -> None:
@@ -126,59 +128,96 @@ class Session:
     def close(self):
         self.transport.close()
 
-    def collect(self, username: str) -> dict:
+    def collect(self, username: str, skip_storage: bool = False, budget: int = COLLECT_BUDGET) -> dict:
+        """One refresh: the collector's run_collection over this session.
+
+        The collector owns the sequence (budget, cut-line trimming, the jobs
+        fallback round trip, storage semantics), so this app and the CLI
+        cannot drift apart; this class only supplies the transport (_run).
+        skip_storage leaves out df/quota/lfs; the snapshot's storage is then
+        None, meaning "keep the previous rows".
+        """
         config = collector.SSHConfig(
-            self.profile.id,
-            username,
-            self.profile.host,
-            False,
-            None,
-            None,
-            None,
-            30,
+            host=self.profile.id,
+            username=username,
+            hostname=self.profile.host,
+            use_jump_host=False,
+            jump_hostname=None,
+            control_path=None,
+            jump_control_path=None,
+            timeout=budget,
         )
-        channel = self.transport.open_session(timeout=10)
+        snapshot = collector.run_collection(
+            self._run,
+            config,
+            collector.ClusterInfo(self.profile.id, self.profile.name),
+            self.profile.volumes,
+            skip_storage=skip_storage,
+        )
+        return asdict(snapshot)
+
+    def _run(self, script: str, timeout: float) -> tuple[str, str | None, bool]:
+        """run_collection's transport: `sh -s` on a new exec channel, the
+        script on its stdin. Returns (stdout, error, timed_out).
+
+        Reads stdout and stderr until EOF (or the channel closes), not until
+        the exit status arrives: OpenSSH may send exit-status before the
+        last stdout chunk, which holds node_details, storage and the finish
+        markers. stderr is drained so a full SSH window cannot stall stdout.
+        A cut last line is left in place; run_collection drops it.
+        """
+        deadline = time.monotonic() + timeout
+        channel = self.transport.open_session(timeout=min(CHANNEL_OPEN_TIMEOUT, timeout))
         output = bytearray()
-        timed_out = False
         error = None
-        deadline = time.monotonic() + 30
+        timed_out = False
         try:
             channel.settimeout(10)
             channel.exec_command("sh -s")
-            channel.sendall(collector.build_remote_script(self.profile.volumes).encode("utf-8"))
+            channel.sendall(script.encode("utf-8"))
             channel.shutdown_write()
             while True:
                 if time.monotonic() >= deadline:
                     timed_out = True
-                    error = "Snapshot collection timed out after 30 seconds."
                     break
+                received = False
                 if channel.recv_ready():
                     output.extend(channel.recv(65536))
+                    received = True
                     if len(output) > MAX_OUTPUT:
                         raise ValueError("Snapshot exceeded the 32 MiB safety limit.")
-                elif channel.exit_status_ready():
-                    code = channel.recv_exit_status()
-                    if code:
-                        error = f"Snapshot command exited with status {code}."
-                    break
-                # Drain stderr too, otherwise a full SSH window could deadlock.
                 if channel.recv_stderr_ready():
                     channel.recv_stderr(65536)
+                    received = True
+                if received:
+                    continue
+                # EOF first, then the buffers: data always precedes EOF on the
+                # wire, so once EOF is seen an empty buffer stays empty.
+                if (
+                    (channel.eof_received or channel.closed)
+                    and not channel.recv_ready()
+                    and not channel.recv_stderr_ready()
+                ):
+                    break
                 time.sleep(0.01)
+            # The exit status may follow EOF; wait for it within the budget.
+            while not timed_out and not channel.exit_status_ready():
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.01)
+            if timed_out:
+                error = f"Timed out after {timeout:.0f}s: snapshot collection"
+            else:
+                code = channel.recv_exit_status()
+                if code == -1:
+                    # paramiko's value when the channel closed without one.
+                    error = "The SSH channel closed before the snapshot command reported its exit status."
+                elif code:
+                    error = f"Snapshot command exited with status {code}."
         finally:
             channel.close()
-        if not output and not error:
-            error = "The cluster returned an empty snapshot."
-        snapshot = collector.assemble_snapshot(
-            config,
-            collector.ClusterInfo(self.profile.id, self.profile.name),
-            self.profile.volumes,
-            now_iso(),
-            output.decode("utf-8", errors="replace"),
-            error,
-            timed_out,
-        )
-        return asdict(snapshot)
+        return output.decode("utf-8", errors="replace"), error, timed_out
 
     def files(self, path: str) -> tuple[str, list[dict]]:
         sftp = paramiko.SFTPClient.from_transport(self.transport)

@@ -7,8 +7,8 @@ from contextlib import contextmanager
 import paramiko
 import pytest
 
-from aire_windows.core import PROFILES
-from aire_windows.ssh import AuthenticationRejected, HostVerifier, Session, authenticate
+from leeds_hpc_desktop.core import PROFILES
+from leeds_hpc_desktop.ssh import AuthenticationRejected, HostVerifier, Session, authenticate
 
 
 def section(name, body="", status=0):
@@ -29,8 +29,11 @@ OUTPUT = (
 
 
 class Server(paramiko.ServerInterface):
-    def __init__(self, reject=False):
+    def __init__(self, reject=False, status_first=False):
         self.reject = reject
+        # Send exit-status before the output, as OpenSSH may when the
+        # command exits with data still in its pipe.
+        self.status_first = status_first
         self.stage = 0
         self.passwords = []
         self.commands = []
@@ -64,12 +67,12 @@ class Server(paramiko.ServerInterface):
 
 
 @contextmanager
-def ssh_server(reject=False):
+def ssh_server(reject=False, status_first=False):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     listener.settimeout(10)
-    server = Server(reject)
+    server = Server(reject, status_first)
     transports = []
     errors = []
 
@@ -87,8 +90,11 @@ def ssh_server(reject=False):
                     if not data:
                         break
                     server.script += data
+                if server.status_first:
+                    channel.send_exit_status(0)
                 channel.sendall(OUTPUT.encode())
-                channel.send_exit_status(0)
+                if not server.status_first:
+                    channel.send_exit_status(0)
                 channel.close()
         except (EOFError, OSError):
             pass
@@ -131,6 +137,22 @@ def test_real_ssh_duo_and_shared_collector(tmp_path):
         assert b"squeue" in server.script
         assert b"test-only" not in server.script
         assert prompts == [("host", "loopback.test"), ("challenge", "loopback.test")]
+
+
+def test_real_ssh_output_after_exit_status_is_kept(tmp_path):
+    def ask(kind, host, content):
+        return True if kind == "host" else "1"
+
+    with ssh_server(status_first=True) as (client, server):
+        HostVerifier(tmp_path / "known_hosts", ask).verify("loopback.test", client.get_remote_server_key())
+        authenticate(client, "loopback.test", "demo", "test-only", ask)
+        snapshot = Session(PROFILES[0], client).collect("demo")
+        assert snapshot["errors"] == []
+        # Reading stopped at EOF, not at the exit status: the whole output,
+        # storage section included, arrived.
+        assert snapshot["storage"] is not None
+        assert not any("missing" in warning for warning in snapshot["warnings"])
+        assert snapshot["nodes"][0]["gpu_idle"] == 2
 
 
 def test_real_ssh_wrong_password_no_retry():

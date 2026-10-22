@@ -3,6 +3,7 @@
 A Linux desktop port of the read-only monitoring features. The macOS SwiftUI
 application is unchanged. The Linux app uses Python, Qt (PySide6) and Paramiko,
 and imports the same `scripts/hpc_snapshot.py` collector and parsers as the Mac.
+It shares its code, in `desktop/`, with the [Windows app](WINDOWS_APP.md).
 It does not need OpenSSH ControlMaster, Xcode, or anything installed on the
 cluster.
 
@@ -51,8 +52,10 @@ example snapshots into the live cache.
 - Ten-second refreshes over persistent authenticated SSH connections. One
   cluster's refresh failure does not discard the other's data.
 - System tray icon, minimize-to-tray, and notifications when a job starts or
-  leaves the active queue. Leaving the queue is **not** described as successful
-  completion: its final status is unknown.
+  leaves the active queue, where the desktop provides a tray (stock GNOME needs
+  the AppIndicator extension). Without one the button reads **Minimize** and
+  job changes appear in the window's banner instead. Leaving the queue is
+  **not** described as successful completion: its final status is unknown.
 - Local, account-scoped snapshots and up to 8,640 history points per cluster.
   Offline data always remains labelled as cached/stale.
 
@@ -69,15 +72,16 @@ It has **no** embedded shell, uploads, downloads, rename/delete, job submission,
 job cancellation, standalone desktop widget, or automatic GPU-availability alert.
 Use your usual SSH client for those operations. Output viewing is a bounded
 manual refresh, not an unbounded `tail -F` stream. SSH sessions end on **Quit**;
-they do not survive app restarts. **Minimize to tray** keeps the process and
-sessions running; closing the window quits.
+they do not survive app restarts. **Minimize to tray** (or **Minimize**)
+keeps the process and sessions running; closing the window quits.
 
 ## Privacy and trust
 
 - Credentials are never put in subprocess arguments, environment variables,
   logs, snapshots, settings, or plaintext files. The optional saved password
-  uses the freedesktop.org Secret Service keyring (such as GNOME Keyring or
-  KWallet) explicitly, with no plaintext keyring fallback.
+  uses a freedesktop.org Secret Service provider explicitly (GNOME Keyring,
+  KeePassXC, or a KWallet version with Secret Service support enabled), with no
+  plaintext keyring fallback.
 - Passwords are held transiently in process memory during sign-in. Python
   strings cannot be reliably zeroed; the input field and worker references are
   cleared after use. Passwords are not retained for automatic reconnection.
@@ -111,7 +115,7 @@ From the repository root in bash:
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/python -m pip install -r linux/requirements-dev.txt
+./.venv/bin/python -m pip install -r desktop/requirements-dev.txt
 ./scripts/run_linux_app.sh --demo
 ./scripts/run_linux_app.sh
 ```
@@ -119,15 +123,15 @@ python3 -m venv .venv
 The scripts use the venv directly; activation is unnecessary.
 
 ```bash
-./.venv/bin/python -m ruff check linux
-./.venv/bin/python -m ruff format --check linux
-./.venv/bin/python -m pyright -p linux
-./.venv/bin/python -m pytest -c linux/pyproject.toml linux/tests -q
+./.venv/bin/python -m ruff check desktop
+./.venv/bin/python -m ruff format --check desktop
+./.venv/bin/python -m pyright -p desktop
+./.venv/bin/python -m pytest -c desktop/pyproject.toml desktop/tests -q
 ./.venv/bin/python scripts/hpc_snapshot.py --self-test
 ./scripts/build_linux_app.sh --skip-install
 ```
 
-The build produces `linux/dist/LeedsHPCMonitor-Linux-x64.tar.gz` (or
+The build produces `desktop/dist/LeedsHPCMonitor-Linux-x64.tar.gz` (or
 `LeedsHPCMonitor-Linux-arm64.tar.gz` on `aarch64`), prints its SHA-256 hash, and
 runs an offline frozen-executable startup check. Dependency licence texts are
 included alongside the executable. GitHub Actions performs the same checks and
@@ -137,21 +141,27 @@ The tests use fixtures, an isolated cache, offscreen Qt widgets and a real SSH
 server bound only to `127.0.0.1`. They never contact AIRE, Calder or rash, and do
 not touch your real System Keyring or SSH configuration. Live Leeds/Duo
 compatibility must still be checked by someone with a Leeds account and network
-access; passing fixture tests does not prove a real sign-in.
+access; passing fixture tests does not prove a real sign-in. Without PySide6
+and Paramiko installed (for example on a Mac), `pytest` runs only the
+standard-library tests and names the suites it left out.
 
 `LEEDS_HPC_DATA_DIR` can point to an isolated local folder for development.
 
 ## Code map
 
+The Windows and Linux apps are one package; only `platform_support.py` differs
+by platform.
+
 | Path | Role |
 |---|---|
-| `linux/main.py` | Source/frozen entry point |
-| `linux/aire_linux/app.py` | Desktop UI, background tasks, prompts, tray |
-| `linux/aire_linux/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP |
-| `linux/aire_linux/core.py` | Profiles, cache validation, capacity calculations |
-| `linux/aire_linux/demo.py` | Explicit offline examples |
-| `scripts/hpc_snapshot.py` | Unmodified shared collector and parsers |
-| `linux/tests/` | Offline regression and loopback SSH tests |
+| `desktop/main.py` | Source/frozen entry point |
+| `desktop/leeds_hpc_desktop/app.py` | Desktop UI, background tasks, prompts, tray |
+| `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP, the collector's transport |
+| `desktop/leeds_hpc_desktop/core.py` | Profiles, cache validation, capacity calculations |
+| `desktop/leeds_hpc_desktop/platform_support.py` | Data folder, file permissions, credential store, tray check, platform wording |
+| `desktop/leeds_hpc_desktop/demo.py` | Explicit offline examples |
+| `scripts/hpc_snapshot.py` | Shared collector and parsers, imported as a library; `run_collection` runs each refresh |
+| `desktop/tests/` | Offline regression and loopback SSH tests |
 
-MIT for the app; see `LICENSE` and `linux/THIRD_PARTY_NOTICES.md` for bundled
+MIT for the app; see `LICENSE` and `desktop/THIRD_PARTY_NOTICES.md` for bundled
 third-party components and their separate licences.

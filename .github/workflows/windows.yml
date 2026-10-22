@@ -1,15 +1,22 @@
 name: Windows desktop app
 
+# Also runs for changes to what the job uses outside desktop/: the collector
+# and its tests (run below via --self-test), the build scripts, and the
+# licence and guide copied into the bundle.
 on:
   push:
-    branches: [main, 'windows-branch']
-    paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
+    branches: [main]
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
   pull_request:
-    paths: ['windows/**', 'scripts/hpc_snapshot.py', 'scripts/*windows*.ps1', '.github/workflows/windows.yml']
+    paths: ['desktop/**', 'scripts/hpc_snapshot.py', 'scripts/tests/test_snapshot.py', 'scripts/*windows*.ps1', 'LICENSE', 'WINDOWS_APP.md', '.github/workflows/windows.yml']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -21,26 +28,29 @@ jobs:
         with:
           python-version: '3.13'
           cache: pip
-          cache-dependency-path: 'windows/requirements*.txt'
+          cache-dependency-path: 'desktop/requirements*.txt'
       - name: Install
         shell: pwsh
         run: |
           python -m venv .venv
-          .\.venv\Scripts\python.exe -m pip install -r windows\requirements-dev.txt
+          .\.venv\Scripts\python.exe -m pip install -r desktop\requirements-dev.txt
       - name: Lint and type check
         shell: pwsh
         run: |
-          .\.venv\Scripts\python.exe -m ruff check windows
+          .\.venv\Scripts\python.exe -m ruff check desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\.venv\Scripts\python.exe -m ruff format --check windows
+          .\.venv\Scripts\python.exe -m ruff format --check desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\.venv\Scripts\python.exe -m pyright -p windows
+          .\.venv\Scripts\python.exe -m pyright -p desktop
       - name: Tests (offline and loopback only)
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          # Every desktop test must run here: a missing PySide6 or paramiko
+          # is an error, not a reason to skip the SSH and widget suites.
+          LEEDS_HPC_FULL_TESTS: '1'
         run: |
-          .\.venv\Scripts\python.exe -m pytest -c windows\pyproject.toml windows\tests -q
+          .\.venv\Scripts\python.exe -m pytest -c desktop\pyproject.toml desktop\tests -q
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\.venv\Scripts\python.exe scripts\hpc_snapshot.py --self-test
       - name: Package and smoke test
@@ -49,5 +59,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: LeedsHPCMonitor-Windows-x64
-          path: windows/dist/LeedsHPCMonitor-Windows-x64.zip
+          path: desktop/dist/LeedsHPCMonitor-Windows-x64.zip
           if-no-files-found: error

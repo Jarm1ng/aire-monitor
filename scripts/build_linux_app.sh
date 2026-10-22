@@ -22,26 +22,25 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 if [[ "$SKIP_INSTALL" -eq 0 ]]; then
-    "$PYTHON" -m pip install -r "$REPO_DIR/linux/requirements-dev.txt"
+    "$PYTHON" -m pip install -r "$REPO_DIR/desktop/requirements-dev.txt"
 fi
 
 cd "$REPO_DIR"
 
 "$PYTHON" -m PyInstaller --noconfirm --clean --windowed --noupx --onedir \
-    --name LeedsHPCMonitor --paths linux --paths scripts \
+    --name LeedsHPCMonitor --paths desktop --paths scripts \
     --hidden-import keyring.backends.SecretService \
-    --hidden-import keyring.backends.kwallet \
     --hidden-import secretstorage \
     --hidden-import jeepney \
     --copy-metadata keyring \
-    --distpath linux/dist --workpath linux/build --specpath linux \
+    --distpath desktop/dist --workpath desktop/build --specpath desktop \
     --add-data "$REPO_DIR/LICENSE:." \
-    --add-data "$REPO_DIR/linux/THIRD_PARTY_NOTICES.md:." \
-    linux/main.py
+    --add-data "$REPO_DIR/desktop/THIRD_PARTY_NOTICES.md:." \
+    desktop/main.py
 
-OUTPUT_DIR="$REPO_DIR/linux/dist"
+OUTPUT_DIR="$REPO_DIR/desktop/dist"
 cp "$REPO_DIR/LINUX_APP.md" "$OUTPUT_DIR/LeedsHPCMonitor/LINUX_APP.md"
-"$PYTHON" "$REPO_DIR/linux/collect_licenses.py" "$OUTPUT_DIR/LeedsHPCMonitor/licenses"
+"$PYTHON" "$REPO_DIR/desktop/collect_licenses.py" "$OUTPUT_DIR/LeedsHPCMonitor/licenses"
 
 QT_QPA_PLATFORM=offscreen timeout 30s "$OUTPUT_DIR/LeedsHPCMonitor/LeedsHPCMonitor" --smoke-test
 

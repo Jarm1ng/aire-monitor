@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import posixpath
 import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
@@ -39,12 +37,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import demo
-from .core import LocalStore, PROFILES, metrics, validate_snapshot, validate_username
+from . import demo, platform_support
+from .core import (
+    KNOWN_HOSTS_FILE,
+    PROFILES,
+    SETTINGS_FILE,
+    LocalStore,
+    metrics,
+    validate_snapshot,
+    validate_username,
+)
 from .ssh import AuthenticationRejected, Cancelled, ConnectionManager, HostVerifier
 
-STYLE = """
-QWidget { background: #101820; color: #e5edf3; font-family: 'Segoe UI'; font-size: 13px; }
+# Window titles, labels and messages that name the platform or its
+# credential store; everything else is identical on Windows and Linux.
+PLATFORM = platform_support.texts()
+
+STYLE_TEMPLATE = """
+QWidget { background: #101820; color: #e5edf3; font-family: FONT_FAMILY; font-size: 13px; }
 QMainWindow, QDialog { background: #101820; }
 QFrame#sidebar { background: #141f29; border-right: 1px solid #283846; }
 QFrame#card { background: #182630; border: 1px solid #30434f; border-radius: 12px; }
@@ -71,6 +81,8 @@ QHeaderView::section { background: #1f303c; color: #c1d1dd; border: 0; padding: 
 QScrollArea { border: 0; }
 QToolTip { background: #213542; color: white; border: 1px solid #6c8b9b; }
 """
+# The platform's font stack; the stylesheet's braces rule out an f-string.
+STYLE = STYLE_TEMPLATE.replace("FONT_FAMILY", PLATFORM.font_family)
 
 
 def label(text, name="", wrap=False):
@@ -382,6 +394,8 @@ class MainWindow(QMainWindow):
         self.store = store or LocalStore()
         self.is_demo = is_demo
         self.snapshots, self.history, self.states, self.errors = {}, {}, {}, {}
+        # Job changes for the banner where no tray can show them (notify_jobs).
+        self.job_notices = {}
         self.busy, self.tasks = set(), set()
         self.connecting = False
         self.closing = False
@@ -390,15 +404,17 @@ class MainWindow(QMainWindow):
         self.pool.setMaxThreadCount(6)
         self.bridge = PromptBridge(self)
         self.manager = ConnectionManager(
-            HostVerifier(self.store.root / "known_hosts", self.bridge.ask), self.bridge.ask
+            HostVerifier(self.store.root / KNOWN_HOSTS_FILE, self.bridge.ask), self.bridge.ask
         )
-        self.setWindowTitle("Leeds HPC Monitor" + (" · DEMO — synthetic data" if is_demo else " · Windows"))
+        self.setWindowTitle(
+            "Leeds HPC Monitor" + (" · DEMO — synthetic data" if is_demo else f" · {PLATFORM.name}")
+        )
         self.resize(1280, 840)
         self.setMinimumSize(1050, 740)
         self.setWindowIcon(self.make_icon())
         self.build_ui()
         self.setup_tray()
-        prefs = self.store.read("settings.json", {})
+        prefs = self.store.read(SETTINGS_FILE, {})
         if isinstance(prefs, dict):
             self.username.setText(
                 prefs.get("username", "") if isinstance(prefs.get("username", ""), str) else ""
@@ -448,7 +464,7 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(20, 26, 20, 20)
         side.addWidget(label("LEEDS / RESEARCH COMPUTING", "accent"))
         side.addWidget(label("HPC Monitor", "brand"))
-        side.addWidget(label("Windows · independent project", "muted"))
+        side.addWidget(label(f"{PLATFORM.name} · independent project", "muted"))
         side.addSpacing(20)
         self.nav = QListWidget()
         self.nav.addItems(["Overview", "Jobs", "Partitions", "Nodes", "Storage", "Trends", "Files & logs"])
@@ -478,7 +494,7 @@ class MainWindow(QMainWindow):
             self.enabled[p.id] = choice
             choices.addWidget(choice)
         side.addLayout(choices)
-        self.remember = QCheckBox("Save in Credential Manager")
+        self.remember = QCheckBox(PLATFORM.remember_label)
         side.addWidget(self.remember)
         self.connect_button = button("Connect selected", self.connect_all, True)
         side.addWidget(self.connect_button)
@@ -501,7 +517,9 @@ class MainWindow(QMainWindow):
         self.cluster_filter.currentIndexChanged.connect(self.render)
         heading.addWidget(self.cluster_filter)
         heading.addWidget(button("Refresh now", self.refresh_all))
-        heading.addWidget(button("Minimize to tray", self.hide))
+        # Relabelled "Minimize" by setup_tray when there is no tray to hide into.
+        self.minimize_button = button("Minimize to tray", self.minimize)
+        heading.addWidget(self.minimize_button)
         body.addLayout(heading)
         self.banner = label("", "banner", True)
         body.addWidget(self.banner)
@@ -646,6 +664,14 @@ class MainWindow(QMainWindow):
         horizontal.addLayout(body, 1)
 
     def setup_tray(self):
+        # Without a tray host (stock GNOME without the AppIndicator extension,
+        # some tiling window managers) the icon never appears: a window hidden
+        # into it could not be restored or quit, and its SSH sessions would
+        # stay open until the process was killed. So no tray, no hiding.
+        self.tray: QSystemTrayIcon | None = None
+        if not platform_support.tray_available():
+            self.minimize_button.setText("Minimize")
+            return
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         menu = QMenu(self)
         for text, action in (
@@ -661,6 +687,12 @@ class MainWindow(QMainWindow):
             lambda reason: self.restore() if reason == QSystemTrayIcon.ActivationReason.Trigger else None
         )
         self.tray.show()
+
+    def minimize(self):
+        if self.tray is not None:
+            self.hide()
+        else:
+            self.showMinimized()
 
     def restore(self):
         self.showNormal()
@@ -688,6 +720,7 @@ class MainWindow(QMainWindow):
             return
         self.account = username
         self.snapshots, self.history, self.states, self.errors = {}, {}, {}, {}
+        self.job_notices = {}
         if username:
             for p in PROFILES:
                 snapshot, history = self.store.load(username, p.id)
@@ -697,20 +730,30 @@ class MainWindow(QMainWindow):
         self.render()
 
     def vault(self):
-        if sys.platform != "win32":
-            raise RuntimeError("Password saving is available only in Windows Credential Manager.")
-        from keyring.backends.Windows import WinVaultKeyring
+        return platform_support.credential_backend()
 
-        return WinVaultKeyring()
+    def saved_password(self, username):
+        """Returns (password, problem): the saved password or None, and why
+        it could not be read or None.
+
+        A missing entry is simply None. A store that fails (a locked or
+        absent Secret Service, a Credential Manager error) is reported the
+        same way on both platforms, so the user knows why the password is
+        asked for instead of seeing a raw error or nothing at all.
+        """
+        try:
+            return self.vault().get_password(platform_support.CREDENTIAL_SERVICE, username), None
+        except Exception as exc:
+            return None, f"The saved password could not be read ({exc})."
 
     def forget_password(self):
         try:
             username = validate_username(self.username.text())
             vault = self.vault()
-            if vault.get_password("LeedsHPCMonitor", username) is not None:
-                vault.delete_password("LeedsHPCMonitor", username)
+            if vault.get_password(platform_support.CREDENTIAL_SERVICE, username) is not None:
+                vault.delete_password(platform_support.CREDENTIAL_SERVICE, username)
             self.password.clear()
-            self.status.setText("Saved password removed from Windows Credential Manager.")
+            self.status.setText(PLATFORM.forgot_message)
         except Exception as exc:
             self.problem(str(exc))
 
@@ -727,9 +770,14 @@ class MainWindow(QMainWindow):
         try:
             username = validate_username(self.username.text())
             self.load_account()
-            password = self.password.text() or self.vault().get_password("LeedsHPCMonitor", username)
+            password, unreadable = self.password.text(), None
             if not password:
-                raise ValueError("Enter your university password. It is never written to a file.")
+                password, unreadable = self.saved_password(username)
+            if not password:
+                raise ValueError(
+                    (f"{unreadable} " if unreadable else "")
+                    + "Enter your university password. It is never written to a file."
+                )
             selected = [p for p in PROFILES if self.enabled[p.id].isChecked()]
             if not selected:
                 raise ValueError("Select at least one cluster.")
@@ -740,7 +788,7 @@ class MainWindow(QMainWindow):
         remember = self.remember.isChecked()
         self.password.clear()
         try:
-            self.store.write("settings.json", {"username": username, "route": route})
+            self.store.write(SETTINGS_FILE, {"username": username, "route": route})
         except OSError as exc:
             self.problem(f"Could not save settings: {exc}")
             return
@@ -763,13 +811,13 @@ class MainWindow(QMainWindow):
                     results.append((p.id, None, exc))
             if remember and any(value is not None for _, value, _ in results):
                 try:
-                    self.vault().set_password("LeedsHPCMonitor", username, password)
+                    self.vault().set_password(platform_support.CREDENTIAL_SERVICE, username, password)
                 except Exception:
                     results.append(
                         (
                             "credential",
                             None,
-                            RuntimeError("Connected, but Credential Manager could not save the password."),
+                            RuntimeError(PLATFORM.save_failed_message),
                         )
                     )
             return results
@@ -857,10 +905,17 @@ class MainWindow(QMainWindow):
         changes += [
             f"{job}: left the active queue (final status unknown)" for job in before if job not in after
         ]
-        if changes:
-            self.tray.showMessage(
-                f"{cluster.upper()} jobs", "\n".join(changes[:4]), QSystemTrayIcon.MessageIcon.Information
-            )
+        if self.tray is not None and QSystemTrayIcon.supportsMessages():
+            if changes:
+                self.tray.showMessage(
+                    f"{cluster.upper()} jobs", "\n".join(changes[:4]), QSystemTrayIcon.MessageIcon.Information
+                )
+        elif changes:
+            # No tray to notify through: show the latest refresh's changes in
+            # the banner instead of dropping them silently.
+            self.job_notices[cluster] = "; ".join(changes[:4])
+        else:
+            self.job_notices.pop(cluster, None)
 
     def tick(self):
         self.ticks += 1
@@ -938,11 +993,14 @@ class MainWindow(QMainWindow):
             snapshot = self.snapshots.get(p.id)
             if snapshot:
                 notices.extend(f"{p.name}: {warning}" for warning in snapshot.get("warnings", []))
+            if p.id in self.job_notices:
+                notices.append(f"{p.name} jobs: {self.job_notices[p.id]}")
         self.banner.setVisible(bool(notices))
         self.banner.setText("\n".join(notices))
         statuses = "  |  ".join(f"{p.name}: {self.states.get(p.id, 'not connected')}" for p in selected)
         self.status.setText(statuses + " · refresh every 10s · sessions end when the app quits")
-        self.tray.setToolTip("Leeds HPC Monitor\n" + statuses[:1000])
+        if self.tray is not None:
+            self.tray.setToolTip("Leeds HPC Monitor\n" + statuses[:1000])
         for section, columns in self.columns.items():
             rows = [
                 {**row, "cluster": p.name, "cluster_id": p.id}
@@ -1013,12 +1071,13 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.bridge.close()
         self.manager.stop()
-        self.tray.hide()
+        if self.tray is not None:
+            self.tray.hide()
         event.accept()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Leeds HPC Monitor for Windows")
+    parser = argparse.ArgumentParser(description=f"Leeds HPC Monitor for {PLATFORM.name}")
     parser.add_argument(
         "--demo", action="store_true", help="Synthetic offline data; makes no network connections"
     )
@@ -1030,13 +1089,14 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     app.setQuitOnLastWindowClosed(True)
-    store = LocalStore(Path(os.environ["LEEDS_HPC_DATA_DIR"]) if "LEEDS_HPC_DATA_DIR" in os.environ else None)
+    # The platform's data folder, or LEEDS_HPC_DATA_DIR (platform_support.data_dir).
+    store = LocalStore()
     window = MainWindow(store, args.demo or args.smoke_test)
     window.show()
     if args.smoke_test:
         assert window.tables["jobs"].rowCount() == 4
-        if sys.platform == "win32":
-            assert window.vault().priority > 0
+        # Fails the frozen build when the credential store's modules were not bundled.
+        platform_support.smoke_check()
         for index in range(window.stack.count()):
             window.nav.setCurrentRow(index)
         window.nav.setCurrentRow(0)

@@ -3,6 +3,7 @@
 A Windows desktop port of the read-only monitoring features. The macOS SwiftUI
 application is unchanged. The Windows app uses Python, Qt (PySide6) and Paramiko,
 and imports the same `scripts/hpc_snapshot.py` collector and parsers as the Mac.
+It shares its code, in `desktop/`, with the [Linux app](LINUX_APP.md).
 It does not need WSL, OpenSSH ControlMaster, Xcode, or anything installed on the
 cluster.
 
@@ -110,26 +111,26 @@ From the repository root in PowerShell:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r windows\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install -r desktop\requirements-dev.txt
 .\scripts\run_windows_app.ps1 -Demo
 .\scripts\run_windows_app.ps1
 ```
 
 The scripts use the venv directly; activation is unnecessary. If your local
-PowerShell policy blocks scripts, use `python windows\main.py` with the venv
+PowerShell policy blocks scripts, use `python desktop\main.py` with the venv
 Python, or review the script and use a process-scoped policy appropriate to your
 machine. Do not change machine-wide security settings just to launch the app.
 
 ```powershell
-.\.venv\Scripts\python.exe -m ruff check windows
-.\.venv\Scripts\python.exe -m ruff format --check windows
-.\.venv\Scripts\python.exe -m pyright -p windows
-.\.venv\Scripts\python.exe -m pytest -c windows\pyproject.toml windows\tests -q
+.\.venv\Scripts\python.exe -m ruff check desktop
+.\.venv\Scripts\python.exe -m ruff format --check desktop
+.\.venv\Scripts\python.exe -m pyright -p desktop
+.\.venv\Scripts\python.exe -m pytest -c desktop\pyproject.toml desktop\tests -q
 .\.venv\Scripts\python.exe scripts\hpc_snapshot.py --self-test
 .\scripts\build_windows_app.ps1 -SkipInstall
 ```
 
-The build produces `windows\dist\LeedsHPCMonitor-Windows-x64.zip`, prints its
+The build produces `desktop\dist\LeedsHPCMonitor-Windows-x64.zip`, prints its
 SHA-256 hash, and runs an offline frozen-executable startup check. Dependency
 licence texts are included alongside the executable. GitHub Actions performs
 the same checks and uploads a ZIP artifact; it does not publish a release.
@@ -138,21 +139,27 @@ The tests use fixtures, an isolated cache, offscreen Qt widgets and a real SSH
 server bound only to `127.0.0.1`. They never contact AIRE, Calder or rash, and do
 not touch your real Credential Manager or SSH configuration. Live Leeds/Duo
 compatibility must still be checked by someone with a Leeds account and network
-access; passing fixture tests does not prove a real sign-in.
+access; passing fixture tests does not prove a real sign-in. Without PySide6
+and Paramiko installed (for example on a Mac), `pytest` runs only the
+standard-library tests and names the suites it left out.
 
 `LEEDS_HPC_DATA_DIR` can point to an isolated local folder for development.
 
 ## Code map
 
+The Windows and Linux apps are one package; only `platform_support.py` differs
+by platform.
+
 | Path | Role |
 |---|---|
-| `windows/main.py` | Source/frozen entry point |
-| `windows/aire_windows/app.py` | Desktop UI, background tasks, prompts, tray |
-| `windows/aire_windows/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP |
-| `windows/aire_windows/core.py` | Profiles, cache validation, capacity calculations |
-| `windows/aire_windows/demo.py` | Explicit offline examples |
-| `scripts/hpc_snapshot.py` | Unmodified shared collector and parsers |
-| `windows/tests/` | Offline regression and loopback SSH tests |
+| `desktop/main.py` | Source/frozen entry point |
+| `desktop/leeds_hpc_desktop/app.py` | Desktop UI, background tasks, prompts, tray |
+| `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP, the collector's transport |
+| `desktop/leeds_hpc_desktop/core.py` | Profiles, cache validation, capacity calculations |
+| `desktop/leeds_hpc_desktop/platform_support.py` | Data folder, file permissions, credential store, tray check, platform wording |
+| `desktop/leeds_hpc_desktop/demo.py` | Explicit offline examples |
+| `scripts/hpc_snapshot.py` | Shared collector and parsers, imported as a library; `run_collection` runs each refresh |
+| `desktop/tests/` | Offline regression and loopback SSH tests |
 
-MIT for the app; see `LICENSE` and `windows/THIRD_PARTY_NOTICES.md` for bundled
+MIT for the app; see `LICENSE` and `desktop/THIRD_PARTY_NOTICES.md` for bundled
 third-party components and their separate licences.

@@ -52,27 +52,29 @@ Partitions the app does not know (for example the `aire-*` nodes currently hoste
 
 ## Windows version
 
-A read-only Windows desktop port is available in [`windows/`](windows/), with
-both clusters, SSH/Duo login, dashboards, local history, a tray icon and file/log
-previews. It reuses the Python collector; the macOS app below is unchanged.
+A read-only Windows desktop port is available in [`desktop/`](desktop/) (one
+code base with the Linux port), with both clusters, SSH/Duo login, dashboards,
+local history, a tray icon and file/log previews. It reuses the Python
+collector; the macOS app below is unchanged.
 See [Windows setup, portable builds and limitations](WINDOWS_APP.md).
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r windows\requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r desktop\requirements.txt
 .\scripts\run_windows_app.ps1
 ```
 
 ## Linux version
 
-A read-only Linux desktop port is available in [`linux/`](linux/), with
-both clusters, SSH/Duo login, dashboards, local history, a tray icon and file/log
-previews. It reuses the Python collector; the macOS app below is unchanged.
+A read-only Linux desktop port is available in [`desktop/`](desktop/) (one
+code base with the Windows port), with both clusters, SSH/Duo login, dashboards,
+local history, a tray icon where the desktop has one, and file/log previews. It
+reuses the Python collector; the macOS app below is unchanged.
 See [Linux setup, portable builds and limitations](LINUX_APP.md).
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/python -m pip install -r linux/requirements.txt
+./.venv/bin/python -m pip install -r desktop/requirements.txt
 ./scripts/run_linux_app.sh
 ```
 
@@ -153,6 +155,7 @@ Details: [SECURITY.md](SECURITY.md).
 | `Sources/AIREDesktopWidget/` | The standalone desktop widget |
 | `scripts/` | The snapshot collector, the SSH login helpers (`hpc_*`), `build_bundle.sh`, which builds and signs both bundles for the `run_*` scripts, and `install_app.sh`, which installs the app |
 | `Tests/`, `scripts/tests/` | Swift unit and layout tests with collector fixtures; the collector's Python tests and the mock-ssh login harness |
+| `desktop/` | The Windows and Linux app (Python, PySide6, Paramiko): one package, built per platform by `build_windows_app.ps1` / `build_linux_app.sh`. See [WINDOWS_APP.md](WINDOWS_APP.md) and [LINUX_APP.md](LINUX_APP.md) |
 
 ```bash
 scripts/test_all.sh                          # the next three plus a widget build, with a PASS/FAIL summary

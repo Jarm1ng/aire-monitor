@@ -39,10 +39,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .pyright/
-windows/build/
-windows/dist/
-windows/*.spec
-linux/build/
-linux/dist/
-linux/*.spec
 *.pyc
+
+# Windows/Linux app build products (PyInstaller)
+desktop/build/
+desktop/dist/
+desktop/*.spec

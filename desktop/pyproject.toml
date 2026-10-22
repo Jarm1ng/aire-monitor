@@ -9,7 +9,7 @@ line-length = 110
 [tool.pyright]
 venvPath = ".."
 venv = ".venv"
-include = ["aire_linux", "main.py"]
+include = ["leeds_hpc_desktop", "main.py"]
 extraPaths = ["../scripts"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
