@@ -127,7 +127,7 @@ run_login() {
         FAILED=1
         return
     fi
-    # The harness bounds every script leg itself (30 s); its 16 scenarios
+    # The harness bounds every script leg itself (30 s); its 17 scenarios
     # take about 70 s.
     run_limited 600 "$PYTHON" "$ROOT_DIR/scripts/tests/test_login_flow.py"
     record login "scripts/tests/test_login_flow.py" $?

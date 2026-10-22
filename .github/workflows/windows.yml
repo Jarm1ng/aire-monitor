@@ -26,6 +26,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          # Parse (never run) every Windows script, so a syntax error fails
+          # here rather than on a user's machine.
+          $failed = $false
+          foreach ($file in Get-ChildItem scripts\*windows*.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) { Write-Host "::error file=$($file.Name)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'

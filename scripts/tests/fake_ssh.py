@@ -74,6 +74,10 @@ Other per-host knobs (one word or number in <HPC_FAKE_HOME>/<knob>/<host>):
                (pam_unix: "(current) UNIX password: ")
   password_delay  seconds before the server asks for the password (a slow
                or silent server)
+  duo_warning  any value: a PAM message warning that the password expires
+               soon ("Your password will expire in 5 day(s).") comes in
+               front of every Duo menu, as OpenSSH delivers it: on its own
+               line before the prompt's text
 
 pam_duo is free to treat an EMPTY answer to its menu as "use the default
 factor"; the fake assumes the worst and sends another push for it, so a
@@ -514,8 +518,9 @@ def authenticate(host, user):
     except ValueError:
         prompts = 3
     reason = ""
+    warning = "Your password will expire in 5 day(s).\n" if knob("duo_warning", host) else ""
     for _attempt in range(prompts):
-        ask(reason + duo_menu(user, host), via_askpass)
+        ask(reason + warning + duo_menu(user, host), via_askpass)
         record_duo(host)
         delay = duo_delay(host)
         if mode == "deny":

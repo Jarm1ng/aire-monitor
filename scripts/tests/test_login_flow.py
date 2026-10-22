@@ -1096,6 +1096,40 @@ def s11_password_expired(h):
     return c
 
 
+def s17_expiry_warning_before_duo(h):
+    """A password that is about to expire puts a warning line in front of
+    Duo's menu ("Your password will expire in 5 day(s).\nPasscode or
+    option (1-2): "). That is Duo's prompt, not a second password prompt:
+    the sign-in must succeed with one push, and must never be reported as a
+    rejected password (exit 13) or an expired one (exit 14)."""
+    c = Check()
+    with throwaway("warned", "Warned") as host:
+        with h.knobs(host, duo_warning="1", duo_delay=1):
+            before = h.duo_count(host)
+            target = h.run_target_starter("warned", "direct")
+            c.ok(target.returncode == 0, "target leg exit %d, want 0 (%s)" % (
+                target.returncode, err(target)))
+            c.ok(h.duo_count(host) - before == 1, "target leg sent %d pushes, want 1" % (
+                h.duo_count(host) - before))
+            c.ok(h.master_alive("warned", "direct"), "no master came up after the warned sign-in")
+            # The prompt was answered AS Duo (the one-push rule and the
+            # declined/timed-out reporting depend on it), not refused as a
+            # second password prompt whose empty answer the server happened
+            # to take as a push.
+            c.ok("waiting for Duo approval on your phone (Warned)" in status_lines(target),
+                 "the Duo prompt behind the warning was not treated as Duo: %r" % status_lines(target))
+            c.ok("password sent (Warned)" in status_lines(target),
+                 "the password prompt was not answered: %r" % status_lines(target))
+        with h.knobs(RASH, duo_warning="1"):
+            spare = os.path.join(h.ctl, "jump-warned.sock")
+            before = h.duo_count(RASH)
+            jump = h.run_expect_jump("warned", jump_control_path=spare)
+            c.ok(jump.returncode == 0, "jump leg exit %d, want 0 (%s)" % (jump.returncode, err(jump)))
+            c.ok(h.duo_count(RASH) - before == 1, "jump leg sent %d pushes, want 1" % (
+                h.duo_count(RASH) - before))
+    return c
+
+
 def s12_reuse_instead_of_replace(h):
     c = Check()
     aire_host = CLUSTERS["aire"][1]
@@ -1464,6 +1498,7 @@ SCENARIOS = [
     ("S14", "special-character password", s14_special_character_password),
     ("S15", "stop helper: one route, jump only if unused", s15_stop_master),
     ("S16", "ssh option sets", s16_option_sets),
+    ("S17", "expiry warning before Duo is not a password prompt", s17_expiry_warning_before_duo),
     ("S7", "password never leaks", s7_password_never_leaks),
 ]
 
