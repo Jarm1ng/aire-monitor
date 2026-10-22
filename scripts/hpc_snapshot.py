@@ -1101,11 +1101,15 @@ _zone_cache: dict[str, object] = {}
 def _cluster_zone():
     name = os.environ.get("HPC_CLUSTER_TZ") or CLUSTER_TIME_ZONE
     if name not in _zone_cache:
+        if name.upper() == "UTC":
+            # Needs no time-zone database (Windows has none without tzdata).
+            _zone_cache[name] = timezone.utc
+            return _zone_cache[name]
         try:
             from zoneinfo import ZoneInfo
 
             _zone_cache[name] = ZoneInfo(name)
-        except Exception:  # no tz database: fall back to the Mac's zone
+        except Exception:  # no tz database: fall back to the machine's zone
             _zone_cache[name] = None
     return _zone_cache[name]
 

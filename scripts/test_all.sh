@@ -33,7 +33,17 @@ else
     SUITES=("${ALL_SUITES[@]}")
 fi
 
-PYTHON="${PYTHON:-python3}"
+# Apple's /usr/bin/python3 when there is one: the interpreter the app itself
+# runs the collector with, and one that keeps argv[0] across exec. Homebrew's
+# framework Python relaunches through Python.app and replaces argv[0], so the
+# login harness's fake ssh would no longer look like ssh in ps.
+if [[ -z "${PYTHON:-}" ]]; then
+    if [[ -x /usr/bin/python3 ]]; then
+        PYTHON=/usr/bin/python3
+    else
+        PYTHON=python3
+    fi
+fi
 RESULTS=()
 FAILED=0
 

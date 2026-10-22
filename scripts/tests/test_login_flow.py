@@ -79,6 +79,9 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True   # never litter scripts/tests/__pycache__
+import fake_ssh  # noqa: E402 - exec_interpreter() and the fake's argv parser
 PROJECT_ROOT = os.path.dirname(os.path.dirname(HERE))
 SCRIPTS = os.path.join(PROJECT_ROOT, "scripts")
 
@@ -277,7 +280,7 @@ class Harness:
                 devnull = os.open(os.devnull, os.O_RDWR)
                 for fd in (0, 1, 2):
                     os.dup2(devnull, fd)
-                os.execve(sys.executable, argv, env)
+                os.execve(fake_ssh.exec_interpreter(), argv, env)
             finally:
                 os._exit(127)
         os.close(write_fd)
@@ -1465,8 +1468,34 @@ SCENARIOS = [
 ]
 
 
+def interpreter_keeps_argv0():
+    """The fake ssh and the impersonators exec the interpreter with argv[0]
+    = "ssh" so ps shows them the way the scripts' kill rules expect (see
+    fake_ssh.exec_interpreter). Checked once the probe's interpreter is up
+    and printing, after any launcher has re-executed: a replaced argv[0]
+    would make every title-based scenario fail for reasons that have
+    nothing to do with the scripts."""
+    probe = subprocess.Popen(["ssh-argv0-probe", "-c",
+                              "import sys, time; print('ready', flush=True); time.sleep(10)"],
+                             executable=fake_ssh.exec_interpreter(),
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        probe.stdout.readline()
+        title = subprocess.run(["ps", "-o", "command=", "-p", str(probe.pid)],
+                               capture_output=True, text=True).stdout.strip()
+        return title.startswith("ssh-argv0-probe"), title
+    finally:
+        probe.kill()
+        probe.wait()
+
+
 def main():
     only = set(sys.argv[1:])
+    keeps, title = interpreter_keeps_argv0()
+    if not keeps:
+        print("error: %s replaces argv[0] when it starts (ps shows %r), so the fake ssh cannot "
+              "look like ssh to the scripts." % (fake_ssh.exec_interpreter(), title), file=sys.stderr)
+        return 2
     h = Harness()
     results = []
     try:

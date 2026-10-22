@@ -12,6 +12,7 @@ Leeds HPC Monitor is MIT-licensed. The Windows distribution also includes:
 - PyNaCl — Apache-2.0: https://github.com/pyca/pynacl
 - bcrypt — Apache-2.0: https://github.com/pyca/bcrypt
 - keyring — MIT: https://github.com/jaraco/keyring
+- tzdata (IANA time-zone database) — Apache-2.0: https://github.com/python/tzdata
 - PyInstaller bootloader — GPL with an exception for bundled applications:
   https://pyinstaller.org/en/stable/license.html
 

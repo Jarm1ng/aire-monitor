@@ -95,6 +95,19 @@ import signal
 import sys
 import time
 
+
+def exec_interpreter():
+    """The interpreter binary to exec with a chosen argv[0] ("ssh", or
+    "ssh: <socket> [mux]"). A macOS framework build (Apple's Command Line
+    Tools Python on recent macOS, Homebrew's) starts through a launcher that
+    re-executes Resources/Python.app/Contents/MacOS/Python and puts its own
+    path in argv[0], so ps would show "…/Python …" instead of ssh. Exec'ing
+    that inner binary directly keeps argv[0]."""
+    inner = os.path.join(sys.base_prefix, "Resources", "Python.app", "Contents", "MacOS", "Python")
+    if sys.platform == "darwin" and os.access(inner, os.X_OK):
+        return inner
+    return sys.executable
+
 HOME = os.environ.get("HPC_FAKE_HOME", "")
 BANNER = "SSH-2.0-OpenSSH_9.9"
 
@@ -806,9 +819,9 @@ def do_master_create(a):
     if proxy_pid:
         markers.append("--proxy-pid=%d" % proxy_pid)
     if a.want_N and not a.command:
-        os.execv(sys.executable,
+        os.execv(exec_interpreter(),
                  ["ssh", self_path, "--__master__"] + markers + ["--"] + a.argv)
-    os.execv(sys.executable,
+    os.execv(exec_interpreter(),
              ["ssh: %s [mux]" % cp, self_path, "--__master__"] + markers
              + ["-o", "ControlMaster=yes", "-o", "ControlPath=" + cp, a.host or "host"])
     # execv replaces this process; control never returns here.
@@ -905,7 +918,7 @@ def main(argv):
             # like `python3 .../bin/ssh ...`.
             sys.stdout.flush()
             sys.stderr.flush()
-            os.execv(sys.executable,
+            os.execv(exec_interpreter(),
                      ["ssh", os.path.realpath(__file__), REEXEC_MARK] + argv)
     log_invocation(argv)
     a = parse_args(argv)

@@ -384,6 +384,13 @@ def assemble(output, *, error=None, timed_out=False, **kwargs):
                                 **kwargs)
 
 
+def _tzset():
+    """time.tzset() where it exists: Windows has none, and there the
+    collector reads only HPC_CLUSTER_TZ, never the process zone."""
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+
 @contextlib.contextmanager
 def pinned_timezone(name="UTC"):
     """Epoch -> cluster time conversions depend on the zone; the fixture must
@@ -391,7 +398,7 @@ def pinned_timezone(name="UTC"):
     previous = {key: os.environ.get(key) for key in ("TZ", "HPC_CLUSTER_TZ")}
     os.environ["TZ"] = name
     os.environ["HPC_CLUSTER_TZ"] = name
-    time.tzset()
+    _tzset()
     try:
         yield
     finally:
@@ -400,7 +407,7 @@ def pinned_timezone(name="UTC"):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        time.tzset()
+        _tzset()
 
 
 # ---------------------------------------------------------------------------
@@ -680,8 +687,10 @@ class JobsJSONTests(unittest.TestCase):
         previous = {key: os.environ.get(key) for key in ("TZ", "HPC_CLUSTER_TZ")}
         os.environ["TZ"] = "America/New_York"
         os.environ.pop("HPC_CLUSTER_TZ", None)
-        time.tzset()
+        _tzset()
         try:
+            if hs._cluster_zone() is None:
+                self.skipTest("no time-zone database here (Windows without tzdata)")
             self.assertEqual(hs._epoch_to_local_iso(epoch), "2025-10-12T09:34:50")
         finally:
             for key, value in previous.items():
@@ -689,7 +698,7 @@ class JobsJSONTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-            time.tzset()
+            _tzset()
 
     def test_running_job(self):
         job = self.jobs()["40188"]

@@ -120,7 +120,18 @@ final class UserNotificationCenterPoster: NotificationPosting {
     }
 
     func requestAuthorization() async throws -> Bool {
-        try await center.requestAuthorization(options: [.alert, .sound])
+        // The completion-handler form, like authorizationStatus(): the async
+        // one sends the non-Sendable center off the main actor, which the
+        // Swift 6.1 compiler (Xcode 16, CI) rejects as a data race.
+        try await withCheckedThrowingContinuation { continuation in
+            center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: granted)
+                }
+            }
+        }
     }
 
     func post(_ notification: LocalNotification) {

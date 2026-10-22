@@ -15,6 +15,7 @@ try {
     & $python -m PyInstaller --noconfirm --clean --windowed --noupx --onedir `
         --name LeedsHPCMonitor --paths windows --paths scripts `
         --hidden-import keyring.backends.Windows --copy-metadata keyring `
+        --collect-data tzdata `
         --distpath windows/dist --workpath windows/build --specpath windows `
         --add-data "$(Join-Path $repo 'LICENSE');." `
         --add-data "$(Join-Path $repo 'windows\THIRD_PARTY_NOTICES.md');." windows/main.py

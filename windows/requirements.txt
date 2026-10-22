@@ -1,3 +1,6 @@
 PySide6==6.8.3
 paramiko==4.0.0
 keyring==25.6.0
+# Windows has no system time-zone database; the collector needs one to read
+# Slurm job times in the clusters' zone (Europe/London).
+tzdata==2025.2
