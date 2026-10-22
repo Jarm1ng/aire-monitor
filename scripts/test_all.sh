@@ -13,20 +13,29 @@
 #   login      The login-flow harness (scripts/tests/test_login_flow.py): the
 #              real login scripts against a fake ssh first on PATH. No
 #              network, no ~/.ssh, no real sessions.
+#   desktop    The Windows and Linux app's pytest suite (desktop/tests). With
+#              PySide6 and Paramiko installed it runs in full; without them
+#              (a Mac, usually) only the standard-library tests run, and the
+#              Qt and SSH modules are reported as SKIP, never as PASS. The
+#              full suite always runs in .github/workflows/windows.yml and
+#              linux.yml. HPC_DESKTOP_PYTHON picks the interpreter (a path
+#              from the repository root, or a command on PATH), e.g. a venv
+#              with desktop/requirements-dev.txt; otherwise the first of
+#              .venv/bin/python and python3 that is Python 3.11+ with pytest.
 #
 #   scripts/test_all.sh                 # everything
 #   scripts/test_all.sh swift login     # a subset, in this order
 #
 # Every suite runs even when an earlier one fails; the exit status is
-# non-zero if any failed. Each suite has a hard time limit so a hung helper
-# can never stall CI. HPC_TEST_BUILD_DIR is passed through to run_tests.sh
-# (build scratch directory).
+# non-zero if any failed (a SKIP is not a failure). Each suite has a hard
+# time limit so a hung helper can never stall CI. HPC_TEST_BUILD_DIR is
+# passed through to run_tests.sh (build scratch directory).
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-ALL_SUITES=(swift collector login)
+ALL_SUITES=(swift collector login desktop)
 if [[ $# -gt 0 ]]; then
     SUITES=("$@")
 else
@@ -118,10 +127,68 @@ run_login() {
         FAILED=1
         return
     fi
-    # The harness bounds every script leg itself (30 s); its 16 scenarios
+    # The harness bounds every script leg itself (30 s); its 17 scenarios
     # take about 70 s.
     run_limited 600 "$PYTHON" "$ROOT_DIR/scripts/tests/test_login_flow.py"
     record login "scripts/tests/test_login_flow.py" $?
+}
+
+# desktop_python_ok <python>: whether it can run the desktop suite: the
+# app's floor (Python 3.11, desktop/pyproject.toml) and pytest.
+desktop_python_ok() {
+    "$1" -c 'import sys, pytest; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
+run_desktop() {
+    banner "Desktop app tests"
+    local py="" candidate
+    if [[ -n "${HPC_DESKTOP_PYTHON:-}" ]]; then
+        # Asked for by name, so an unusable one is a failure, not a skip.
+        if ! desktop_python_ok "$HPC_DESKTOP_PYTHON"; then
+            RESULTS+=("FAIL  desktop: HPC_DESKTOP_PYTHON ($HPC_DESKTOP_PYTHON) is not Python 3.11+ with pytest")
+            FAILED=1
+            return
+        fi
+        py="$HPC_DESKTOP_PYTHON"
+    else
+        for candidate in "$ROOT_DIR/.venv/bin/python" python3; do
+            if desktop_python_ok "$candidate"; then
+                py="$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$py" ]]; then
+        RESULTS+=("SKIP  desktop: no Python 3.11+ with pytest (set HPC_DESKTOP_PYTHON to a venv with desktop/requirements-dev.txt)")
+        return
+    fi
+
+    # desktop/tests/conftest.py decides which modules need PySide6 or
+    # Paramiko and leaves them out when those are missing; ask it, so this
+    # report and the run cannot disagree. LEEDS_HPC_FULL_TESTS (CI's switch
+    # that turns a missing package into an error) is unset for the question.
+    local info missing left_out
+    if ! info="$(env -u LEEDS_HPC_FULL_TESTS "$py" -B -c 'import sys; sys.path.insert(0, "desktop/tests")
+import conftest
+print(" ".join(conftest.MISSING))
+print(" ".join(conftest.collect_ignore))')"; then
+        RESULTS+=("FAIL  desktop: could not read desktop/tests/conftest.py with $py")
+        FAILED=1
+        return
+    fi
+    { read -r missing; read -r left_out; } <<<"$info"
+
+    # -p no:cacheprovider and -B: nothing written into the checkout.
+    local pytest_args=(-B -m pytest -q -p no:cacheprovider -c "$ROOT_DIR/desktop/pyproject.toml" "$ROOT_DIR/desktop/tests")
+    if [[ -z "$left_out" ]]; then
+        # Everything installed: the full suite, as strict as CI.
+        run_limited 900 env LEEDS_HPC_FULL_TESTS=1 "$py" "${pytest_args[@]}"
+        record desktop "pytest desktop/tests ($py)" $?
+    else
+        run_limited 900 env -u LEEDS_HPC_FULL_TESTS "$py" "${pytest_args[@]}"
+        record desktop "pytest desktop/tests, standard-library tests only ($py)" $?
+        RESULTS+=("SKIP  desktop: ${left_out// /, } (needs ${missing// /, }; set HPC_DESKTOP_PYTHON to a venv with desktop/requirements-dev.txt)")
+    fi
 }
 
 for suite in "${SUITES[@]}"; do
@@ -129,6 +196,7 @@ for suite in "${SUITES[@]}"; do
         swift) run_swift ;;
         collector) run_collector ;;
         login) run_login ;;
+        desktop) run_desktop ;;
         *)
             echo "Unknown suite '$suite' (expected: ${ALL_SUITES[*]})" >&2
             exit 2

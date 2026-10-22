@@ -48,6 +48,8 @@ for the multi-cluster (AIRE + Calder) behaviour, without touching the network,
     recorded (as a kind, never the text) in `logs/pw_change/<host>.log`.
   - `password_delay` — seconds before the server asks for the password (a
     slow or silent server).
+  - `duo_warning` — any value: a PAM warning that the password expires soon
+    comes on its own line in front of every Duo menu.
   - `kbdint_only` — a wrong password gets no second prompt, just
     "Permission denied" (what AIRE, Calder and rash really do).
 - `test_snapshot.py` — the collector's unit tests: the parsers, the
@@ -62,14 +64,14 @@ for the multi-cluster (AIRE + Calder) behaviour, without touching the network,
   `MonitorService` does (expect jump leg with `HPC_SKIP_TARGET=1`, then
   `hpc_start_target_master.zsh`; `hpc_stop_master.zsh` to sign out; password
   on stdin; one control socket per cluster *and route*) and checks scenarios
-  S1–S16. `python3 scripts/tests/test_login_flow.py S10 S11` runs a subset.
+  S1–S17. `python3 scripts/tests/test_login_flow.py S10 S11` runs a subset.
 
 ## Running
 
 ```sh
 python3 scripts/tests/test_login_flow.py    # the login harness alone
 python3 scripts/tests/test_snapshot.py      # the collector tests alone
-scripts/test_all.sh                         # every suite: swift, collector, login
+scripts/test_all.sh                         # every suite: swift, collector, login, desktop
 ```
 
 The login harness takes about a minute. It prints a PASS/FAIL table and exits
@@ -126,3 +128,4 @@ sent it, never after a sign-in that merely reused open sessions.
 | S14 | A password with spaces, quotes, a backslash, `$HOME`, backticks, a tab and UTF-8 logs in on both legs. |
 | S15 | `hpc_stop_master.zsh` stops exactly one route's master, its socket and pid file, and an old release's keepalive for that path; keeps the other route's master, pid record and keepalive, Calder, and the jump master; reports "nothing running" on a second call; refuses the jump socket; stops an authenticating ssh (Disconnect during sign-in); and with `HPC_STOP_JUMP_IF_UNUSED=1` stops the shared jump master only once no tunnel rides on it — with every master titled as real `-N` masters are (their own argv, never `[mux]`), so the jump master's own argv, which names the jump socket, never counts as its own rider (the helper leaves out exactly the pid `-O check` reports). A login also ends its own path's old keepalive. |
 | S16 | Every ssh the scripts ran: no master with a remote command, every ProxyCommand hardened (BatchMode, no key/GSSAPI/password/kbd-int, ConnectTimeout, `ControlMaster=no`), nothing with `ControlMaster=auto`; the collector still sets `ControlMaster=no` and `BatchMode=yes`. |
+| S17 | A password about to expire puts "Your password will expire in 5 day(s)." in front of Duo's menu (knob `duo_warning`). The askpass helper decides on the prompt's last line, so that is answered as Duo — one push, "waiting for Duo approval", success — never as a second password prompt (which would read as a rejected password); the expect leg's anchored patterns agree. |

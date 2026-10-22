@@ -49,6 +49,13 @@ umask 077
 
 prompt="${1:-}"
 lower_prompt="$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]')"
+# OpenSSH puts the PAM messages that precede a prompt in front of the
+# prompt's own text, one per line (Duo's "Login request denied." on a
+# repeated menu, or "Your password will expire in 5 day(s)." while an AD
+# password nears expiry). What is being asked for is decided on the LAST
+# line only, as hpc_ssh_login.expect's anchored patterns do; only statements
+# that the password HAS expired count anywhere in the text.
+lower_last_line="$(printf '%s\n' "$lower_prompt" | awk 'NF { line = $0 } END { print line }')"
 
 log_prompt() {
     # Logging is opt-in (HPC_DEBUG=1) and digit runs are redacted so Duo
@@ -124,16 +131,28 @@ answer_password() {
     record_event password
 }
 
+refuse_password_change() {
+    # Never feed the stored password into a password-change flow
+    # (RHEL 7's pam_unix asks "(current) UNIX password:"; pam_sss says
+    # "Password expired. Change your password now." then "Current
+    # Password:"). Tell the starter why ssh is about to fail: an expired
+    # password, not a wrong one.
+    log_prompt refused-password-change
+    record_event password-change
+    exit 1
+}
+
+# Anywhere in the text: the password has already expired, or the server is
+# in a change flow. An advance warning ("will expire") does not match.
 case "$lower_prompt" in
-    *"new password"*|*"retype"*|*"change password"*|*"current password"*|*"(current)"*password*|*"password has expired"*|*"password expired"*|*"must change your password"*)
-        # Never feed the stored password into a password-change flow
-        # (RHEL 7's pam_unix asks "(current) UNIX password:"; pam_sss says
-        # "Password expired. Change your password now." then "Current
-        # Password:"). Tell the starter why ssh is about to fail: an expired
-        # password, not a wrong one.
-        log_prompt refused-password-change
-        record_event password-change
-        exit 1
+    *"password has expired"*|*"password expired"*|*"(current)"*password*|*"must change your password"*|*"required to change your password"*)
+        refuse_password_change
+        ;;
+esac
+
+case "$lower_last_line" in
+    *"new password"*|*"current password"*|*"old password"*|*"retype"*password*|*"re-enter"*password*|*"reenter"*password*|*"confirm"*password*|*"change password"*)
+        refuse_password_change
         ;;
     *password*)
         log_prompt password
