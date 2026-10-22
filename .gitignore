@@ -42,4 +42,7 @@ __pycache__/
 windows/build/
 windows/dist/
 windows/*.spec
+linux/build/
+linux/dist/
+linux/*.spec
 *.pyc

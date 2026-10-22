@@ -61,6 +61,19 @@ python -m venv .venv
 .\scripts\run_windows_app.ps1
 ```
 
+## Linux version
+
+A read-only Linux desktop port is available in [`linux/`](linux/), with
+both clusters, SSH/Duo login, dashboards, local history, a tray icon and file/log
+previews. It reuses the Python collector; the macOS app below is unchanged.
+See [Linux setup, portable builds and limitations](LINUX_APP.md).
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r linux/requirements.txt
+./scripts/run_linux_app.sh
+```
+
 ## Quick start (macOS)
 
 **Requirements:** macOS 13 or newer, the Xcode Command Line Tools (Swift 6), and network access to the login hosts — on the University VPN or campus network, or through the `rash.leeds.ac.uk` jump host.
