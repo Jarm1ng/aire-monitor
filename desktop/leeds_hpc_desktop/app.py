@@ -68,7 +68,15 @@ from .rules import (
     storage_summary,
     trend_points,
 )
-from .ssh import AuthenticationRejected, Cancelled, ConnectionManager, HostVerifier
+from .login import SavedPasswordGuard
+from .ssh import (
+    AuthenticationRejected,
+    Cancelled,
+    ConnectionManager,
+    HostVerifier,
+    PasswordExpired,
+    PasswordRejected,
+)
 
 # Window titles, labels and messages that name the platform or its
 # credential store; everything else is identical on Windows and Linux.
@@ -197,6 +205,23 @@ class Prompt:
     result: object = None
 
 
+@dataclass
+class SignIn:
+    """One Connect press, for the sign-in worker (MainWindow.sign_in).
+
+    password is set to None as soon as the worker is done with it, so the
+    app keeps no reference to it after sign-in (Python cannot zero strings,
+    but nothing of ours points at one any more).
+    """
+
+    username: str
+    route: str
+    selected: list
+    password: str | None
+    from_saved: bool
+    remember: bool
+
+
 class PromptBridge(QObject):
     requested = Signal(object)
 
@@ -220,6 +245,11 @@ class PromptBridge(QObject):
 
     def close(self):
         self.closing.set()
+        self.cancel_pending()
+
+    def cancel_pending(self):
+        """Answer every prompt not yet answered with "cancel" (None), so a
+        sign-in that Disconnect abandoned does not still show its dialog."""
         for prompt in self.pending[:]:
             prompt.event.set()
 
@@ -310,6 +340,10 @@ class FileBrowser(QDialog):
     def __init__(self, window, profile, path):
         super().__init__(window)
         self.owner, self.profile, self.entries = window, profile, []
+        # The folder the listing shows. Double-clicks resolve against it, not
+        # against the path box, which may have been edited (or failed to
+        # open) since: the file opened is then always the one on screen.
+        self.current: str | None = None
         self.setWindowTitle(f"{profile.name} · Read-only files")
         self.resize(1000, 700)
         layout = QVBoxLayout(self)
@@ -335,8 +369,12 @@ class FileBrowser(QDialog):
         self.browse()
 
     def up(self):
-        self.path.setText(posixpath.dirname(self.path.text()) or "/")
+        self.path.setText(posixpath.dirname(self.current or self.path.text()) or "/")
         self.browse()
+
+    def session(self):
+        session = self.owner.manager.sessions.get(self.profile.id)
+        return session if session and session.connected else None
 
     def browse(self):
         path = self.path.text()
@@ -360,8 +398,8 @@ class FileBrowser(QDialog):
                 None,
             )
             return
-        session = self.owner.manager.sessions.get(self.profile.id)
-        if not session or not session.connected:
+        session = self.session()
+        if not session:
             self.listed(None, ValueError("Connect this cluster first."))
             return
         self.owner.submit(lambda: session.files(path), self.listed)
@@ -373,6 +411,7 @@ class FileBrowser(QDialog):
             self.message.setText(str(error))
             return
         path, self.entries = value
+        self.current = path
         self.path.setText(path)
         rows = [
             {
@@ -392,16 +431,40 @@ class FileBrowser(QDialog):
         if item is None:
             return
         data = item.data(Qt.ItemDataRole.UserRole)
-        path = posixpath.join(self.path.text(), data["name"])
+        path = posixpath.join(self.current or self.path.text(), data["name"])
         if data["directory"]:
-            self.path.setText(path)
-            self.browse()
+            self.open_folder(path)
         elif self.owner.is_demo:
             self.preview.setPlainText("DEMO DATA\nEpoch 1 · loss 0.42\nEpoch 2 · loss 0.37")
+        elif data.get("symlink"):
+            # The listing has lstat's view, so a link to a folder is not
+            # marked as one: ask the server what it points at first.
+            session = self.session()
+            if session:
+                self.message.setText("Following the link…")
+                self.owner.submit(
+                    lambda: session.is_directory(path),
+                    lambda value, error: self.link_resolved(path, value, error),
+                )
         else:
-            session = self.owner.manager.sessions.get(self.profile.id)
-            if session and session.connected:
-                self.owner.submit(lambda: session.preview(path), self.previewed)
+            self.open_file(path)
+
+    def open_folder(self, path):
+        self.path.setText(path)
+        self.browse()
+
+    def open_file(self, path):
+        session = self.session()
+        if session:
+            self.owner.submit(lambda: session.preview(path), self.previewed)
+
+    def link_resolved(self, path, is_directory, error):
+        if error:
+            self.message.setText(f"Cannot follow the link: {error}")
+        elif is_directory:
+            self.open_folder(path)
+        else:
+            self.open_file(path)
 
     def previewed(self, value, error):
         self.preview.setPlainText(str(error) if error else value)
@@ -417,7 +480,11 @@ class MainWindow(QMainWindow):
         self.job_notices = {}
         # When to collect storage and how its rows merge, per cluster.
         self.storage = {p.id: StorageTracker() for p in PROFILES}
+        # Clusters with a refresh running, for the current generation only.
         self.busy, self.tasks = set(), set()
+        # Bumped by Disconnect: results of work started before it (a refresh
+        # on a closed session, a sign-in it cancelled) are ignored.
+        self.generation = 0
         self.connecting = False
         self.closing = False
         self.account = ""
@@ -427,6 +494,8 @@ class MainWindow(QMainWindow):
         self.manager = ConnectionManager(
             HostVerifier(self.store.root / KNOWN_HOSTS_FILE, self.bridge.ask), self.bridge.ask
         )
+        # The saved password, and never resending one a server rejected.
+        self.saved = SavedPasswordGuard(self.store, self.vault, platform_support.CREDENTIAL_SERVICE)
         self.setWindowTitle(
             "Leeds HPC Monitor" + (" · DEMO — synthetic data" if is_demo else f" · {PLATFORM.name}")
         )
@@ -448,12 +517,15 @@ class MainWindow(QMainWindow):
             self.history = {p.id: demo.history(i) for i, p in enumerate(PROFILES)}
             self.states = {p.id: "DEMO / SYNTHETIC" for p in PROFILES}
             self.connect_button.setEnabled(False)
+            self.disconnect_button.setEnabled(False)
             self.username.setEnabled(False)
             self.password.setEnabled(False)
             self.route.setEnabled(False)
         else:
             self.load_account()
+            self.update_password_hint()
         self.username.editingFinished.connect(self.load_account)
+        self.username.editingFinished.connect(self.update_password_hint)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(1000)
@@ -730,7 +802,9 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def minimize(self):
-        if self.tray is not None:
+        # Checked again at the click: a tray host that has gone away since
+        # start-up (a crashed panel, say) can no longer bring the window back.
+        if self.tray is not None and platform_support.tray_available():
             self.hide()
         else:
             self.showMinimized()
@@ -751,7 +825,7 @@ class MainWindow(QMainWindow):
         self.pool.start(task)
 
     def load_account(self):
-        if self.is_demo or self.connecting or self.manager.sessions:
+        if self.is_demo or self.connecting or self.manager.signed_in():
             return
         try:
             username = validate_username(self.username.text())
@@ -777,21 +851,22 @@ class MainWindow(QMainWindow):
     def vault(self):
         return platform_support.credential_backend()
 
-    def saved_password(self, username):
-        """Returns (password, problem): the saved password or None, and why
-        it could not be read or None.
-
-        A missing entry is simply None. A store that fails (a locked or
-        absent Secret Service, a Credential Manager error) is reported the
-        same way on both platforms, so the user knows why the password is
-        asked for instead of seeing a raw error or nothing at all.
-        """
+    def update_password_hint(self):
+        """Say in the empty password field whether Connect would use the
+        saved password, or will not because a server rejected it."""
         try:
-            return self.vault().get_password(platform_support.CREDENTIAL_SERVICE, username), None
-        except Exception as exc:
-            return None, f"The saved password could not be read ({exc})."
+            username = validate_username(self.username.text())
+        except ValueError:
+            username = ""
+        if username and self.saved.blocked(username):
+            self.password.setPlaceholderText("Password (the saved one was rejected)")
+        else:
+            self.password.setPlaceholderText("Password (or saved credential)")
 
     def forget_password(self):
+        # The "rejected" flag is left alone: it is lifted by the next typed
+        # password a server accepts (SavedPasswordGuard.verified), which
+        # finds no saved entry left to resend.
         try:
             username = validate_username(self.username.text())
             vault = self.vault()
@@ -810,30 +885,39 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def connect_all(self):
-        if self.is_demo or self.connecting or self.busy:
+        if self.is_demo:
+            return
+        if self.connecting:
+            # Say why nothing happens rather than ignoring the press.
+            self.status.setText(
+                "A sign-in is already running: answer its prompt or approve Duo, or press Disconnect to cancel it."
+            )
             return
         try:
             username = validate_username(self.username.text())
             self.load_account()
-            password, unreadable = self.password.text(), None
-            if not password:
-                password, unreadable = self.saved_password(username)
-            if not password:
-                raise ValueError(
-                    (f"{unreadable} " if unreadable else "")
-                    + "Enter your university password. It is never written to a file."
-                )
             selected = [p for p in PROFILES if self.enabled[p.id].isChecked()]
             if not selected:
                 raise ValueError("Select at least one cluster.")
+            if all(self.live(p.id) for p in selected):
+                # Nothing to sign in to: refresh instead of reading or
+                # sending any password.
+                self.password.clear()
+                self.refresh_now()
+                self.status.setText("Already connected: refreshing now. No password was sent or saved.")
+                return
+            # The typed password, else the saved one, unless a server has
+            # rejected that: then it is not even read (SavedPasswordGuard).
+            password, from_saved = self.saved.choose(username, self.password.text())
         except Exception as exc:
             self.problem(str(exc))
             return
         route = self.route.currentData()
-        remember = self.remember.isChecked()
+        plan = SignIn(username, route, selected, password, from_saved, self.remember.isChecked())
+        del password
         self.password.clear()
         try:
-            self.store.write(SETTINGS_FILE, {"username": username, "route": route})
+            self.store.update_settings(username=username, route=route)
         except OSError as exc:
             self.problem(f"Could not save settings: {exc}")
             return
@@ -846,42 +930,71 @@ class MainWindow(QMainWindow):
             # timer refresh still asks for it.
             self.storage[p.id].due = True
         self.render()
+        generation = self.generation
+        self.submit(
+            lambda: self.sign_in(plan),
+            lambda value, error: self.connected(value, error, generation),
+        )
 
-        def connect():
-            results = []
-            for p in selected:
+    def live(self, cluster):
+        session = self.manager.sessions.get(cluster)
+        return bool(session and session.connected)
+
+    def sign_in(self, plan):
+        """The Connect worker (off the UI thread): sign in to each selected
+        cluster in turn, then settle the saved password. Returns rows of
+        (cluster, snapshot, error); "credential" rows carry a message."""
+        results: list[tuple[str, dict | None, Exception | None]] = []
+        verified = False
+        try:
+            for p in plan.selected:
                 try:
-                    session = self.manager.connect(p, username, password, route)
+                    session, fresh = self.manager.connect(p, plan.username, plan.password, plan.route)
+                    verified = verified or fresh
                     # The first refresh after sign-in always collects storage.
-                    results.append((p.id, session.collect(username), None))
+                    results.append((p.id, session.collect(plan.username), None))
                 except (AuthenticationRejected, Cancelled) as exc:
                     results.append((p.id, None, exc))
+                    if plan.from_saved and isinstance(exc, (PasswordRejected, PasswordExpired)):
+                        # Recorded here, not in the UI callback, so it holds
+                        # even if the window closes before that runs.
+                        message = self.saved.rejected_by_server(plan.username)
+                        results.append(("credential", None, RuntimeError(message)))
+                    # Every remaining cluster would send the same password,
+                    # or push another Duo request nobody is answering.
                     break
                 except Exception as exc:
                     results.append((p.id, None, exc))
-            if remember and any(value is not None for _, value, _ in results):
-                try:
-                    self.vault().set_password(platform_support.CREDENTIAL_SERVICE, username, password)
-                except Exception:
-                    results.append(
-                        (
-                            "credential",
-                            None,
-                            RuntimeError(PLATFORM.save_failed_message),
-                        )
-                    )
-            return results
-
-        self.submit(connect, self.connected)
+            # Only a typed password that a server has just accepted may be
+            # saved or lift the saved one's "rejected" flag; reused sessions
+            # never sent it.
+            if verified and not plan.from_saved and plan.password is not None:
+                problem = self.saved.verified(
+                    plan.username, plan.password, plan.remember, PLATFORM.save_failed_message
+                )
+                if problem:
+                    results.append(("credential", None, RuntimeError(problem)))
+        finally:
+            plan.password = None
+        return results
 
     def set_connecting(self, connecting):
         self.connecting = connecting
+        # The account and route stay editable until something is signed in:
+        # after a failed sign-in, switching to rash (the off-VPN fix) or
+        # correcting the username must not need a Disconnect first.
+        editable = not connecting and not self.manager.signed_in() and not self.is_demo
         self.connect_button.setEnabled(not connecting and not self.is_demo)
-        self.disconnect_button.setEnabled(not connecting)
-        self.username.setEnabled(not connecting and not self.manager.sessions and not self.is_demo)
-        self.route.setEnabled(not connecting and not self.manager.sessions and not self.is_demo)
+        # Always available: it also cancels a sign-in in progress and ends
+        # sessions whose link has died while a refresh waits on them.
+        self.disconnect_button.setEnabled(not self.is_demo)
+        self.username.setEnabled(editable)
+        self.route.setEnabled(editable)
 
-    def connected(self, value, error):
+    def connected(self, value, error, generation=None):
+        # A sign-in that Disconnect cancelled: its sessions are already
+        # closed, so only its messages (a rejected saved password) count.
+        cancelled = generation is not None and generation != self.generation
         self.set_connecting(False)
         if error:
             self.problem(str(error))
@@ -889,21 +1002,34 @@ class MainWindow(QMainWindow):
             for cluster, snapshot, issue in value:
                 if cluster == "credential":
                     self.problem(str(issue))
-                else:
+                elif not cancelled:
                     self.receive(cluster, snapshot, issue)
         for p in PROFILES:
             if self.states.get(p.id, "").startswith("SIGNING"):
                 self.states[p.id] = "SIGN-IN CANCELLED"
+        self.update_password_hint()
         self.render()
 
     def disconnect(self):
-        if self.connecting or self.busy:
-            self.status.setText("Wait for the current operation to finish before disconnecting.")
-            return
+        """End every session at once, even while a refresh runs on it or a
+        sign-in is in progress (which this cancels)."""
+        signing_in = self.connecting
+        # Everything started before this press now reports into nothing; the
+        # busy marks belonged to those refreshes.
+        self.generation += 1
+        self.busy.clear()
+        if signing_in:
+            self.bridge.cancel_pending()
         self.manager.disconnect()
         for p in PROFILES:
-            self.states[p.id] = "CACHED / OFFLINE" if p.id in self.snapshots else "DISCONNECTED"
-        self.set_connecting(False)
+            if signing_in and self.states.get(p.id, "").startswith("SIGNING"):
+                self.states[p.id] = "SIGN-IN CANCELLED"
+            else:
+                self.states[p.id] = "CACHED / OFFLINE" if p.id in self.snapshots else "DISCONNECTED"
+        # During a sign-in, Connect comes back when its worker reports in
+        # (connected), as soon as its closed connection fails.
+        if not signing_in:
+            self.set_connecting(False)
         self.render()
 
     def refresh_now(self):
@@ -914,6 +1040,7 @@ class MainWindow(QMainWindow):
         if self.is_demo or self.connecting:
             return
         now = time.monotonic()
+        generation, account = self.generation, self.account
         for p in PROFILES:
             session = self.manager.sessions.get(p.id)
             if session and session.connected and p.id not in self.busy:
@@ -923,14 +1050,21 @@ class MainWindow(QMainWindow):
                 # Other refreshes skip it and keep the previous rows.
                 want = self.storage[p.id].wants_storage(manual, now)
                 self.submit(
-                    lambda session=session, want=want: session.collect(self.account, skip_storage=not want),
-                    lambda value, error, cluster=p.id, want=want: self.receive(
-                        cluster, value, error, requested_storage=want
+                    lambda session=session, want=want: session.collect(account, skip_storage=not want),
+                    lambda value, error, cluster=p.id, want=want: self.refreshed(
+                        cluster, value, error, want, generation
                     ),
                 )
 
-    def receive(self, cluster, value, error, requested_storage=True):
+    def refreshed(self, cluster, value, error, requested_storage, generation):
+        if generation != self.generation:
+            # Started before a Disconnect: its session is closed (that is
+            # what ended it), and its busy mark was cleared then.
+            return
         self.busy.discard(cluster)
+        self.receive(cluster, value, error, requested_storage=requested_storage)
+
+    def receive(self, cluster, value, error, requested_storage=True):
         if error or (value and value.get("errors")):
             self.errors[cluster] = str(error) if error else "; ".join(value["errors"])
             self.states[cluster] = "STALE / REFRESH FAILED"
@@ -986,6 +1120,10 @@ class MainWindow(QMainWindow):
                 lost = True
         if lost:
             self.render()
+        # Once nothing is signed in any more (a link lost, or closed as dead
+        # by a refresh), the account and route become editable again.
+        if not self.connecting and not self.is_demo and self.username.isEnabled() == self.manager.signed_in():
+            self.set_connecting(False)
         if self.ticks % 10 == 0:
             self.refresh_all()
         # Do not rebuild tables every second; preserve selection and scroll position.

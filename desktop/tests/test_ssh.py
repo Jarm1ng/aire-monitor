@@ -1,5 +1,8 @@
+import socket
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,10 +14,15 @@ from leeds_hpc_desktop.ssh import (
     AuthenticationRejected,
     Cancelled,
     ConnectionManager,
+    DuoNotApproved,
     HostVerifier,
+    PasswordExpired,
+    PasswordRejected,
     Session,
     authenticate,
     fingerprint,
+    prefer_key_types,
+    responsive,
 )
 
 
@@ -23,9 +31,22 @@ def key():
     return paramiko.RSAKey.generate(2048)
 
 
+def verifier_for(tmp_path, ask, user_lines=None):
+    """A HostVerifier whose "user's own known_hosts" is a file in tmp_path
+    (never the real ~/.ssh/known_hosts)."""
+    user = tmp_path / "user_known_hosts"
+    if user_lines is not None:
+        user.write_text("".join(f"{line}\n" for line in user_lines))
+    return HostVerifier(tmp_path / "known_hosts", ask, user_known_hosts=user)
+
+
+def entry(host, key):
+    return f"{host} {key.get_name()} {key.get_base64()}"
+
+
 def test_unknown_host_refused_before_auth(tmp_path, key):
     ask = MagicMock(return_value=False)
-    verifier = HostVerifier(tmp_path / "known_hosts", ask)
+    verifier = verifier_for(tmp_path, ask)
     with pytest.raises(Cancelled):
         verifier.verify("test.example", key)
     assert not verifier.path.exists()
@@ -34,7 +55,7 @@ def test_unknown_host_refused_before_auth(tmp_path, key):
 
 def test_host_trust_persists_and_changed_keys_blocked(tmp_path, key):
     ask = MagicMock(return_value=True)
-    verifier = HostVerifier(tmp_path / "known_hosts", ask)
+    verifier = verifier_for(tmp_path, ask)
     verifier.verify("test.example", key)
     verifier.verify("test.example", key)
     assert ask.call_count == 1
@@ -45,9 +66,91 @@ def test_host_trust_persists_and_changed_keys_blocked(tmp_path, key):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 def test_known_hosts_is_owner_only(tmp_path, key):
-    verifier = HostVerifier(tmp_path / "known_hosts", MagicMock(return_value=True))
+    verifier = verifier_for(tmp_path, MagicMock(return_value=True))
     verifier.verify("test.example", key)
     assert stat.S_IMODE(verifier.path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("hashed", [False, True])
+def test_key_in_the_users_known_hosts_is_trusted_without_a_prompt(tmp_path, key, hashed):
+    host = paramiko.HostKeys.hash_host("aire.test") if hashed else "aire.test"
+    lines = ["# comment", "@cert-authority *.test ssh-rsa AAAA", "broken line", entry(host, key)]
+    ask = MagicMock()
+    verifier = verifier_for(tmp_path, ask, lines)
+    before = verifier.user_known_hosts.read_bytes()
+    verifier.verify("aire.test", key)
+    ask.assert_not_called()
+    # Read only: the user's file is untouched, and nothing is copied over.
+    assert verifier.user_known_hosts.read_bytes() == before
+    assert not verifier.path.exists()
+
+
+def test_key_conflicting_with_the_users_known_hosts_is_blocked(tmp_path, key):
+    ask = MagicMock(return_value=True)
+    verifier = verifier_for(tmp_path, ask, [entry("aire.test", paramiko.RSAKey.generate(2048))])
+    with pytest.raises(paramiko.SSHException, match="HOST KEY CHANGED.*your own known_hosts"):
+        verifier.verify("aire.test", key)
+    ask.assert_not_called()
+    assert not verifier.path.exists()
+
+
+def test_app_approved_key_that_conflicts_with_the_users_file_is_blocked(tmp_path, key):
+    # The app's own approval (perhaps given blindly at first use) does not
+    # outweigh a different key the user's ssh trusts for the same host.
+    verifier = verifier_for(tmp_path, MagicMock(return_value=True))
+    verifier.verify("aire.test", key)
+    verifier.user_known_hosts.write_text(entry("aire.test", paramiko.RSAKey.generate(2048)) + "\n")
+    with pytest.raises(paramiko.SSHException, match="HOST KEY CHANGED"):
+        verifier.verify("aire.test", key)
+
+
+def test_revoked_key_in_the_users_file_is_blocked(tmp_path, key):
+    ask = MagicMock(return_value=True)
+    verifier = verifier_for(tmp_path, ask, ["@revoked " + entry("aire.test", key)])
+    with pytest.raises(paramiko.SSHException, match="revoked"):
+        verifier.verify("aire.test", key)
+    ask.assert_not_called()
+
+
+def test_other_key_type_in_the_users_file_still_needs_approval(tmp_path, key):
+    ask = MagicMock(return_value=True)
+    verifier = verifier_for(tmp_path, ask, [entry("aire.test", paramiko.ECDSAKey.generate())])
+    verifier.verify("aire.test", key)
+    ask.assert_called_once()
+    assert "different type of key" in ask.call_args.args[2]
+    assert verifier.path.exists()
+
+
+def test_missing_or_unreadable_users_file_falls_back_to_the_prompt(tmp_path, key):
+    ask = MagicMock(return_value=True)
+    verifier = HostVerifier(tmp_path / "known_hosts", ask, user_known_hosts=tmp_path / "missing")
+    verifier.verify("aire.test", key)
+    ask.assert_called_once()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    ask = MagicMock(return_value=True)
+    HostVerifier(tmp_path / "other_known_hosts", ask, user_known_hosts=folder).verify("aire.test", key)
+    ask.assert_called_once()
+
+
+def test_known_key_types_are_asked_for_first(tmp_path, key):
+    ecdsa = paramiko.ECDSAKey.generate()
+    verifier = verifier_for(tmp_path, MagicMock(return_value=True), [entry("aire.test", key)])
+    # The user's file knows an RSA key: ask for it by its SHA-2 names first.
+    assert verifier.preferred_key_types("aire.test")[:2] == ["rsa-sha2-512", "rsa-sha2-256"]
+    assert verifier.preferred_key_types("calder.test") == []
+    # The app's own file, once it knows the host, decides.
+    verifier.verify("calder.test", ecdsa)
+    assert verifier.preferred_key_types("calder.test") == [ecdsa.get_name()]
+    left, right = socket.socketpair()
+    try:
+        t = paramiko.Transport(left)
+        prefer_key_types(t, [ecdsa.get_name(), "not-a-key-type"])
+        assert t.get_security_options().key_types[0] == ecdsa.get_name()
+        t.close()
+    finally:
+        left.close()
+        right.close()
 
 
 def transport(methods):
@@ -72,9 +175,101 @@ def test_interactive_password_once_then_duo(instructions, prompt):
         t.is_authenticated.return_value = True
 
     t.auth_interactive.side_effect = interactive
-    authenticate(t, "test.example", "demo", "test-only", ask)
+    # True: the password was sent and the server accepted it.
+    assert authenticate(t, "test.example", "demo", "test-only", ask) is True
     assert ask.call_count == 1
     t.auth_password.assert_not_called()
+
+
+WARNED_DUO = "Your password will expire in 5 day(s).\nDuo two-factor login\n\nPasscode or option (1-1): "
+
+
+def test_duo_prompt_carrying_an_expiry_warning_is_not_a_second_password_request():
+    t = transport(["keyboard-interactive"])
+    ask = MagicMock(return_value="1")
+
+    def interactive(username, callback):
+        assert callback("", "", [("Password:", False)]) == ["test-only"]
+        assert callback("", "", [(WARNED_DUO, True)]) == ["1"]
+        t.is_authenticated.return_value = True
+
+    t.auth_interactive.side_effect = interactive
+    assert authenticate(t, "test.example", "demo", "test-only", ask)
+    assert "will expire" in ask.call_args.args[2][2]
+
+
+def test_password_change_prompt_is_refused_and_answered_with_nothing():
+    t = transport(["keyboard-interactive"])
+    ask = MagicMock(return_value="anything")
+    answers = []
+
+    def interactive(username, callback):
+        answers.append(callback("", "", [("Password:", False)]))
+        answers.append(
+            callback("", "", [("Password expired. Change your password now.\nCurrent Password: ", False)])
+        )
+
+    t.auth_interactive.side_effect = interactive
+    with pytest.raises(PasswordExpired):
+        authenticate(t, "test.example", "demo", "test-only", ask)
+    assert answers == [["test-only"]]
+    ask.assert_not_called()
+
+
+def test_refusal_says_whether_the_password_or_duo_failed():
+    t = transport(["keyboard-interactive"])
+
+    def wrong_password(username, callback):
+        callback("", "", [("Password:", False)])
+        raise paramiko.AuthenticationException("failed")
+
+    t.auth_interactive.side_effect = wrong_password
+    with pytest.raises(PasswordRejected):
+        authenticate(t, "test.example", "demo", "test-only", MagicMock())
+
+    t = transport(["keyboard-interactive"])
+
+    def duo_declined(username, callback):
+        callback("", "", [("Password:", False)])
+        callback("", "", [("Passcode or option (1-1): ", True)])
+        raise paramiko.AuthenticationException("failed")
+
+    t.auth_interactive.side_effect = duo_declined
+    with pytest.raises(DuoNotApproved):
+        authenticate(t, "test.example", "demo", "test-only", MagicMock(return_value="1"))
+
+
+def test_no_password_reference_is_left_after_sign_in():
+    # paramiko keeps the interactive handler, and auth_password's copy on
+    # its AuthHandler, for the whole life of the connection.
+    t = transport(["keyboard-interactive"])
+    handlers = []
+
+    def interactive(username, callback):
+        handlers.append(callback)
+        callback("", "", [("Password:", False)])
+        t.is_authenticated.return_value = True
+
+    t.auth_interactive.side_effect = interactive
+    authenticate(t, "test.example", "demo", "test-only", MagicMock())
+    assert "test-only" not in vars(handlers[0]).values()
+
+    t = transport(["password"])
+
+    def password(username, secret, fallback):
+        t.auth_handler.password = secret
+        t.is_authenticated.return_value = True
+        return []
+
+    t.auth_password.side_effect = password
+    assert authenticate(t, "test.example", "demo", "test-only", MagicMock())
+    assert t.auth_handler.password is None
+
+
+def test_sign_in_without_the_password_is_not_a_verification():
+    t = MagicMock()
+    t.is_authenticated.return_value = True
+    assert authenticate(t, "test.example", "demo", "test-only", MagicMock()) is False
 
 
 def test_repeated_password_aborts_without_second_submission():
@@ -85,7 +280,7 @@ def test_repeated_password_aborts_without_second_submission():
         callback("", "", [("Password:", False)])
 
     t.auth_interactive.side_effect = interactive
-    with pytest.raises(AuthenticationRejected, match="requested again"):
+    with pytest.raises(AuthenticationRejected, match="requested the password again"):
         authenticate(t, "test.example", "demo", "test-only", MagicMock())
     assert t.auth_interactive.call_count == 1
 
@@ -122,14 +317,16 @@ def test_cancelled_duo():
 def test_jump_reused_for_both_clusters_and_target_failure_preserves_it():
     manager = ConnectionManager(MagicMock(), MagicMock())
     jump, aire, calder = MagicMock(), MagicMock(), MagicMock()
-    manager._open = MagicMock(side_effect=[jump, aire, calder])
-    first = manager.connect(PROFILES[0], "demo", "test-only", "jump")
-    second = manager.connect(PROFILES[1], "demo", "test-only", "jump")
+    manager._open = MagicMock(side_effect=[(jump, True), (aire, True), (calder, True)])
+    first, verified = manager.connect(PROFILES[0], "demo", "test-only", "jump")
+    second, _ = manager.connect(PROFILES[1], "demo", "test-only", "jump")
+    assert verified
     assert first.transport == aire
     assert second.transport == calder
     assert manager._open.call_count == 3
     assert jump.open_channel.call_count == 2
-    assert manager.connect(PROFILES[0], "demo", "test-only", "jump") is first
+    # A live session is reused, and reusing it sends (so proves) nothing.
+    assert manager.connect(PROFILES[0], "demo", "test-only", "jump") == (first, False)
     assert manager._open.call_count == 3
     calder.is_active.return_value = False
     manager._open.side_effect = OSError("target refused")
@@ -144,12 +341,179 @@ def test_jump_reused_for_both_clusters_and_target_failure_preserves_it():
 
 def test_account_route_change_requires_disconnect():
     manager = ConnectionManager(MagicMock(), MagicMock())
-    manager._open = MagicMock(return_value=MagicMock())
+    manager._open = MagicMock(return_value=(MagicMock(), True))
     manager.connect(PROFILES[0], "demo", "test-only", "direct")
     with pytest.raises(ValueError):
         manager.connect(PROFILES[1], "other", "test-only", "direct")
     with pytest.raises(ValueError):
         manager.connect(PROFILES[1], "demo", "test-only", "jump")
+    assert manager.signed_in()
+
+
+def test_failed_sign_in_does_not_pin_the_account_or_route():
+    # Off VPN, "Direct" times out; switching to rash (the documented fix)
+    # or correcting the username must then just work, without Disconnect.
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    manager._open = MagicMock(side_effect=OSError("timed out"))
+    with pytest.raises(OSError):
+        manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    assert not manager.signed_in()
+    jump, aire = MagicMock(), MagicMock()
+    manager._open = MagicMock(side_effect=[(jump, True), (aire, True)])
+    session, _ = manager.connect(PROFILES[0], "demo", "test-only", "jump")
+    assert session.transport is aire
+    assert manager.route == "jump"
+
+
+def test_lost_links_release_the_account():
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    old = MagicMock()
+    manager._open = MagicMock(return_value=(old, True))
+    manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    old.is_active.return_value = False
+    manager._open = MagicMock(return_value=(MagicMock(), True))
+    session, _ = manager.connect(PROFILES[0], "other", "test-only", "direct")
+    assert manager.username == "other"
+    old.close.assert_called()
+    assert manager.sessions == {"aire": session}
+
+
+def test_silent_session_is_replaced_not_reused():
+    # Looks connected (paramiko's keepalives want no reply) but the server
+    # no longer answers: a VPN expiry or a suspend.
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    dead, fresh = MagicMock(), MagicMock()
+    dead.global_request.side_effect = lambda *args, **kwargs: time.sleep(5)
+    manager._open = MagicMock(side_effect=[(dead, True), (fresh, True)])
+    manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("leeds_hpc_desktop.ssh.PROBE_TIMEOUT", 0.2)
+        session, verified = manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    assert session.transport is fresh and verified
+    dead.close.assert_called()
+
+
+def test_disconnect_cancels_a_sign_in_without_waiting_for_it():
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    started, release = threading.Event(), threading.Event()
+    transport = MagicMock()
+
+    def slow_open(host, username, password, generation, sock=None):
+        # Stands in for a Duo approval nobody gives.
+        started.set()
+        release.wait(5)
+        manager._check_current(generation)
+        return transport, True
+
+    manager._open = slow_open
+    errors = []
+
+    def sign_in():
+        try:
+            manager.connect(PROFILES[0], "demo", "test-only", "direct")
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=sign_in)
+    worker.start()
+    assert started.wait(5)
+    began = time.monotonic()
+    manager.disconnect()
+    # disconnect() never waits on the sign-in lock.
+    assert time.monotonic() - began < 1
+    release.set()
+    worker.join(5)
+    assert len(errors) == 1 and isinstance(errors[0], Cancelled)
+    assert manager.sessions == {}
+    assert manager.username is None and manager.route is None
+
+
+def test_session_opened_after_a_disconnect_is_not_kept():
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    transport = MagicMock()
+
+    def open_then_disconnected(host, username, password, generation, sock=None):
+        manager.disconnect()
+        return transport, True
+
+    manager._open = open_then_disconnected
+    with pytest.raises(Cancelled):
+        manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    transport.close.assert_called()
+    assert manager.sessions == {}
+
+
+def test_disconnect_closes_rash_first_and_any_sign_in_in_progress():
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    order = []
+    jump, aire, opening = MagicMock(), MagicMock(), MagicMock()
+    jump.close.side_effect = lambda: order.append("jump")
+    aire.close.side_effect = lambda: order.append("aire")
+    opening.close.side_effect = lambda: order.append("opening")
+    manager._open = MagicMock(side_effect=[(jump, True), (aire, True)])
+    manager.connect(PROFILES[0], "demo", "test-only", "jump")
+    manager.opening.add(opening)
+    manager.disconnect()
+    assert order == ["jump", "opening", "aire"]
+    assert not manager.signed_in()
+
+
+def fake_network(monkeypatch, transport):
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.socket.create_connection", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.paramiko.Transport", lambda sock: transport)
+
+
+def test_open_signs_in_and_reports_whether_the_password_was_verified(monkeypatch):
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    manager.verifier.preferred_key_types.return_value = []
+    transport = MagicMock()
+    fake_network(monkeypatch, transport)
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.authenticate", lambda *args: True)
+    session, verified = manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    assert session.transport is transport and verified
+    manager.verifier.verify.assert_called_once()
+    transport.set_keepalive.assert_called_once_with(30)
+    assert manager.opening == set()
+
+
+def test_sign_in_ended_by_disconnect_is_a_cancel_not_a_rejection(monkeypatch):
+    # Closing the transport under a sign-in looks like a failed
+    # authentication to paramiko; it must not count against the password.
+    manager = ConnectionManager(MagicMock(), MagicMock())
+    manager.verifier.preferred_key_types.return_value = []
+    transport = MagicMock()
+    fake_network(monkeypatch, transport)
+
+    def closed_under_it(*args):
+        manager.disconnect()
+        raise PasswordRejected("looks like a wrong password")
+
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.authenticate", closed_under_it)
+    with pytest.raises(Cancelled):
+        manager.connect(PROFILES[0], "demo", "test-only", "direct")
+    transport.close.assert_called()
+
+    def refused(*args):
+        raise PasswordRejected("wrong password")
+
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.authenticate", refused)
+    with pytest.raises(PasswordRejected):
+        manager.connect(PROFILES[0], "demo", "test-only", "direct")
+
+
+def test_responsive_needs_a_reply_within_the_timeout():
+    t = MagicMock()
+    assert responsive(t, 1)
+    t.global_request.assert_called_once_with("keepalive@openssh.com", wait=True)
+    silent = MagicMock()
+    silent.global_request.side_effect = lambda *args, **kwargs: time.sleep(5)
+    began = time.monotonic()
+    assert not responsive(silent, 0.2)
+    assert time.monotonic() - began < 2
+    inactive = MagicMock()
+    inactive.is_active.return_value = False
+    assert not responsive(inactive, 1)
+    inactive.global_request.assert_not_called()
 
 
 def section(name, body="", status=0):
@@ -300,6 +664,43 @@ def test_skip_storage_leaves_out_the_storage_commands():
     assert snapshot["storage_skipped"] is True
 
 
+def test_dead_link_is_closed_when_a_channel_cannot_be_opened():
+    session, t = session_with()
+    t.open_session.side_effect = paramiko.SSHException("Timeout opening channel.")
+    with pytest.raises(ConnectionError, match="stopped responding"):
+        session.collect("demo")
+    t.close.assert_called_once()
+
+
+def test_refused_channel_keeps_the_connection():
+    # The server answered (too many sessions, say): the link works.
+    session, t = session_with()
+    t.open_session.side_effect = paramiko.ChannelException(2, "Connect failed")
+    with pytest.raises(paramiko.ChannelException):
+        session.collect("demo")
+    t.close.assert_not_called()
+
+
+def test_stuck_exec_request_is_ended_by_closing_its_channel(monkeypatch):
+    # exec_command has no timeout: a link that dies after the channel opened
+    # would otherwise hold the refresh (and the cluster's busy mark) for good.
+    monkeypatch.setattr("leeds_hpc_desktop.ssh.CHANNEL_GRACE", 0.2)
+    channel = FakeChannel([])
+
+    def exec_command(command):
+        while not channel.closed:
+            time.sleep(0.01)
+        raise paramiko.SSHException("Channel closed.")
+
+    channel.exec_command = exec_command
+    session, t = session_with(channel)
+    began = time.monotonic()
+    with pytest.raises(paramiko.SSHException):
+        session._run("true", 0.3)
+    assert time.monotonic() - began < 3
+    t.close.assert_not_called()
+
+
 def test_empty_output_is_a_refresh_error():
     channel = FakeChannel([])
     session, _ = session_with(channel)
@@ -334,6 +735,20 @@ def test_file_preview_read_only_and_bounded(monkeypatch, tail):
     sftp.close.assert_called_once()
 
 
+def test_links_are_followed_to_decide_folder_or_file(monkeypatch):
+    sftp = MagicMock()
+    sftp.stat.return_value.st_mode = stat.S_IFDIR | 0o755
+    monkeypatch.setattr(paramiko.SFTPClient, "from_transport", lambda t: sftp)
+    session = Session(PROFILES[0], MagicMock())
+    assert session.is_directory("/users/demo/scratch")
+    # stat follows the link; lstat (what the listing has) would not.
+    sftp.stat.assert_called_once_with("/users/demo/scratch")
+    sftp.lstat.assert_not_called()
+    sftp.close.assert_called_once()
+    sftp.stat.return_value.st_mode = stat.S_IFREG | 0o644
+    assert not session.is_directory("/users/demo/link-to-file")
+
+
 def test_binary_preview(monkeypatch):
     sftp = MagicMock()
     remote = sftp.open.return_value.__enter__.return_value
@@ -344,6 +759,6 @@ def test_binary_preview(monkeypatch):
 
 
 def test_no_password_in_local_files(tmp_path, key):
-    verifier = HostVerifier(tmp_path / "known_hosts", MagicMock(return_value=True))
+    verifier = verifier_for(tmp_path, MagicMock(return_value=True))
     verifier.verify("test.example", key)
     assert "test-only" not in "".join(p.read_text() for p in Path(tmp_path).iterdir())

@@ -14,9 +14,34 @@ from leeds_hpc_desktop.core import (
 from leeds_hpc_desktop.rules import cluster_figures
 
 
-@pytest.mark.parametrize("username", ["abcd1234", "ab_cd", "abc-12", "Abc.1"])
-def test_username(username):
-    assert validate_username(f" {username} ") == username
+@pytest.mark.parametrize(
+    "username,canonical",
+    [
+        ("abcd1234", "abcd1234"),
+        ("ab_cd", "ab_cd"),
+        ("abc-12", "abc-12"),
+        ("Abc.1", "abc.1"),
+        ("AB12CDE", "ab12cde"),
+    ],
+)
+def test_username(username, canonical):
+    # One spelling for sign-in, saved password and cache: Leeds usernames
+    # are lower case and the clusters' account lookup ignores case.
+    assert validate_username(f" {username} ") == canonical
+
+
+def test_snapshot_account_check_ignores_case(tmp_path):
+    # whoami reports the canonical lower-case name, whatever was typed.
+    snapshot = copy.deepcopy(demo.snapshots()["aire"])
+    snapshot["remote"]["user"] = "DEMO"
+    assert validate_snapshot(snapshot, "aire", "demo") is snapshot
+    store = LocalStore(tmp_path)
+    store.save("Demo", "aire", snapshot, [])
+    assert [p.name for p in tmp_path.iterdir()] == ["demo-aire.json"]
+    assert store.load("DEMO", "aire")[0] == snapshot
+    snapshot["remote"]["user"] = "other"
+    with pytest.raises(ValueError, match="different account"):
+        validate_snapshot(snapshot, "aire", "demo")
 
 
 @pytest.mark.parametrize("username", ["", "-option", "a@leeds.ac.uk", "../user", "a/b", "a\\b", "a;pwd"])

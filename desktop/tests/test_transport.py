@@ -8,7 +8,14 @@ import paramiko
 import pytest
 
 from leeds_hpc_desktop.core import PROFILES
-from leeds_hpc_desktop.ssh import AuthenticationRejected, HostVerifier, Session, authenticate
+from leeds_hpc_desktop.ssh import (
+    HostVerifier,
+    PasswordExpired,
+    PasswordRejected,
+    Session,
+    authenticate,
+    responsive,
+)
 
 
 def section(name, body="", status=0):
@@ -28,12 +35,22 @@ OUTPUT = (
 )
 
 
+DUO_PROMPT = "Passcode or option:"
+# What OpenSSH sends while an AD password nears expiry: pam_sss's warning in
+# front of pam_duo's prompt.
+WARNED_DUO_PROMPT = "Your password will expire in 5 day(s).\nPasscode or option (1-1): "
+CHANGE_PROMPT = "Password expired. Change your password now.\nCurrent Password: "
+
+
 class Server(paramiko.ServerInterface):
-    def __init__(self, reject=False, status_first=False):
+    def __init__(self, reject=False, status_first=False, second_prompt=DUO_PROMPT):
         self.reject = reject
         # Send exit-status before the output, as OpenSSH may when the
         # command exits with data still in its pipe.
         self.status_first = status_first
+        # What follows an accepted password: Duo, or a password change.
+        self.second_prompt = second_prompt
+        self.later_responses = []
         self.stage = 0
         self.passwords = []
         self.commands = []
@@ -52,7 +69,8 @@ class Server(paramiko.ServerInterface):
             if self.reject or responses != ["test-only"]:
                 return paramiko.AUTH_FAILED
             self.stage += 1
-            return paramiko.InteractiveQuery("Duo", "Choose push", ("Passcode or option:", True))
+            return paramiko.InteractiveQuery("Duo", "Choose push", (self.second_prompt, True))
+        self.later_responses.extend(responses)
         return paramiko.AUTH_SUCCESSFUL if responses == ["1"] else paramiko.AUTH_FAILED
 
     def check_channel_request(self, kind, channel_id):
@@ -67,12 +85,12 @@ class Server(paramiko.ServerInterface):
 
 
 @contextmanager
-def ssh_server(reject=False, status_first=False):
+def ssh_server(reject=False, status_first=False, second_prompt=DUO_PROMPT):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     listener.settimeout(10)
-    server = Server(reject, status_first)
+    server = Server(reject, status_first, second_prompt)
     transports = []
     errors = []
 
@@ -117,6 +135,11 @@ def ssh_server(reject=False, status_first=False):
         assert not errors
 
 
+def verifier(tmp_path, ask):
+    # Never the real ~/.ssh/known_hosts.
+    return HostVerifier(tmp_path / "known_hosts", ask, user_known_hosts=tmp_path / "user_known_hosts")
+
+
 def test_real_ssh_duo_and_shared_collector(tmp_path):
     prompts = []
 
@@ -125,8 +148,8 @@ def test_real_ssh_duo_and_shared_collector(tmp_path):
         return True if kind == "host" else "1"
 
     with ssh_server() as (client, server):
-        HostVerifier(tmp_path / "known_hosts", ask).verify("loopback.test", client.get_remote_server_key())
-        authenticate(client, "loopback.test", "demo", "test-only", ask)
+        verifier(tmp_path, ask).verify("loopback.test", client.get_remote_server_key())
+        assert authenticate(client, "loopback.test", "demo", "test-only", ask) is True
         snapshot = Session(PROFILES[0], client).collect("demo")
         assert snapshot["errors"] == []
         assert snapshot["remote"]["user"] == "demo"
@@ -144,7 +167,7 @@ def test_real_ssh_output_after_exit_status_is_kept(tmp_path):
         return True if kind == "host" else "1"
 
     with ssh_server(status_first=True) as (client, server):
-        HostVerifier(tmp_path / "known_hosts", ask).verify("loopback.test", client.get_remote_server_key())
+        verifier(tmp_path, ask).verify("loopback.test", client.get_remote_server_key())
         authenticate(client, "loopback.test", "demo", "test-only", ask)
         snapshot = Session(PROFILES[0], client).collect("demo")
         assert snapshot["errors"] == []
@@ -157,7 +180,43 @@ def test_real_ssh_output_after_exit_status_is_kept(tmp_path):
 
 def test_real_ssh_wrong_password_no_retry():
     with ssh_server(reject=True) as (client, server):
-        with pytest.raises(AuthenticationRejected):
+        with pytest.raises(PasswordRejected):
             authenticate(client, "loopback.test", "demo", "test-only", lambda *args: "1")
         assert server.passwords == ["test-only"]
         assert server.commands == []
+
+
+def test_real_ssh_duo_prompt_with_expiry_warning_reaches_the_user():
+    shown = []
+
+    def ask(kind, host, content):
+        shown.append(content)
+        return "1"
+
+    with ssh_server(second_prompt=WARNED_DUO_PROMPT) as (client, server):
+        assert authenticate(client, "loopback.test", "demo", "test-only", ask)
+        assert client.is_authenticated()
+        # The password went once; the warned Duo prompt went to the user.
+        assert server.passwords == ["test-only"]
+        assert server.later_responses == ["1"]
+        assert "will expire in 5 day(s)" in shown[0][2]
+
+
+def test_real_ssh_password_change_is_refused_with_nothing_sent():
+    ask_calls = []
+    with ssh_server(second_prompt=CHANGE_PROMPT) as (client, server):
+        with pytest.raises(PasswordExpired):
+            authenticate(client, "loopback.test", "demo", "test-only", lambda *args: ask_calls.append(args))
+        assert server.passwords == ["test-only"]
+        assert server.later_responses == []
+        assert ask_calls == []
+
+
+def test_real_ssh_liveness_probe_gets_a_reply():
+    with ssh_server() as (client, server):
+        authenticate(client, "loopback.test", "demo", "test-only", lambda *args: "1")
+        # paramiko's server refuses unknown global requests, as OpenSSH does
+        # for keepalive@openssh.com: a reply all the same.
+        assert responsive(client, 5)
+        client.close()
+        assert not responsive(client, 1)

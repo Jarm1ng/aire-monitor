@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,10 +43,24 @@ USERNAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 
 
 def validate_username(value: str) -> str:
+    """The username in its canonical, lower-case spelling.
+
+    Leeds usernames are lower case, and the clusters' SSSD/AD lookup is
+    case-insensitive, so "AB12CDE" signs in as "ab12cde" and the collector's
+    whoami reports "ab12cde". Lower-casing here keeps one spelling for the
+    sign-in, the saved password, the cache file and the snapshot check (a
+    Windows file system would otherwise treat two spellings as one file).
+    """
     value = value.strip()
     if not USERNAME.fullmatch(value):
         raise ValueError("Enter your university username, not an email address.")
-    return value
+    return value.lower()
+
+
+def same_account(reported: Any, username: str) -> bool:
+    """Whether the account a cluster reports is username, ignoring case (see
+    validate_username)."""
+    return isinstance(reported, str) and reported.casefold() == username.casefold()
 
 
 def now_iso() -> str:
@@ -59,7 +74,7 @@ def validate_snapshot(data: Any, cluster_id: str, username: str) -> dict:
         or data["cluster"].get("id") != cluster_id
     ):
         raise ValueError("Snapshot belongs to a different cluster.")
-    if not isinstance(data.get("remote"), dict) or data["remote"].get("user") != username:
+    if not isinstance(data.get("remote"), dict) or not same_account(data["remote"].get("user"), username):
         raise ValueError("Snapshot belongs to a different account.")
     if not isinstance(data.get("collected_at"), str):
         raise ValueError("Invalid snapshot timestamp.")
@@ -158,12 +173,68 @@ def clean_history(history: Any) -> list:
 # with these names, so they are part of the on-disk format.
 SETTINGS_FILE = "settings.json"
 KNOWN_HOSTS_FILE = "known_hosts"
+# settings.json key: the accounts whose saved password a server rejected
+# (login.SavedPasswordGuard). Usernames only, never a password.
+REJECTED_SAVED_PASSWORDS = "saved_password_rejected"
 
 
 class LocalStore:
     def __init__(self, root: Path | None = None):
         self.root = root or platform_support.data_dir()
         platform_support.make_private_dir(self.root)
+        # settings.json is changed from the UI thread (username, route) and
+        # from the sign-in worker (the rejected flags): one read-modify-write
+        # at a time, so neither loses the other's change.
+        self._settings_lock = threading.Lock()
+
+    def update_settings(self, **changes: Any) -> None:
+        """Merge changes into settings.json, keeping every other key."""
+        with self._settings_lock:
+            settings = self.read(SETTINGS_FILE, {})
+            if not isinstance(settings, dict):
+                settings = {}
+            settings.update(changes)
+            self.write(SETTINGS_FILE, settings)
+
+    def saved_password_rejected(self, username: str) -> bool:
+        """Whether a server rejected this account's saved password.
+
+        Fails closed: a settings file that exists but cannot be read or
+        parsed counts as "rejected", because wrongly answering "no" would
+        send a password that may already have been refused.
+        """
+        try:
+            text = (self.root / SETTINGS_FILE).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            settings = json.loads(text)
+        except ValueError:
+            return True
+        if not isinstance(settings, dict):
+            return True
+        names = settings.get(REJECTED_SAVED_PASSWORDS, [])
+        if not isinstance(names, list):
+            return True
+        return any(same_account(name, username) for name in names)
+
+    def set_saved_password_rejected(self, username: str, rejected: bool) -> None:
+        with self._settings_lock:
+            settings = self.read(SETTINGS_FILE, {})
+            if not isinstance(settings, dict):
+                settings = {}
+            names = settings.get(REJECTED_SAVED_PASSWORDS)
+            names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+            names = [n for n in names if not same_account(n, username)]
+            if rejected:
+                names.append(username.lower())
+            if names:
+                settings[REJECTED_SAVED_PASSWORDS] = sorted(names)
+            else:
+                settings.pop(REJECTED_SAVED_PASSWORDS, None)
+            self.write(SETTINGS_FILE, settings)
 
     def read(self, name: str, default: Any = None) -> Any:
         try:
@@ -180,7 +251,7 @@ class LocalStore:
         temporary.replace(target)
 
     def cache_name(self, username: str, cluster_id: str) -> str:
-        validate_username(username)
+        username = validate_username(username)
         if cluster_id not in {p.id for p in PROFILES}:
             raise ValueError("Unknown cluster")
         return f"{username}-{cluster_id}.json"

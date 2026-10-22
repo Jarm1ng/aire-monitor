@@ -24,13 +24,33 @@ download you trust.
 3. Optionally tick **Save in System Keyring**. The default is not to save.
 4. Click **Connect selected**. On first connection, verify each host's SHA-256
    fingerprint with Leeds IT or a known-good connection before trusting it.
+   Hosts your own OpenSSH already trusts (in
+   `~/.ssh/known_hosts`) are recognised without asking.
 5. Answer any Duo selection/passcode prompts and approve the push on your phone.
 
 Sign-ins are serial: one cluster's Duo prompt at a time. The rash SSH connection
-is shared when connecting both clusters. A rejected password, cancelled Duo
-dialog, or declined host key stops the remaining queued sign-ins. There is no
-automatic password retry. After a failure, correct the problem before pressing
-Connect again.
+is shared when connecting both clusters. The password is sent at most once to
+each server and never to a password-change prompt: an expired password stops
+the sign-in with a message, and you change it with the University first. Duo
+prompts are shown to you as the server words them, including any warning in
+front of them (such as an upcoming password expiry). A rejected or expired
+password, an unapproved Duo push, a cancelled dialog or a declined host key
+stops the remaining queued sign-ins. There is no automatic password retry.
+After a failure, correct the problem before pressing Connect again. The
+username is not case-sensitive.
+
+If a server rejects the **saved** password (say, after you changed your
+university password), the app never sends it again on its own, even after a
+restart: type the current password, and tick the save option as well to
+replace the saved one. Each wrong attempt counts towards the University's
+account lockout.
+
+**Disconnect** works at any time: it ends the sessions even while a refresh is
+running, and cancels a sign-in in progress. A connection that stops answering
+(after the VPN expires or the computer sleeps, say) is closed at its next
+refresh and shown as lost; press Connect to sign in again. After a failed
+sign-in the route and username stay editable, so you can switch to the rash
+jump host when off VPN, or fix a typo, and connect again.
 
 To try the interface without credentials or network access:
 
@@ -50,7 +70,8 @@ example snapshots into the live cache.
   rules, so both apps show the same numbers for the same snapshot.
 - Jobs, partitions, nodes and storage tables; a cluster filter on every page.
 - Job details and a manually refreshed, bounded stdout tail (last 128 KiB).
-- Read-only SFTP directory browsing and text previews (first 128 KiB).
+- Read-only SFTP directory browsing and text previews (first 128 KiB); links
+  to folders (such as `~/scratch`) open as folders.
 - Per-cluster idle-GPU charts (all of a cluster's models on one line, as on
   the Mac) and recent CPU/queue/node-health history, in local time.
 - Ten-second refreshes over persistent authenticated SSH connections. Storage
@@ -97,11 +118,16 @@ end on **Quit**; they do not survive app restarts. **Minimize to tray** (or
   KeePassXC, or a KWallet version with Secret Service support enabled), with no
   plaintext keyring fallback.
 - Passwords are held transiently in process memory during sign-in. Python
-  strings cannot be reliably zeroed; the input field and worker references are
-  cleared after use. Passwords are not retained for automatic reconnection.
-- A new host key needs explicit approval **before** authentication. A changed
-  key is blocked, not silently accepted. If a key really changed, verify it
-  with Leeds IT before editing the app-specific `known_hosts` file.
+  strings cannot be reliably zeroed, so copies may linger in freed memory; once
+  sign-in ends, the input field is cleared and the app drops its references,
+  including the ones Paramiko would otherwise keep for the life of the
+  connection. Passwords are not retained for automatic reconnection.
+- A new host key needs explicit approval **before** authentication. A key
+  already in your own OpenSSH `~/.ssh/known_hosts` file is trusted
+  without a prompt; that file is only read, never written. A key that differs
+  from the one recorded in either file, or that your file marks `@revoked`, is
+  blocked, not silently accepted. If a key really changed, verify it with Leeds
+  IT before editing the file concerned.
 - There is no SSH agent forwarding. Only fixed Leeds hostnames are contacted.
   No telemetry or public service receives your snapshots or credentials.
 - The collector runs its existing read-only POSIX script over SSH (`sh -s`);
@@ -112,15 +138,15 @@ Local files are under `${XDG_DATA_HOME:-~/.local/share}/LeedsHPCMonitor` (mode `
 
 | File | Contents |
 |---|---|
-| `settings.json` | Last username and route, no password |
+| `settings.json` | Last username and route, and the accounts whose saved password a server rejected; no password |
 | `known_hosts` | Explicitly trusted SSH public keys |
 | `<username>-<cluster>.json` | Last successful snapshot and bounded history |
 
 Snapshots contain job names, commands and remote paths. Treat them as private.
 The folder is created with mode `0700` and files with mode `0600`. To remove
 local monitoring data, quit the app and delete this folder. Use **Forget saved
-password** separately to remove the System Keyring entry. Disconnect before
-changing your account or route.
+password** separately to remove the System Keyring entry. While connected,
+disconnect before changing your account or route.
 
 ## Develop from source
 
@@ -170,7 +196,8 @@ by platform.
 |---|---|
 | `desktop/main.py` | Source/frozen entry point |
 | `desktop/leeds_hpc_desktop/app.py` | Desktop UI, background tasks, prompts, tray |
-| `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP, the collector's transport |
+| `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, liveness and cancellation, SFTP, the collector's transport |
+| `desktop/leeds_hpc_desktop/login.py` | Sign-in rules (standard library only): which prompts get the password, and never resending a rejected saved password |
 | `desktop/leeds_hpc_desktop/core.py` | Profiles, snapshot validation, local cache |
 | `desktop/leeds_hpc_desktop/rules.py` | The macOS app's rules, ported: node states, GPU pools, job counts, storage tone and cadence, times |
 | `desktop/leeds_hpc_desktop/platform_support.py` | Data folder, file permissions, credential store, tray check, platform wording |
