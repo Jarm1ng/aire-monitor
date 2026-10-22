@@ -1,5 +1,6 @@
 import copy
 import time
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -19,7 +20,7 @@ def test_demo_widgets_and_filters(qt_app, tmp_path):
     window = MainWindow(LocalStore(tmp_path), is_demo=True)
     assert "DEMO" in window.windowTitle()
     assert window.tables["jobs"].rowCount() == 4
-    assert window.tables["nodes"].rowCount() == 6
+    assert window.tables["nodes"].rowCount() == 12
     window.cluster_filter.setCurrentIndex(2)
     assert window.tables["jobs"].rowCount() == 2
     assert window.tables["jobs"].item(0, 0).text() == "Calder"
@@ -145,4 +146,73 @@ def test_with_a_tray_minimize_hides_into_it(qt_app, tmp_path, monkeypatch):
     assert window.minimize_button.text() == "Minimize to tray"
     window.minimize()
     assert window.isHidden()
+    finish(window)
+
+
+def test_cards_name_each_gpu_model_and_count_array_tasks(qt_app, tmp_path):
+    # Headings come from the pools the snapshot reports, never a fixed
+    # model; an idle L40 is not added to the H200 figure; an array's
+    # pending remainder counts as its 8 tasks and shows its task range.
+    window = MainWindow(LocalStore(tmp_path), is_demo=True)
+    _, name, _, summary, details = window.cards["calder"]
+    assert name.text() == "Calder  /  H200 + L40 GPUs"
+    assert summary.text() == "1 running · 8 pending   /   3 of 24 H200 idle · +1 more model"
+    assert "L40: 0 of 3 idle · all 3 unavailable" in details.text()
+    assert "156 of 256 CPUs idle on CPU nodes" in details.text()
+    window.cluster_filter.setCurrentIndex(2)
+    jobs = window.tables["jobs"]
+    assert {jobs.item(row, 1).text() for row in range(jobs.rowCount())} == {"7101", "8101_[2-9]"}
+    finish(window)
+
+
+def test_storage_rows_survive_refreshes_that_skip_storage(qt_app, tmp_path):
+    # storage None means "not collected this time": the rows on screen,
+    # their collection time and the cached copy all stay.
+    store = LocalStore(tmp_path)
+    window = MainWindow(store)
+    window.account = "demo"
+    first = demo.snapshots()["aire"]
+    window.receive("aire", first, None)
+    later = copy.deepcopy(first)
+    later["collected_at"] = (
+        datetime.fromisoformat(first["collected_at"]) + timedelta(seconds=10)
+    ).isoformat()
+    later["storage"] = None
+    window.receive("aire", later, None, requested_storage=False)
+    assert window.states["aire"] == "CONNECTED"
+    assert window.snapshots["aire"]["storage"] == first["storage"]
+    assert window.snapshots["aire"]["storage_collected_at"] == first["collected_at"]
+    assert window.tables["storage"].rowCount() == 2
+    cached, _ = store.load("demo", "aire")
+    assert cached is not None and cached["storage"] == first["storage"]
+    finish(window)
+
+
+def test_refreshes_collect_storage_only_when_due(qt_app, tmp_path, monkeypatch):
+    # The first refresh collects storage, the next ones skip it (the macOS
+    # cadence: every 5 minutes), and Refresh now always collects it.
+    window = MainWindow(LocalStore(tmp_path))
+    window.account = "demo"
+    requests = []
+
+    class FakeSession:
+        connected = True
+
+        def collect(self, username, skip_storage=False):
+            requests.append(skip_storage)
+            snapshot = demo.snapshots()["aire"]
+            if skip_storage:
+                snapshot["storage"] = None
+            return snapshot
+
+        def close(self):
+            pass
+
+    window.manager.sessions = {"aire": FakeSession()}
+    monkeypatch.setattr(window, "submit", lambda work, done: done(work(), None))
+    window.refresh_all()
+    window.refresh_all()
+    window.refresh_now()
+    assert requests == [False, True, False]
+    assert window.snapshots["aire"]["storage"] == demo.snapshots()["aire"]["storage"]
     finish(window)

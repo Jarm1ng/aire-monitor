@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import posixpath
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
@@ -43,9 +43,30 @@ from .core import (
     PROFILES,
     SETTINGS_FILE,
     LocalStore,
-    metrics,
     validate_snapshot,
     validate_username,
+)
+from .rules import (
+    StorageTracker,
+    card_heading,
+    card_summary,
+    cluster_figures,
+    cpu_summary,
+    gpu_fleet,
+    history_gpu_text,
+    history_point,
+    job_change_messages,
+    job_details_text,
+    job_display_fields,
+    job_sort_key,
+    local_time_text,
+    node_display_fields,
+    partition_display_fields,
+    pool_lines,
+    storage_display_fields,
+    storage_rows_time,
+    storage_summary,
+    trend_points,
 )
 from .ssh import AuthenticationRejected, Cancelled, ConnectionManager, HostVerifier
 
@@ -125,13 +146,21 @@ def table(columns):
     return widget
 
 
+# Text colours for rows whose "_tone" asks for attention (storage at 75 %
+# and 90 % pressure, or over quota), the same thresholds as the macOS app.
+TONE_COLOURS = {"warning": "#ffd27a", "critical": "#ff8a80"}
+
+
 def fill_table(widget, columns, rows):
     widget.setSortingEnabled(False)
     widget.setRowCount(len(rows))
     for row, data in enumerate(rows):
+        tone = TONE_COLOURS.get(data.get("_tone", ""))
         for col, (_, key) in enumerate(columns):
             item = QTableWidgetItem(display(data.get(key)))
             item.setData(Qt.ItemDataRole.UserRole, data)
+            if tone:
+                item.setForeground(QColor(tone))
             widget.setItem(row, col, item)
     widget.setSortingEnabled(True)
 
@@ -243,17 +272,7 @@ class TrendPlot(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         area = self.rect().adjusted(42, 25, -25, -40)
-        valid = [
-            (
-                p,
-                [
-                    (datetime.fromisoformat(h["time"]).timestamp(), h["gpu_idle"])
-                    for h in history
-                    if isinstance(h, dict) and h.get("gpu_idle") is not None
-                ],
-            )
-            for p, history in self.series
-        ]
+        valid = [(p, trend_points(history)) for p, history in self.series]
         values = [v for _, history in valid for _, v in history]
         times = [t for _, history in valid for t, _ in history]
         maximum = max(values, default=1) or 1
@@ -396,6 +415,8 @@ class MainWindow(QMainWindow):
         self.snapshots, self.history, self.states, self.errors = {}, {}, {}, {}
         # Job changes for the banner where no tray can show them (notify_jobs).
         self.job_notices = {}
+        # When to collect storage and how its rows merge, per cluster.
+        self.storage = {p.id: StorageTracker() for p in PROFILES}
         self.busy, self.tasks = set(), set()
         self.connecting = False
         self.closing = False
@@ -516,7 +537,7 @@ class MainWindow(QMainWindow):
             self.cluster_filter.addItem(p.name, p.id)
         self.cluster_filter.currentIndexChanged.connect(self.render)
         heading.addWidget(self.cluster_filter)
-        heading.addWidget(button("Refresh now", self.refresh_all))
+        heading.addWidget(button("Refresh now", self.refresh_now))
         # Relabelled "Minimize" by setup_tray when there is no tray to hide into.
         self.minimize_button = button("Minimize to tray", self.minimize)
         heading.addWidget(self.minimize_button)
@@ -533,21 +554,24 @@ class MainWindow(QMainWindow):
             card.setObjectName("card")
             layout = QVBoxLayout(card)
             layout.setContentsMargins(22, 18, 22, 20)
-            name = label(f"{p.name}  /  {p.gpu} GPUs", "brand")
+            # Renamed by render_cards to the GPU models the snapshot reports.
+            name = label(p.name, "brand")
             name.setStyleSheet(f"color: {p.color}")
             layout.addWidget(name)
-            state, summary, storage = label(""), label(""), label("", "muted", True)
+            state, summary, details = label(""), label("", wrap=True), label("", "muted", True)
             summary.setStyleSheet("font-size: 23px; font-weight: 600;")
             layout.addWidget(state)
             layout.addSpacing(8)
             layout.addWidget(summary)
-            layout.addWidget(storage)
-            self.cards[p.id] = (card, state, summary, storage)
+            layout.addWidget(details)
+            self.cards[p.id] = (card, name, state, summary, details)
             self.overview_layout.addWidget(card)
         self.overview_layout.addWidget(
             label(
-                "Capacity is not a scheduling guarantee. Drained, down and unresponsive nodes are excluded.\n"
-                "L40S and H200 pools are separate. Home quota is shared by both clusters.",
+                "Idle GPUs are ones a new job could start on now: on nodes that accept work (not down, "
+                "drained, draining, reserved, rebooting or not responding) with a CPU free. Each GPU model "
+                "is counted on its own; 'stranded' GPUs are idle on nodes whose CPUs are all taken.\n"
+                "Capacity is not a scheduling guarantee. Home quota is shared by both clusters.",
                 "muted",
                 True,
             )
@@ -555,11 +579,15 @@ class MainWindow(QMainWindow):
         self.overview_layout.addStretch()
         self.stack.addWidget(self.overview)
         self.columns = {
+            # The display_fields functions in core add the derived columns.
             "jobs": [
                 ("Cluster", "cluster"),
-                ("Job ID", "job_id"),
+                # "123_[2-9]" for an array's pending remainder: the bare id
+                # would read as one job (and stands for the whole array).
+                ("Job ID", "display_id"),
                 ("Name", "name"),
-                ("State", "state"),
+                ("State", "state_label"),
+                ("Jobs", "jobs"),
                 ("Partition", "partition"),
                 ("Elapsed", "elapsed"),
                 ("Limit", "time_limit"),
@@ -570,7 +598,8 @@ class MainWindow(QMainWindow):
                 ("Partition", "partition"),
                 ("Availability", "availability"),
                 ("Nodes", "node_count"),
-                ("State", "state"),
+                ("State", "state_label"),
+                ("Slurm state", "state"),
                 ("GPUs / node", "gres"),
                 ("CPUs / node", "cpus_per_node"),
                 ("Walltime", "time_limit"),
@@ -578,28 +607,43 @@ class MainWindow(QMainWindow):
             "nodes": [
                 ("Cluster", "cluster"),
                 ("Node", "node"),
-                ("State", "state"),
+                ("State", "state_label"),
+                ("Accepts work", "accepts_work"),
                 ("Partitions", "partitions"),
-                ("GPUs free", "gpu_idle"),
-                ("GPUs total", "gpu_total"),
-                ("CPUs free", "cpu_idle"),
+                ("GPU model", "gpu_model"),
+                ("GPUs", "gpu_count"),
+                ("GPUs unallocated", "gpu_unallocated"),
+                ("GPUs startable", "gpu_startable"),
+                ("CPUs idle", "cpu_idle"),
                 ("RAM MiB", "memory_mb"),
+                ("Slurm state", "state"),
                 ("Reason", "reason"),
             ],
             "storage": [
                 ("Cluster", "cluster"),
                 ("Volume", "label"),
+                ("Status", "status"),
+                ("Pressure %", "pressure_percent"),
                 ("Path", "path"),
                 ("Used GiB", "used_gb"),
                 ("Quota GiB", "quota_gb"),
                 ("Hard limit GiB", "limit_gb"),
+                ("Available GiB", "available_gb"),
                 ("Used %", "used_percent"),
                 ("Files", "file_count"),
                 ("File quota", "file_quota"),
+                ("File limit", "file_limit"),
+                ("Over quota", "over_quota_text"),
                 ("Source", "source"),
                 ("Quota type", "quota_type"),
                 ("Unavailable reason", "unavailable_reason"),
             ],
+        }
+        self.row_fields = {
+            "jobs": job_display_fields,
+            "partitions": partition_display_fields,
+            "nodes": node_display_fields,
+            "storage": storage_display_fields,
         }
         self.tables = {}
         for section, columns in self.columns.items():
@@ -612,31 +656,28 @@ class MainWindow(QMainWindow):
                 layout.addWidget(label("Double-click a job for its details and output log.", "muted"))
                 self.tables[section].cellDoubleClicked.connect(self.job_details)
             if section == "storage":
-                layout.addWidget(
-                    label(
-                        "Home is shared across clusters. ‘df’ means filesystem-wide totals, not your personal quota.",
-                        "muted",
-                        True,
-                    )
-                )
+                # Filled in by render: when each cluster's rows were collected.
+                self.storage_note = label("", "muted", True)
+                layout.addWidget(self.storage_note)
             self.stack.addWidget(page)
         trends_page = QWidget()
         trend_layout = QVBoxLayout(trends_page)
         trend_layout.setContentsMargins(0, 0, 0, 0)
-        trend_layout.addWidget(label("Free GPUs over time", "brand"))
-        trend_layout.addWidget(
-            label("AIRE = green / L40S     Calder = violet / H200 · local time · not combined", "muted")
-        )
+        trend_layout.addWidget(label("Idle GPUs over time", "brand"))
+        # Filled in by render with the colours and the models seen.
+        self.trend_legend = label("", "muted", True)
+        trend_layout.addWidget(self.trend_legend)
         self.plot = TrendPlot()
         trend_layout.addWidget(self.plot, 1)
         self.history_columns = [
             ("Cluster", "cluster"),
-            ("Time", "time"),
-            ("Free GPUs", "gpu_idle"),
-            ("Free CPUs", "cpu_idle"),
+            ("Time (local)", "time"),
+            ("Idle GPUs (all models)", "gpu_idle"),
+            ("Idle CPUs (CPU nodes)", "cpu_idle"),
             ("Running", "running"),
             ("Pending", "pending"),
-            ("Unavailable nodes", "unavailable"),
+            ("Held", "held"),
+            ("Nodes accepting no work", "unavailable"),
         ]
         self.history_table = table(self.history_columns)
         trend_layout.addWidget(self.history_table, 1)
@@ -676,7 +717,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         for text, action in (
             ("Show monitor", self.restore),
-            ("Refresh", self.refresh_all),
+            ("Refresh", self.refresh_now),
             ("Quit", self.close),
         ):
             item = QAction(text, self)
@@ -721,12 +762,16 @@ class MainWindow(QMainWindow):
         self.account = username
         self.snapshots, self.history, self.states, self.errors = {}, {}, {}, {}
         self.job_notices = {}
+        # Storage is per account: start the bookkeeping afresh, remembering
+        # which volumes the cached rows had figures for.
+        self.storage = {p.id: StorageTracker() for p in PROFILES}
         if username:
             for p in PROFILES:
                 snapshot, history = self.store.load(username, p.id)
                 if snapshot and not snapshot["errors"]:
                     self.snapshots[p.id], self.history[p.id] = snapshot, history
                     self.states[p.id] = "CACHED / OFFLINE"
+                    self.storage[p.id].note_cached(snapshot)
         self.render()
 
     def vault(self):
@@ -796,6 +841,10 @@ class MainWindow(QMainWindow):
         for p in selected:
             self.states[p.id] = "SIGNING IN / approve Duo when prompted"
             self.errors.pop(p.id, None)
+            # The first refresh after sign-in collects storage: the sign-in's
+            # own collection always does, and if that one fails the next
+            # timer refresh still asks for it.
+            self.storage[p.id].due = True
         self.render()
 
         def connect():
@@ -803,6 +852,7 @@ class MainWindow(QMainWindow):
             for p in selected:
                 try:
                     session = self.manager.connect(p, username, password, route)
+                    # The first refresh after sign-in always collects storage.
                     results.append((p.id, session.collect(username), None))
                 except (AuthenticationRejected, Cancelled) as exc:
                     results.append((p.id, None, exc))
@@ -856,19 +906,30 @@ class MainWindow(QMainWindow):
         self.set_connecting(False)
         self.render()
 
-    def refresh_all(self):
+    def refresh_now(self):
+        """Refresh now (button and tray): a manual refresh also collects storage."""
+        self.refresh_all(manual=True)
+
+    def refresh_all(self, manual=False):
         if self.is_demo or self.connecting:
             return
+        now = time.monotonic()
         for p in PROFILES:
             session = self.manager.sessions.get(p.id)
             if session and session.connected and p.id not in self.busy:
                 self.busy.add(p.id)
+                # Storage (df, quota, lfs on shared filesystems) only when
+                # due: after sign-in, on Refresh now, or every 5 minutes.
+                # Other refreshes skip it and keep the previous rows.
+                want = self.storage[p.id].wants_storage(manual, now)
                 self.submit(
-                    lambda session=session: session.collect(self.account),
-                    lambda value, error, cluster=p.id: self.receive(cluster, value, error),
+                    lambda session=session, want=want: session.collect(self.account, skip_storage=not want),
+                    lambda value, error, cluster=p.id, want=want: self.receive(
+                        cluster, value, error, requested_storage=want
+                    ),
                 )
 
-    def receive(self, cluster, value, error):
+    def receive(self, cluster, value, error, requested_storage=True):
         self.busy.discard(cluster)
         if error or (value and value.get("errors")):
             self.errors[cluster] = str(error) if error else "; ".join(value["errors"])
@@ -877,9 +938,13 @@ class MainWindow(QMainWindow):
             try:
                 validate_snapshot(value, cluster, self.account)
                 old = self.snapshots.get(cluster)
+                # Storage that was not collected (None) keeps the rows on
+                # screen, rows cut short keep their figures for a while, and
+                # the merged snapshot is what is shown, cached and charted.
+                value = self.storage[cluster].receive(old, value, requested_storage, time.monotonic())
                 self.snapshots[cluster] = value
                 history = self.history.setdefault(cluster, [])
-                history.append({"time": value["collected_at"], **metrics(value)})
+                history.append(history_point(value))
                 del history[:-8640]
                 self.states[cluster] = "CONNECTED"
                 self.errors.pop(cluster, None)
@@ -895,16 +960,10 @@ class MainWindow(QMainWindow):
         self.render()
 
     def notify_jobs(self, cluster, old, new):
-        before = {j["job_id"]: j["state"] for j in old["jobs"]}
-        after = {j["job_id"]: j["state"] for j in new["jobs"]}
-        changes = [
-            f"{job}: {before.get(job, 'new')} → {state}"
-            for job, state in after.items()
-            if state == "RUNNING" and before.get(job) != state
-        ]
-        changes += [
-            f"{job}: left the active queue (final status unknown)" for job in before if job not in after
-        ]
+        # Starts and endings as the macOS app reports them: an array's
+        # pending remainder vanishing because its last task started is not
+        # "left the queue", and its newly running tasks count as starts.
+        changes = job_change_messages(old["jobs"], new["jobs"])
         if self.tray is not None and QSystemTrayIcon.supportsMessages():
             if changes:
                 self.tray.showMessage(
@@ -944,7 +1003,7 @@ class MainWindow(QMainWindow):
 
     def render_cards(self):
         for p in PROFILES:
-            card, state, summary, storage = self.cards[p.id]
+            card, name, state, summary, details = self.cards[p.id]
             card.setVisible(p in self.profiles())
             snapshot = self.snapshots.get(p.id)
             age = ""
@@ -960,20 +1019,20 @@ class MainWindow(QMainWindow):
                 status = "STALE / CONNECTION LOST"
             state.setText(status + age)
             if snapshot:
-                m = metrics(snapshot)
-                summary.setText(
-                    f"{m['running']} running   /   {m['pending']} pending   /   {display(m['gpu_idle'])} GPUs free"
-                )
-                storage.setText(
-                    f"{display(m['cpu_idle'])} CPUs free · {m['unavailable']} unavailable nodes\n"
-                    + "  ·  ".join(
-                        f"{s['label']}: {display(s.get('used_gb'))} / {display(s.get('quota_gb'))} GiB ({s['source']})"
-                        for s in snapshot["storage"]
-                    )
+                # The macOS overview's figures: jobs by queue state (held
+                # apart, array tasks counted one by one), idle GPUs per
+                # model (largest pool first, never summed across models),
+                # CPUs on CPU-only nodes, and storage with its pressure.
+                figures = cluster_figures(snapshot)
+                name.setText(card_heading(p, figures.fleet))
+                summary.setText(card_summary(figures))
+                details.setText(
+                    "\n".join([*pool_lines(figures.fleet), cpu_summary(figures), storage_summary(snapshot)])
                 )
             else:
+                name.setText(p.name)
                 summary.setText("No snapshot yet")
-                storage.setText(
+                details.setText(
                     f"{p.host}\nConnect on VPN or use the rash jump host. Nothing is contacted until you connect."
                 )
 
@@ -998,19 +1057,66 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(bool(notices))
         self.banner.setText("\n".join(notices))
         statuses = "  |  ".join(f"{p.name}: {self.states.get(p.id, 'not connected')}" for p in selected)
-        self.status.setText(statuses + " · refresh every 10s · sessions end when the app quits")
+        self.status.setText(
+            statuses
+            + " · jobs, GPUs and nodes every 10 s, storage every 5 min · sessions end when the app quits"
+        )
         if self.tray is not None:
             self.tray.setToolTip("Leeds HPC Monitor\n" + statuses[:1000])
         for section, columns in self.columns.items():
-            rows = [
-                {**row, "cluster": p.name, "cluster_id": p.id}
-                for p in selected
-                for row in self.snapshots.get(p.id, {}).get(section, [])
-            ]
+            rows = []
+            for p in selected:
+                # storage is None until it has been collected once.
+                section_rows = self.snapshots.get(p.id, {}).get(section) or []
+                if section == "jobs":
+                    section_rows = sorted(section_rows, key=job_sort_key)
+                rows += [
+                    {**row, **self.row_fields[section](row), "cluster": p.name, "cluster_id": p.id}
+                    for row in section_rows
+                ]
             fill_table(self.tables[section], columns, rows)
+        self.storage_note.setText(self.storage_note_text(selected))
+        self.trend_legend.setText(self.trend_legend_text(selected))
         self.plot.set_series([(p, self.history.get(p.id, [])) for p in selected])
-        rows = [{**row, "cluster": p.name} for p in selected for row in self.history.get(p.id, [])[-100:]]
+        rows = [
+            {
+                **row,
+                "cluster": p.name,
+                "time": local_time_text(row.get("time"), "%d %b %H:%M:%S"),
+                "gpu_idle": history_gpu_text(row),
+            }
+            for p in selected
+            for row in self.history.get(p.id, [])[-100:]
+        ]
         fill_table(self.history_table, self.history_columns, rows)
+
+    def trend_legend_text(self, selected):
+        # Each line is one cluster's startable idle GPUs with every model
+        # added together (the one place models are summed, as on the Mac),
+        # so the legend names the models instead of a fixed one.
+        lines = []
+        for p in selected:
+            models = gpu_fleet(self.snapshots.get(p.id, {})).model_label
+            lines.append(f"{p.name} = {p.color_name}" + (f" ({models})" if models else ""))
+        return (
+            "   ".join(lines)
+            + " · startable idle GPUs, every model of a cluster together (the Overview names each model)"
+            + " · local time"
+        )
+
+    def storage_note_text(self, selected):
+        times = []
+        for p in selected:
+            stamp = storage_rows_time(self.snapshots.get(p.id))
+            if stamp:
+                times.append(f"{p.name} rows from {local_time_text(stamp, '%d %b %H:%M:%S')}")
+        return (
+            "Home is shared across clusters. ‘df’ means filesystem-wide totals, not your personal quota. "
+            "Status turns Warning at 75 % and Critical at 90 % of space or files, whichever is fuller, "
+            "and Over quota once a soft quota is exceeded.\n"
+            "Storage is collected after sign-in, on Refresh now and every 5 minutes"
+            + (f" ({', '.join(times)}, local time)." if times else ".")
+        )
 
     def open_files(self, profile, path="."):
         session = self.manager.sessions.get(profile.id)
@@ -1028,10 +1134,12 @@ class MainWindow(QMainWindow):
         job = item.data(Qt.ItemDataRole.UserRole)
         profile = next(p for p in PROFILES if p.id == job["cluster_id"])
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"{profile.name} · job {job['job_id']}")
+        dialog.setWindowTitle(f"{profile.name} · job {job.get('display_id') or job['job_id']}")
         dialog.resize(820, 650)
         layout = QVBoxLayout(dialog)
-        detail = QPlainTextEdit(json.dumps(job, indent=2, ensure_ascii=False))
+        # Slurm's submit/start/end times are cluster (UK) wall-clock times
+        # without a zone; job_details_text shows them in local time, labelled.
+        detail = QPlainTextEdit(job_details_text(job))
         detail.setReadOnly(True)
         layout.addWidget(detail)
         output = QPlainTextEdit()

@@ -43,14 +43,21 @@ example snapshots into the live cache.
 
 ## Included
 
-- Overview cards with separate AIRE/L40S and Calder/H200 capacity, job counts,
-  snapshot age and explicit live/stale/offline status.
+- Overview cards with idle GPUs per model (Calder's H200 and L40 pools are
+  never added together), job counts (held jobs apart, array tasks counted one
+  by one), CPUs idle on CPU nodes, storage with its fill level, snapshot age
+  and explicit live/stale/offline status. The figures follow the macOS app's
+  rules, so both apps show the same numbers for the same snapshot.
 - Jobs, partitions, nodes and storage tables; a cluster filter on every page.
 - Job details and a manually refreshed, bounded stdout tail (last 128 KiB).
 - Read-only SFTP directory browsing and text previews (first 128 KiB).
-- Per-cluster free-GPU charts and recent CPU/queue/node-health history.
-- Ten-second refreshes over persistent authenticated SSH connections. One
-  cluster's refresh failure does not discard the other's data.
+- Per-cluster idle-GPU charts (all of a cluster's models on one line, as on
+  the Mac) and recent CPU/queue/node-health history, in local time.
+- Ten-second refreshes over persistent authenticated SSH connections. Storage
+  (`df`, `quota`, `lfs quota` on shared filesystems) is collected after
+  sign-in, on **Refresh now** and every five minutes; in between, the last rows
+  stay on screen with their collection time. One cluster's refresh failure
+  does not discard the other's data.
 - System tray icon, minimize-to-tray, and notifications when a job starts or
   leaves the active queue, where the desktop provides a tray (stock GNOME needs
   the AppIndicator extension). Without one the button reads **Minimize** and
@@ -59,11 +66,17 @@ example snapshots into the live cache.
 - Local, account-scoped snapshots and up to 8,640 history points per cluster.
   Offline data always remains labelled as cached/stale.
 
-Free capacity excludes down, drained, failed, unresponsive and power-transition
-nodes. Unknown GPU allocation is shown as unknown, not as free. Capacity is not
-a promise that your job will schedule: reservations, accounts, QOS, memory and
-resource placement also matter. Home quota is shared between clusters; `df`
-figures are filesystem totals, not a personal quota.
+Idle GPUs are only those a new job could start on now: on nodes that accept
+work (idle, mixed, allocated, completing or planned, and not in a maintenance
+reservation, rebooting, powering down or unresponsive; a node powered down to
+save energy still counts) and with a CPU free. Idle GPUs on nodes whose CPUs
+are all taken are shown as *stranded*, and unknown GPU allocation as unknown
+(`?`), never as idle. Storage turns Warning at 75 % and Critical at 90 % of
+space or files, whichever is fuller, and is flagged when over quota. Slurm's
+job times are cluster (UK) times and are shown in your computer's time zone.
+Capacity is not a promise that your job will schedule: reservations, accounts,
+QOS, memory and resource placement also matter. Home quota is shared between
+clusters; `df` figures are filesystem totals, not a personal quota.
 
 ## Differences from the macOS app
 
@@ -71,9 +84,10 @@ This first Linux port is intentionally read-only, including explicit actions.
 It has **no** embedded shell, uploads, downloads, rename/delete, job submission,
 job cancellation, standalone desktop widget, or automatic GPU-availability alert.
 Use your usual SSH client for those operations. Output viewing is a bounded
-manual refresh, not an unbounded `tail -F` stream. SSH sessions end on **Quit**;
-they do not survive app restarts. **Minimize to tray** (or **Minimize**)
-keeps the process and sessions running; closing the window quits.
+manual refresh, not an unbounded `tail -F` stream. Storage is not refreshed
+every 10 s while the Storage page is open (use **Refresh now**). SSH sessions
+end on **Quit**; they do not survive app restarts. **Minimize to tray** (or
+**Minimize**) keeps the process and sessions running; closing the window quits.
 
 ## Privacy and trust
 
@@ -157,7 +171,8 @@ by platform.
 | `desktop/main.py` | Source/frozen entry point |
 | `desktop/leeds_hpc_desktop/app.py` | Desktop UI, background tasks, prompts, tray |
 | `desktop/leeds_hpc_desktop/ssh.py` | Host verification, Duo auth, shared rash connection, SFTP, the collector's transport |
-| `desktop/leeds_hpc_desktop/core.py` | Profiles, cache validation, capacity calculations |
+| `desktop/leeds_hpc_desktop/core.py` | Profiles, snapshot validation, local cache |
+| `desktop/leeds_hpc_desktop/rules.py` | The macOS app's rules, ported: node states, GPU pools, job counts, storage tone and cadence, times |
 | `desktop/leeds_hpc_desktop/platform_support.py` | Data folder, file permissions, credential store, tray check, platform wording |
 | `desktop/leeds_hpc_desktop/demo.py` | Explicit offline examples |
 | `scripts/hpc_snapshot.py` | Shared collector and parsers, imported as a library; `run_collection` runs each refresh |

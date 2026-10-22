@@ -8,10 +8,10 @@ from leeds_hpc_desktop.core import (
     LocalStore,
     PROFILES,
     clean_history,
-    metrics,
     validate_snapshot,
     validate_username,
 )
+from leeds_hpc_desktop.rules import cluster_figures
 
 
 @pytest.mark.parametrize("username", ["abcd1234", "ab_cd", "abc-12", "Abc.1"])
@@ -28,28 +28,79 @@ def test_bad_username(username):
 def test_profiles_match_collector_specs():
     assert len(PROFILES) == 2
     assert all(len(p.volumes) == 3 for p in PROFILES)
-    assert PROFILES[0].gpu != PROFILES[1].gpu
+    assert PROFILES[0].color != PROFILES[1].color
     assert PROFILES[0].volumes[0] == PROFILES[1].volumes[0]
 
 
-@pytest.mark.parametrize("state", ["down", "idle+drain", "mix*", "fail", "maint", "not_resp", "idle~"])
+# The node availability rule is HPCCore's allow-list (NodeStateInfo): only
+# idle, mixed, allocated, completing and planned nodes without a blocking
+# flag accept work. The old substring deny-list let these through as free
+# capacity: a maintenance reservation ("$"), draining ("drng" has no
+# "drain"), "unk" (no "unknown"), reservations, power-down and reboot flags.
+@pytest.mark.parametrize(
+    "state",
+    [
+        "idle$",
+        "mix$",
+        "alloc$",
+        "drng",
+        "drain",
+        "resv",
+        "maint",
+        "futr",
+        "boot",
+        "pow_dn",
+        "unk",
+        "mix@",
+        "idle^",
+        "idle%",
+        "idle!",
+        "mix*",
+        "down",
+        "fail",
+        "IDLE+DRAIN",
+        "MIXED+MAINT",
+        "npc",
+    ],
+)
 def test_unavailable_nodes_never_advertised(state):
-    snapshot = {"nodes": [{"state": state, "gpu_idle": 8, "gpu_total": 8, "cpu_idle": 128}]}
-    m = metrics(snapshot)
-    assert m["gpu_idle"] is None
-    assert m["cpu_idle"] is None
-    assert m["unavailable"] == 1
+    snapshot = {
+        "nodes": [{"state": state, "gres": "gpu:l40s:8", "gpu_idle": 8, "gpu_total": 8, "cpu_idle": 128}]
+    }
+    figures = cluster_figures(snapshot)
+    assert figures.fleet.idle == 0
+    assert figures.fleet.unavailable == 8
+    assert figures.unavailable_nodes == 1
+
+
+# "~"/"#": powered down (or powering up) to save energy, which the scheduler
+# resumes on demand, so the node still counts; "-"/planned is backfill.
+@pytest.mark.parametrize("state", ["idle", "mix-", "plnd", "idle~", "idle#", "MIXED+PLANNED", "comp"])
+def test_available_nodes_count(state):
+    snapshot = {
+        "nodes": [{"state": state, "gres": "gpu:l40s:8", "gpu_idle": 8, "gpu_total": 8, "cpu_idle": 128}]
+    }
+    figures = cluster_figures(snapshot)
+    assert figures.fleet.idle == 8
+    assert figures.unavailable_nodes == 0
 
 
 def test_unknown_gpu_allocation_not_zero():
     snapshot = {"nodes": [{"state": "mix", "gpu_idle": None, "gpu_total": 8, "cpu_idle": 32}]}
-    assert metrics(snapshot)["gpu_idle"] is None
+    pool = cluster_figures(snapshot).fleet.primary
+    assert pool is not None
+    assert pool.idle == 0
+    assert pool.unknown == 8
+    assert pool.idle_figure == "?"
 
 
 def test_free_capacity_and_jobs():
-    m = metrics(demo.snapshots()["aire"])
-    assert m["gpu_idle"] == 8
-    assert m["running"] == m["pending"] == 1
+    # The demo's AIRE pool: 5 startable, 1 stranded on a CPU-full node, 2
+    # idle on a draining node.
+    figures = cluster_figures(demo.snapshots()["aire"])
+    assert (figures.fleet.idle, figures.fleet.stranded, figures.fleet.unavailable) == (5, 1, 2)
+    assert figures.counts.running == figures.counts.pending == 1
+    assert (figures.cpu_idle, figures.cpu_total) == (216, 336)
 
 
 def test_cache_scoped_by_account_and_cluster(tmp_path):
@@ -104,12 +155,55 @@ def test_invalid_snapshot_fields(key):
         validate_snapshot(data, "aire", "demo")
 
 
-def test_storage_not_collected_is_accepted():
-    # The collector reports storage as null when it skipped it (an earlier
-    # df/quota/lfs still stuck); the snapshot stays valid, with no rows.
+def test_storage_not_collected_is_accepted_and_kept():
+    # The collector reports storage as null when it was not collected (a
+    # refresh between storage refreshes, an earlier df/quota/lfs still
+    # stuck). The snapshot stays valid and None stays None, meaning "keep
+    # the previous rows"; turning it into [] wiped them and the cache.
     data = copy.deepcopy(demo.snapshots()["aire"])
     data["storage"] = None
-    assert validate_snapshot(data, "aire", "demo")["storage"] == []
+    assert validate_snapshot(data, "aire", "demo")["storage"] is None
+
+
+def test_cache_keeps_uncollected_storage(tmp_path):
+    store = LocalStore(tmp_path)
+    data = copy.deepcopy(demo.snapshots()["aire"])
+    data["storage"] = None
+    store.save("demo", "aire", data, [])
+    assert store.load("demo", "aire")[0]["storage"] is None
+
+
+@pytest.mark.parametrize("value", ["2026-10-13T12:00:00+00:00", None])
+def test_storage_collection_time_accepted(value):
+    data = copy.deepcopy(demo.snapshots()["aire"])
+    data["storage_collected_at"] = value
+    assert validate_snapshot(data, "aire", "demo")["storage_collected_at"] == value
+
+
+@pytest.mark.parametrize("value", [123, "yesterday"])
+def test_bad_storage_collection_time_rejected(value):
+    data = copy.deepcopy(demo.snapshots()["aire"])
+    data["storage_collected_at"] = value
+    with pytest.raises(ValueError):
+        validate_snapshot(data, "aire", "demo")
+
+
+@pytest.mark.parametrize(
+    "section,key,value",
+    [
+        ("nodes", "cpu_other", "4"),
+        ("storage", "file_limit", -1),
+        ("storage", "available_gb", float("nan")),
+        ("jobs", "pending_task_count", "57"),
+        ("jobs", "array_job_id", [1]),
+        ("jobs", "array_pending_tasks", 5),
+    ],
+)
+def test_fields_the_rules_read_are_validated(section, key, value):
+    data = copy.deepcopy(demo.snapshots()["aire"])
+    data[section][0][key] = value
+    with pytest.raises(ValueError):
+        validate_snapshot(data, "aire", "demo")
 
 
 @pytest.mark.parametrize("value", ["8", {}, True, -1, float("nan"), float("inf")])

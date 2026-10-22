@@ -18,7 +18,11 @@ class Profile:
     id: str
     name: str
     host: str
-    gpu: str
+    # The Trends legend names each cluster's line by colour ("AIRE = green").
+    # There is deliberately no GPU model here: headings come from the GPU
+    # pools a snapshot reports (rules.GPUFleet), because one scheduler can
+    # host several models (Calder also runs AIRE's L40 node).
+    color_name: str
     color: str
     storage_spec: str
 
@@ -31,8 +35,8 @@ class Profile:
 
 
 PROFILES = (
-    Profile("aire", "AIRE", "aire.leeds.ac.uk", "L40S", "#36c99c", collector.AIRE_SPEC),
-    Profile("calder", "Calder", "calder.leeds.ac.uk", "H200", "#aa94f6", collector.CALDER_SPEC),
+    Profile("aire", "AIRE", "aire.leeds.ac.uk", "green", "#36c99c", collector.AIRE_SPEC),
+    Profile("calder", "Calder", "calder.leeds.ac.uk", "violet", "#aa94f6", collector.CALDER_SPEC),
 )
 USERNAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 
@@ -59,18 +63,28 @@ def validate_snapshot(data: Any, cluster_id: str, username: str) -> dict:
         raise ValueError("Snapshot belongs to a different account.")
     if not isinstance(data.get("collected_at"), str):
         raise ValueError("Invalid snapshot timestamp.")
-    # The collector reports storage as null when it was not collected this
-    # time (an earlier df/quota/lfs is still stuck on the login node); [] is
-    # "collected, no volumes". Show no storage rows rather than rejecting the
-    # whole snapshot.
-    if data.get("storage") is None:
-        data["storage"] = []
     datetime.fromisoformat(data["collected_at"])
-    for key in ("jobs", "nodes", "partitions", "storage", "errors", "warnings"):
+    # storage is None when it was not collected this time (skipped between
+    # storage refreshes, an earlier df/quota/lfs still stuck, or a round trip
+    # that ended before the section); [] is "collected, no volumes". None is
+    # kept as it is: rules.StorageTracker.receive then keeps the previous rows,
+    # instead of an empty list wiping them on screen and in the cache.
+    storage_rows = data.get("storage")
+    if storage_rows is not None and not isinstance(storage_rows, list):
+        raise ValueError("Invalid snapshot field: storage")
+    # Set by rules.StorageTracker.receive when the rows are older than the snapshot.
+    stamp = data.get("storage_collected_at")
+    if stamp is not None:
+        if not isinstance(stamp, str):
+            raise ValueError("Invalid storage timestamp.")
+        datetime.fromisoformat(stamp)
+    for key in ("jobs", "nodes", "partitions", "errors", "warnings"):
         if not isinstance(data.get(key), list):
             raise ValueError(f"Invalid snapshot field: {key}")
-    for key in ("jobs", "nodes", "partitions", "storage"):
-        if not all(isinstance(row, dict) for row in data[key]):
+    sections = {key: data[key] for key in ("jobs", "nodes", "partitions")}
+    sections["storage"] = storage_rows or []
+    for key, rows in sections.items():
+        if not all(isinstance(row, dict) for row in rows):
             raise ValueError(f"Invalid snapshot rows: {key}")
     for key in ("errors", "warnings"):
         if not all(isinstance(row, str) for row in data[key]):
@@ -78,10 +92,13 @@ def validate_snapshot(data: Any, cluster_id: str, username: str) -> dict:
     for row in data["jobs"]:
         if not isinstance(row.get("job_id"), str) or not isinstance(row.get("state"), str):
             raise ValueError("Invalid job row")
-    for row in data["storage"]:
+        if row.get("array_pending_tasks") is not None and not isinstance(row["array_pending_tasks"], str):
+            raise ValueError("Invalid job row")
+    for row in sections["storage"]:
         if not isinstance(row.get("label"), str) or not isinstance(row.get("source"), str):
             raise ValueError("Invalid storage row")
     numeric_fields = {
+        "jobs": ("array_job_id", "pending_task_count"),
         "nodes": (
             "gpu_total",
             "gpu_idle",
@@ -89,12 +106,22 @@ def validate_snapshot(data: Any, cluster_id: str, username: str) -> dict:
             "cpu_total",
             "cpu_idle",
             "cpu_allocated",
+            "cpu_other",
             "memory_mb",
         ),
-        "storage": ("used_gb", "quota_gb", "limit_gb", "used_percent", "file_count", "file_quota"),
+        "storage": (
+            "used_gb",
+            "quota_gb",
+            "limit_gb",
+            "available_gb",
+            "used_percent",
+            "file_count",
+            "file_quota",
+            "file_limit",
+        ),
     }
     for section, keys in numeric_fields.items():
-        for row in data[section]:
+        for row in sections[section]:
             for key in keys:
                 value = row.get(key)
                 if value is not None and (
@@ -125,29 +152,6 @@ def clean_history(history: Any) -> list:
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             pass
     return clean
-
-
-def metrics(snapshot: dict) -> dict:
-    nodes = snapshot.get("nodes", [])
-    usable = [
-        n
-        for n in nodes
-        if not any(
-            state in n.get("state", "").lower()
-            for state in ("down", "drain", "fail", "maint", "unknown", "not_resp", "no_resp")
-        )
-        and not any(mark in n.get("state", "") for mark in ("*", "~", "#", "!", "%"))
-    ]
-    # Unknown allocation must never be advertised as free capacity.
-    gpu = [n.get("gpu_idle") for n in usable if n.get("gpu_total")]
-    cpu = [n.get("cpu_idle") for n in usable]
-    return {
-        "running": sum(j.get("state") == "RUNNING" for j in snapshot.get("jobs", [])),
-        "pending": sum(j.get("state") == "PENDING" for j in snapshot.get("jobs", [])),
-        "gpu_idle": sum(gpu) if gpu and all(v is not None for v in gpu) else None,
-        "cpu_idle": sum(cpu) if cpu and all(v is not None for v in cpu) else None,
-        "unavailable": len(nodes) - len(usable),
-    }
 
 
 # File names inside the data folder. Existing installs already have files
