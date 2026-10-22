@@ -48,7 +48,20 @@ Each cluster has its own session, refresh loop, cache, notifications, terminals 
 
 Partitions the app does not know (for example the `aire-*` nodes currently hosted by Calder's scheduler) are still classified from Slurm's own data. You can switch either cluster off under **Advanced**. Adding a cluster means adding one profile (hosts, storage paths, partition roles) to [`ClusterProfile.swift`](Sources/AIREMonitorApp/ClusterProfile.swift).
 
-## Quick start
+## Windows version
+
+A read-only Windows desktop port is available in [`windows/`](windows/), with
+both clusters, SSH/Duo login, dashboards, local history, a tray icon and file/log
+previews. It reuses the Python collector; the macOS app below is unchanged.
+See [Windows setup, portable builds and limitations](WINDOWS_APP.md).
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r windows\requirements.txt
+.\scripts\run_windows_app.ps1
+```
+
+## Quick start (macOS)
 
 **Requirements:** macOS 13 or newer, the Xcode Command Line Tools (Swift 6), and network access to the login hosts — on the University VPN or campus network, or through the `rash.leeds.ac.uk` jump host.
 
