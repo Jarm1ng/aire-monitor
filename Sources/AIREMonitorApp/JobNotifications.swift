@@ -109,7 +109,14 @@ final class UserNotificationCenterPoster: NotificationPosting {
     }
 
     func authorizationStatus() async -> UNAuthorizationStatus {
-        await center.notificationSettings().authorizationStatus
+        // Only the status crosses back to the main actor: UNNotificationSettings
+        // is not Sendable in the macOS 15 SDK (CI's), so it never leaves the
+        // callback.
+        await withCheckedContinuation { continuation in
+            center.getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
     }
 
     func requestAuthorization() async throws -> Bool {

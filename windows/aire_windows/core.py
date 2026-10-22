@@ -58,6 +58,12 @@ def validate_snapshot(data: Any, cluster_id: str, username: str) -> dict:
         raise ValueError("Snapshot belongs to a different account.")
     if not isinstance(data.get("collected_at"), str):
         raise ValueError("Invalid snapshot timestamp.")
+    # The collector reports storage as null when it was not collected this
+    # time (an earlier df/quota/lfs is still stuck on the login node); [] is
+    # "collected, no volumes". Show no storage rows rather than rejecting the
+    # whole snapshot.
+    if data.get("storage") is None:
+        data["storage"] = []
     datetime.fromisoformat(data["collected_at"])
     for key in ("jobs", "nodes", "partitions", "storage", "errors", "warnings"):
         if not isinstance(data.get(key), list):

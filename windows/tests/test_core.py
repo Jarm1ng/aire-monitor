@@ -104,6 +104,14 @@ def test_invalid_snapshot_fields(key):
         validate_snapshot(data, "aire", "demo")
 
 
+def test_storage_not_collected_is_accepted():
+    # The collector reports storage as null when it skipped it (an earlier
+    # df/quota/lfs still stuck); the snapshot stays valid, with no rows.
+    data = copy.deepcopy(demo.snapshots()["aire"])
+    data["storage"] = None
+    assert validate_snapshot(data, "aire", "demo")["storage"] == []
+
+
 @pytest.mark.parametrize("value", ["8", {}, True, -1, float("nan"), float("inf")])
 def test_invalid_cached_capacity_rejected(value, tmp_path):
     data = demo.snapshots()["aire"]

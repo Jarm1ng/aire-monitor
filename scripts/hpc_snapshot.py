@@ -1384,6 +1384,25 @@ def merge_node_summary(left: NodeSummary, right: NodeSummary) -> NodeSummary:
 
 
 # ---------------------------------------------------------------------------
+# The clusters' storage specs
+# ---------------------------------------------------------------------------
+
+# Public: the Windows and Linux apps (windows/, linux/) import this module and
+# build their cluster profiles from these, and the tests use them. Keep them
+# identical to the storage of the macOS app's ClusterProfile.swift.
+AIRE_SPEC = (
+    '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
+    '{"label":"Scratch","paths":["/scratch-aire/users/$USER","/mnt/scratch/$USER","/mnt/scratch/users/$USER"],"quota":"lustre"},'
+    '{"label":"Flash","paths":["/flash-aire/users/$USER","/mnt/flash/$USER","/mnt/flash/users/$USER"],"quota":"lustre","optional":true}]'
+)
+CALDER_SPEC = (
+    '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
+    '{"label":"Scratch","paths":["/scratch-calder/users/$USER","/scratch-calder/$USER"],"quota":"lustre"},'
+    '{"label":"Flash","paths":["/flash-calder/users/$USER","/flash-calder/$USER"],"quota":"lustre","optional":true}]'
+)
+
+
+# ---------------------------------------------------------------------------
 # Storage spec: parsing, safe remote rendering, and output parsing
 # ---------------------------------------------------------------------------
 

@@ -71,16 +71,10 @@ hs = load_collector()
 USER = "abcd1234"
 OTHER_USER = "efgh5678"
 
-AIRE_SPEC = (
-    '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
-    '{"label":"Scratch","paths":["/scratch-aire/users/$USER","/mnt/scratch/$USER","/mnt/scratch/users/$USER"],"quota":"lustre"},'
-    '{"label":"Flash","paths":["/flash-aire/users/$USER","/mnt/flash/$USER","/mnt/flash/users/$USER"],"quota":"lustre","optional":true}]'
-)
-CALDER_SPEC = (
-    '[{"label":"Home","paths":["$HOME"],"quota":"nfs"},'
-    '{"label":"Scratch","paths":["/scratch-calder/users/$USER","/scratch-calder/$USER"],"quota":"lustre"},'
-    '{"label":"Flash","paths":["/flash-calder/users/$USER","/flash-calder/$USER"],"quota":"lustre","optional":true}]'
-)
+# The collector's own constants: the Windows and Linux apps build their
+# cluster profiles from them, so they must stay public and parse.
+AIRE_SPEC = hs.AIRE_SPEC
+CALDER_SPEC = hs.CALDER_SPEC
 
 # The fixture's reference time: running jobs' elapsed time is computed
 # against it, and the canned epochs are relative to it.
