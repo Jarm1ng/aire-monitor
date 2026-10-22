@@ -37,4 +37,7 @@ jobs:
         env:
           # The `runner` context is only available at step level.
           HPC_TEST_BUILD_DIR: ${{ runner.temp }}/hpc-tests-build
+          # Three cores: run the Swift tests one at a time, so tests that wait
+          # on child processes cannot starve the shared thread pool.
+          HPC_SWIFT_TEST_ARGS: --no-parallel
         run: scripts/test_all.sh

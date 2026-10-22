@@ -204,6 +204,11 @@ struct CollectorContractTests {
         process.executableURL = URL(fileURLWithPath: python)
         process.arguments = ["-I", script, "-k", "ContractFixtureTests"]
         process.currentDirectoryURL = Self.repositoryRoot
+        // Without xcrun's SDKROOT, which sends /usr/bin/python3 through
+        // xcodebuild on a Mac with full Xcode (see FileScriptTests).
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SDKROOT")
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         let output = Pipe()
         process.standardOutput = output

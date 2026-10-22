@@ -367,7 +367,9 @@ else:
 PY
 
 helper() {
-    perl -e 'alarm shift; exec @ARGV' 60 /usr/bin/python3 -I -c "$PROCESS_HELPER" "$@"
+    # Without SDKROOT: with it set, /usr/bin/python3 on a Mac with full Xcode
+    # resolves itself through xcodebuild (slow, and broken for a bogus value).
+    perl -e 'alarm shift; exec @ARGV' 60 /usr/bin/env -u SDKROOT /usr/bin/python3 -I -c "$PROCESS_HELPER" "$@"
 }
 
 # --- Running copies -------------------------------------------------------

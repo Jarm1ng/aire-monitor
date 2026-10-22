@@ -340,14 +340,21 @@ struct MonitorService: Sendable {
         childEnvironment(from: ProcessInfo.processInfo.environment)
     }
 
-    /// `environment` minus the password variables (testable form).
+    /// `environment` minus the password variables and the build-only
+    /// variables (testable form).
     static func childEnvironment(from environment: [String: String]) -> [String: String] {
         var environment = environment
-        for name in passwordEnvironmentNames {
+        for name in passwordEnvironmentNames + buildOnlyEnvironmentNames {
             environment.removeValue(forKey: name)
         }
         return environment
     }
+
+    /// Set by xcrun (and so by `swift`, a build or a shell that exported
+    /// it), never needed by a child. With SDKROOT set, /usr/bin/python3 on a
+    /// Mac with full Xcode resolves itself through `xcodebuild -sdk … -find`
+    /// on every call, seconds each (the collector runs every 10 s).
+    static let buildOnlyEnvironmentNames = ["SDKROOT"]
 
     /// Every name a password was ever exported under, current and legacy.
     static let passwordEnvironmentNames = ["HPC_PASSWORD", "HPC_ASKPASS_PASSWORD", "AIRE_PASSWORD", "AIRE_ASKPASS_PASSWORD"]

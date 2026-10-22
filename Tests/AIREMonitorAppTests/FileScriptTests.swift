@@ -63,6 +63,10 @@ private func runScript(
     process.executableURL = URL(fileURLWithPath: python)
     process.arguments = ["-I", "-c", script] + arguments
     var environment = ProcessInfo.processInfo.environment
+    // swift test runs under xcrun, which exports SDKROOT; with it set,
+    // /usr/bin/python3 on a Mac with full Xcode (CI) resolves itself through
+    // xcodebuild on every call, which can stall for a minute.
+    environment.removeValue(forKey: "SDKROOT")
     environment["HOME"] = home.path
     for (key, value) in extra {
         environment[key] = value

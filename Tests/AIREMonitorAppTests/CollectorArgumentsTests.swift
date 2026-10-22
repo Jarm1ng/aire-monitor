@@ -124,7 +124,8 @@ struct HelperProcessTests {
             "HPC_PASSWORD": "secret",
             "HPC_ASKPASS_PASSWORD": "secret",
             "AIRE_PASSWORD": "secret",
-            "AIRE_ASKPASS_PASSWORD": "secret"
+            "AIRE_ASKPASS_PASSWORD": "secret",
+            "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
         ]
         let scrubbed = MonitorService.childEnvironment(from: inherited)
         #expect(scrubbed == ["PATH": "/usr/bin:/bin"])

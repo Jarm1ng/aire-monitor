@@ -78,7 +78,12 @@ run_swift() {
     banner "Swift tests"
     # A cold build (SwiftTerm, the app, the test bundle) takes a few minutes
     # on a CI runner; the tests themselves take seconds.
-    run_limited 1800 "$ROOT_DIR/Tests/AIREMonitorAppTests/run_tests.sh"
+    # HPC_SWIFT_TEST_ARGS goes to swift test, e.g. --no-parallel on a CI
+    # runner with few cores, where tests that wait on child processes would
+    # otherwise starve the shared thread pool and make time-limited tests
+    # fail for no reason of their own.
+    # shellcheck disable=SC2086
+    run_limited 1800 "$ROOT_DIR/Tests/AIREMonitorAppTests/run_tests.sh" ${HPC_SWIFT_TEST_ARGS:-}
     record swift "swift test" $?
 
     # The tests link the app but not the desktop widget, so build the widget

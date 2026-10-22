@@ -49,6 +49,12 @@ public enum WidgetProcessRunner {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
+        // Without SDKROOT (exported by xcrun to anything a build or a shell
+        // started): with it set, /usr/bin/python3 on a Mac with full Xcode
+        // resolves itself through xcodebuild on every run.
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SDKROOT")
+        process.environment = environment
         if let currentDirectory {
             process.currentDirectoryURL = currentDirectory
         }
