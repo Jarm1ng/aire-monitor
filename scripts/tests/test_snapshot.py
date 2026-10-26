@@ -1921,6 +1921,7 @@ class JobUsageParsingTests(unittest.TestCase):
         self.assertFalse(any("job_usage" in warning for warning in snapshot.warnings))
 
 
+@unittest.skipUnless(os.path.exists("/bin/sh") and shutil.which("awk"), "needs /bin/sh and awk")
 class JobUsageScriptTests(unittest.TestCase):
     """The job_usage section run for real, in every available shell, with
     stub squeue/scontrol/ssh/nvidia-smi/date/sleep and fake cgroup files.
