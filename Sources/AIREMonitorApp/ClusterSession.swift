@@ -248,6 +248,11 @@ final class ClusterSession: ObservableObject, Identifiable {
     /// report the drop and, if allowed, sign in again. Cleared once the
     /// session is live again, signed out, or re-targeted.
     @Published private(set) var droppedAt: Date?
+    /// The last sign-in failed (wrong password, Duo declined, timed out…)
+    /// and nothing has replaced it since: no new sign-in, no session found,
+    /// no sign-out. Unlike `errorMessage`, a failed refresh never sets it,
+    /// so the menu bar only badges a real sign-in failure.
+    @Published private(set) var signInFailed = false
 
     let dashboard = ClusterDashboardState()
     let terminals: TerminalManager
@@ -697,6 +702,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         set(\.isRefreshing, false)
         set(\.isLoginQueued, false)
         set(\.isLoggedIn, false)
+        set(\.signInFailed, false)
         set(\.errorMessage, nil)
         set(\.schedulerIssue, nil)
         set(\.lastRefreshFailure, nil)
@@ -820,8 +826,10 @@ final class ClusterSession: ObservableObject, Identifiable {
         }
         isLoginQueued = false
         loginCancelRequested = false
+        set(\.signInFailed, false)
         let loginSettings = settings(using: configuration)
         guard !loginSettings.username.isEmpty else {
+            set(\.signInFailed, true)
             errorMessage = "Username is required."
             startBackgroundRefresh()
             return .failed
@@ -938,6 +946,7 @@ final class ClusterSession: ObservableObject, Identifiable {
                 return finishCancelledLogin()
             }
             set(\.isLoggedIn, false)
+            set(\.signInFailed, true)
             isLoggingIn = false
             set(\.loginProgress, nil)
             set(\.hasCompletedFirstProbe, true)
@@ -975,6 +984,7 @@ final class ClusterSession: ObservableObject, Identifiable {
 
     private func finishCancelledLogin() -> LoginOutcome {
         loginCancelRequested = false
+        set(\.signInFailed, false)
         isLoggingIn = false
         set(\.loginProgress, nil)
         set(\.errorMessage, nil)
@@ -1077,6 +1087,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         let previous = activeConnection ?? lastActiveConnection
         set(\.isLoggedIn, false)
         set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         lastActiveConnection = nil
         // A new route is a fresh question ("is a master there?"), probed
         // and then watched like any other.
@@ -1138,6 +1149,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         adoptionTask = nil
         set(\.isLoggedIn, false)
         set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         lastActiveConnection = nil
         set(\.schedulerIssue, nil)
         set(\.errorMessage, nil)
@@ -1793,6 +1805,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         signedOutStatusLine = nil
         set(\.isLoggedIn, true)
         set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         if activeConnection == nil {
             // Live without a sign-in in this run: a master from before (the
             // previous run, the command line, an older release).

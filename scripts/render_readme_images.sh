@@ -76,6 +76,6 @@ nodes-dark 2000
 trends-dark 2000
 job-usage-dark 1300
 sessions-dark 760
-menubar-dark 800
+menubar-dark 680
 LIST
 echo "README images written to docs/images/"

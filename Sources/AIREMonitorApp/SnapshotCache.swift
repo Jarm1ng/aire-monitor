@@ -326,6 +326,8 @@ struct AppPreferences: Codable, Equatable {
     var reconnectAutomatically: Bool = true
     /// Sample running jobs' GPU, CPU and memory use on their nodes.
     var sampleJobUsage: Bool = true
+    /// What the menu bar item shows next to its icon.
+    var menuBarTitleMode: StatusTitleMode = .runningJobs
     /// Keyed by ClusterID.rawValue.
     var clusters: [String: ClusterPreference] = [:]
     /// "overview" or "cluster:<id>".
@@ -342,6 +344,7 @@ struct AppPreferences: Codable, Equatable {
         case shareSessions
         case reconnectAutomatically
         case sampleJobUsage
+        case menuBarTitleMode
         case clusters
         case selection
     }
@@ -358,6 +361,7 @@ struct AppPreferences: Codable, Equatable {
         shareSessions = (try? container.decodeIfPresent(Bool.self, forKey: .shareSessions)) ?? true
         reconnectAutomatically = (try? container.decodeIfPresent(Bool.self, forKey: .reconnectAutomatically)) ?? true
         sampleJobUsage = (try? container.decodeIfPresent(Bool.self, forKey: .sampleJobUsage)) ?? true
+        menuBarTitleMode = (try? container.decodeIfPresent(StatusTitleMode.self, forKey: .menuBarTitleMode)) ?? .runningJobs
         clusters = try container.decodeIfPresent([String: ClusterPreference].self, forKey: .clusters) ?? [:]
         selection = try container.decodeIfPresent(String.self, forKey: .selection)
     }

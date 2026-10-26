@@ -118,6 +118,9 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         }
     }
 
+    /// What the menu bar item shows next to its icon ("Show in Menu Bar").
+    @Published var menuBarTitleMode: StatusTitleMode
+
     /// "Share sessions with Terminal": link the live masters into ~/.ssh so
     /// `ssh aire`, scp, rsync and Claude sessions ride them.
     @Published var shareSessions: Bool
@@ -231,6 +234,7 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         rememberPassword = preferences.rememberPassword
         shareSessions = preferences.shareSessions
         sampleJobUsage = preferences.sampleJobUsage
+        menuBarTitleMode = preferences.menuBarTitleMode
         reconnectAutomatically = preferences.reconnectAutomatically
         notifyWhenGPUFrees = defaults.bool(forKey: Self.notifyWhenGPUFreesKey)
         selection = SidebarSelection(storageKey: preferences.selection) ?? .overview
@@ -925,6 +929,7 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         preferences.rememberPassword = rememberPassword
         preferences.shareSessions = shareSessions
         preferences.sampleJobUsage = sampleJobUsage
+        preferences.menuBarTitleMode = menuBarTitleMode
         preferences.reconnectAutomatically = reconnectAutomatically
         preferences.selection = selection.storageKey
         for session in sessions {
@@ -947,6 +952,7 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             $rememberPassword.map { _ in () }.eraseToAnyPublisher(),
             $shareSessions.map { _ in () }.eraseToAnyPublisher(),
             $sampleJobUsage.map { _ in () }.eraseToAnyPublisher(),
+            $menuBarTitleMode.map { _ in () }.eraseToAnyPublisher(),
             $reconnectAutomatically.map { _ in () }.eraseToAnyPublisher(),
             $selection.map { _ in () }.eraseToAnyPublisher()
         ]

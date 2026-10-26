@@ -110,25 +110,19 @@ struct SessionsCard: View {
             let detail = session.isLoggingIn || session.isLoginQueued ? "signing in…" : "not signed in"
             return Row(id: session.id.rawValue, name: name, detail: detail, tone: .idle, help: "")
         }
-        let when = drop.at.formatted(date: .omitted, time: .shortened)
-        let lasted = drop.lasted.map { " after \(SessionAge.text($0))" } ?? ""
-        let next: String
-        switch model.autoReconnect.state(of: session.id) {
-        case .attempting?:
-            next = "signing in again"
-        case .pending?:
-            next = model.reconnectAutomatically ? "signs in again when you're back" : "sign in to continue"
-        case .suspended?:
-            next = "sign in to continue"
-        case nil:
-            next = session.isLoggingIn || session.isLoginQueued ? "signing in…" : "sign in to continue"
-        }
+        let note = SessionDropNote.make(
+            drop: drop,
+            state: model.autoReconnect.state(of: session.id),
+            reconnectAutomatically: model.reconnectAutomatically,
+            isSigningIn: session.isLoggingIn || session.isLoginQueued
+        )
+        let lasted = note.lasted.map { " after \($0)" } ?? ""
         return Row(
             id: session.id.rawValue,
             name: name,
-            detail: "dropped \(when)\(lasted) · \(next)",
+            detail: note.cardText,
             tone: .dropped,
-            help: "The \(name) session ended on its own at \(when)\(lasted) (sleep, a network change or the VPN ending)."
+            help: "The \(name) session ended on its own at \(note.when)\(lasted) (sleep, a network change or the VPN ending)."
         )
     }
 

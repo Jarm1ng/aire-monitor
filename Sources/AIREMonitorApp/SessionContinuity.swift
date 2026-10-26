@@ -257,3 +257,52 @@ struct SessionDrop: Equatable {
     let at: Date
     let lasted: TimeInterval?
 }
+
+/// How a dropped session is worded, shared by the Sessions card and the
+/// menu bar so the two can never describe one drop differently.
+struct SessionDropNote: Equatable {
+    /// "14:05": when the session dropped.
+    let when: String
+    /// "11 h 52 min": how long it had been up; nil when unknown.
+    let lasted: String?
+    /// What happens next: "sign in to continue", "signing in again", …
+    let next: String
+
+    static func make(
+        drop: SessionDrop,
+        state: AutoReconnectPolicy.State?,
+        reconnectAutomatically: Bool,
+        isSigningIn: Bool
+    ) -> SessionDropNote {
+        let next: String
+        switch state {
+        case .attempting?:
+            next = "signing in again"
+        case .pending?:
+            next = reconnectAutomatically ? "signs in again when you're back" : "sign in to continue"
+        case .suspended?:
+            next = "sign in to continue"
+        case nil:
+            next = isSigningIn ? "signing in…" : "sign in to continue"
+        }
+        return SessionDropNote(
+            when: drop.at.formatted(date: .omitted, time: .shortened),
+            lasted: drop.lasted.map { SessionAge.text($0) },
+            next: next
+        )
+    }
+
+    /// The Sessions card's line: "dropped 14:05 after 3 h 10 min · sign in to continue".
+    var cardText: String {
+        "dropped \(when)\(lasted.map { " after \($0)" } ?? "") · \(next)"
+    }
+
+    /// The menu's note under the "Dropped 14:05" header:
+    /// "Lasted 11 h 52 min · sign in to continue".
+    var menuText: String {
+        guard let lasted else {
+            return next.prefix(1).uppercased() + next.dropFirst()
+        }
+        return "Lasted \(lasted) · \(next)"
+    }
+}

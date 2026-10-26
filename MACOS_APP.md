@@ -94,7 +94,7 @@ AppModel (coordinator, one per app: AppEnvironment.model)
 └── rash route only: ~/.ssh/ctl/jump-<hash>.sock, shared by every cluster's tunnel
 
 Views: ContentView (sidebar + Overview or one ClusterDashboardView)
-       StatusBarMonitorController + MenuBarMonitorView (menu bar)
+       StatusBarMonitorController + StatusMenuBuilder (menu bar)
 Separate process: AIREDesktopWidget (reads .runtime/clusters/*/ and the enabled flags in .runtime/preferences.json)
 ```
 
@@ -501,15 +501,79 @@ The overview is the default landing page (`OverviewDashboard`). Two rules shape 
 
 ## Menu Bar Monitor
 
-While the main app runs, it installs a native AppKit status item (`StatusBarMonitorController`) that summarises every enabled cluster:
+While the main app runs, it installs a native AppKit status item (`StatusBarMonitorController`). The item and its menu are built from one `MenuBarDigest`, so they never disagree.
 
-- **Title.** Built from **live** clusters only; cached or paused figures may describe jobs that ended hours ago, so they are named, with their time, in the tooltip instead. A live cluster whose Slurm is failing (`schedulerIssue`) counts as not live here, because its figures are only carried forward. `C · train 9h 29m` (monogram, job name middle-truncated to fit, elapsed) when exactly one job is running across live clusters; `3 jobs` when several are; otherwise each live cluster's largest GPU pool, such as `A 6 · C 27+` (`A ?` while nothing is known idle only because allocation is unknown; `+` when another model also has idle GPUs, which a pool of unknown allocation never earns; pools are never summed); otherwise a state word (`Signing in`, `Checking`, `Syncing`, `Ready`, `Slurm error`, `Cached`, `Paused`, `Offline`, `Off`). The width is reserved from a digit-stable template, so the item does not jitter on every tick.
-- **Icon tint** shows combined health: green when every enabled cluster is live with Slurm answering; orange when only some are (a Slurm error included), or a check, sign-in or first collection is running; red when nothing is live or shown and a cluster reports an error; dimmed when only cached or paused figures exist, or nothing is connected. With every cluster off, it is a plain template icon.
-- **Tooltip**: one block per cluster (connection state, sign-in progress, job counts with held jobs named apart from pending ones, one line per GPU pool such as "H200: 0 of 56 idle · 34 in use · 7 stranded · 15 unavailable", storage pressure; figures that are not live carry their collection time, and a Slurm-error cluster's counts are marked "(not current)"), then the shared home quota once.
-- **Dropdown** (`MenuBarMonitorView`): a combined header, then one compact section per cluster with its state pill, a single action (Connect, a plain sign-in; Resume; or turn monitoring on), the job counts ("9 running · 1 pending · 11 held") over the first three jobs, then "+N more", or "+37 more jobs in 16 rows" once a hidden array remainder stands for several tasks, so the rows and the count line add up, then GPU pool and storage meters. A GPU row reads "K of M idle" in the shared pool tone beside the overview's segmented capacity meter, with the GPUs that are not idle under it ("34 in use · 7 stranded · 15 unavailable"); when nothing is known idle only because allocation is unknown it reads "? of 9 idle" in grey over "9 unknown". A Slurm-error cluster's section hides "Updated N ago", greys its figures and shows a warning row ("… — showing the previous figures"). Storage rows use the Storage tab's tone: warning from 75 %, critical from 90 % or over quota, judged on the larger of space and file count. The shared home appears once below the sections, then any app-level error, then footer actions: Refresh all (enabled only when some cluster can refresh), Dashboard, Widget and Quit (which still goes through the quit prompt).
-- **Opening the menu** calls `refreshAllQuietly()`, which honours pause, skips clusters never signed in or signed out with Disconnect, and never surfaces an error, so a glance shows data at most a few seconds old without starting a sign-in.
+### The status item
 
-The status item and the dropdown are both built from one `MenuBarDigest`, so the title and the panel beneath it never disagree. The item is only touched when its visible signature changes, and the dropdown re-renders only while it is open.
+- **Glyph.** One shape in every state: the app's rack emblem (`server.rack`), drawn as a template image (`StatusItemGlyph`), so AppKit draws it correctly in each of these cases:
+  - light and dark menu bars;
+  - the open (highlighted) state;
+  - Increase Contrast and Reduce Transparency.
+- **Dimmed and badged.** The glyph is dimmed (`appearsDisabled`) while no enabled cluster is live with Slurm answering: checking, signing in, not connected, cached, paused or off. It carries a small knocked-out "!" badge only when something needs the user (`MenuBarDigest.attention`):
+  - a session dropped on its own (`ClusterSession.droppedAt`, so never after a Disconnect);
+  - a sign-in failed and is not being retried;
+  - Slurm is not answering.
+
+  Not connected, off, paused, an ageing session, storage and GPU verdicts never badge; the menu shows them.
+- **Title.** The user chooses it under **Show in Menu Bar** (`StatusTitleMode`, saved in preferences):
+  - **Running Jobs** (the default): "7 running", the live running count, or nothing (just the glyph) while nothing runs.
+  - **Idle GPUs**: each live cluster's largest pool, such as `A 4 · C 16+`. `A ?` means allocation is unknown. `+` means another model has idle GPUs. Pools are never summed.
+  - **Icon Only**: no title.
+
+  Only live clusters feed a title: cached, paused or Slurm-error figures may describe jobs that ended hours ago. State words, job names and elapsed times never appear in it.
+- **Width.** The width is reserved per class (`StatusWidthClass`):
+  - glyph only: the system's square;
+  - "88 running" for 1–99 running jobs (at most 104 pt);
+  - the digit-stable GPU template (at most 130 pt).
+
+  It changes only when the class does, never on a refresh tick.
+- **Tooltip and VoiceOver.** The tooltip has, in order:
+  1. a headline ("7 jobs running — AIRE 2, Calder 5");
+  2. one "Needs a look: …" line per badge reason;
+  3. one block per cluster (connection, job counts with "(as of 14:05)" or "(not current)", one line per GPU pool, storage pressure);
+  4. the shared home, only under pressure.
+
+  VoiceOver reads a sentence that starts "Leeds HPC Monitor: …".
+
+### The menu
+
+The menu is a real NSMenu (`StatusMenuBuilder`), built from `MenuBarMenuLayout`, a pure list of `MenuEntry` values:
+- **Native items** carry everything you act on, so they get the system highlight, arrow keys, type-select and native scrolling.
+- **Disabled hosted SwiftUI rows** carry what needs a meter or a tone colour: cluster headers, GPU pools, storage warnings and notes. They draw no background or material of their own.
+- **Open-menu updates.** An open menu is updated in place by entry id, so the highlight never jumps.
+- **Native titles** carry no colour, so they still invert when highlighted. Trailing figures sit at a right-aligned tab stop. A long name is shortened in the middle, never its job id.
+
+Per cluster, in catalog order:
+- **Live**: a header (badge, name, "up 3 h 13 min", orange from 11 h) and the counts row ("2 running · 61 pending ▸"). Then up to three running jobs ("1h 08m of 4h"), with jobs whose GPUs sit idle listed first and marked ⚠︎. Then one GPU row per pool: the meter, "16 of 56 idle", and the reason when none is idle. Then storage rows only from 75 %.
+- **Slurm not answering**: a note and the counts row marked "(not current)"; no jobs, GPU or storage rows.
+- **Checking or collecting the first snapshot**: the header alone, never a Connect.
+- **Waiting or signing in**: the progress note ("Waiting for Duo approval on your phone") and Cancel.
+- **Dropped**: "Dropped 14:05", the shared `SessionDropNote` ("Lasted 11 h 52 min · sign in to continue"), and Connect.
+- **Sign-in failed**: the error's first line and Connect.
+- **Not connected**: Connect.
+- **Cached**: "Cached · 14:05", Connect, and "As of 14:05: …".
+- **Paused**: Resume.
+- **Off**: Turn On.
+
+The counts row's submenu lists every queued job under Running, Pending and Held, at most 20 rows, then "+N more", which adds up with the counts. It ends with Open … in Dashboard.
+
+Below the clusters come, when present: the shared home (only under pressure), an app error, and a "Signed in 11 h ago" note once the oldest live leg is 11 h old (the rash jump session counts). Then the footer:
+- Open Dashboard;
+- Open Desktop Widget;
+- Renew All Sessions…;
+- Show in Menu Bar ▸;
+- Quit Leeds HPC Monitor.
+
+Behaviour:
+- **Job rows** open the job's sheet (`AppModel.showJob`).
+- **Connect** is a plain sign-in, which reuses an open session.
+- **Renew All Sessions…** asks first, in an `SessionActionAlert` built from the same `SessionActionConfirmation` the sidebar uses. It checks again on confirm that no sign-in has started meanwhile.
+- **Never in the menu**: Reconnect, Disconnect, Pause and route changes. They stay in the dashboard behind its confirmations.
+- **Quit** still goes through the app's quit prompt.
+- **Commands run after the menu closes.**
+- **Opening the menu** builds it from the latest digest and calls `refreshAllQuietly()`, which never starts a sign-in or paints an error.
+
+An NSMenu cannot be rendered offscreen, so the renders (`scripts/render_previews.sh`, the README image) use `MenuBarMenuPreview`. It is a test-only stand-in that draws the same entries with the same rows: close to the real menu, but not identical.
 
 ## Current Views
 
@@ -530,7 +594,7 @@ Tabs:
 - **Storage**: one card per reported space, with used percentage, headroom, limit, file-count pressure, and how it is measured (NFS quota, Lustre project or user quota, or filesystem totals from `df`)
 - **Files** and **Terminal**, as above
 
-Detail tables are hidden by default behind `Show Details`. State classification, GPU counting and time handling come from HPCCore; `SlurmFormatting.swift` holds the app-side state colours and formatting. Sizes are binary: storage (`formatGB`) reads "12.3 GiB", whole GiB from 100 GiB up to 10 TiB ("2,458 GiB"), then TiB, and node memory on the Nodes and Partitions cards (`formatMemoryGB`) switches to TiB at 1 TiB ("754 GiB", "1.5 TiB"). Nodes that accept no work (down, drained, maintenance) are grey everywhere, and so is a partition with no usable node; red is reserved for faults (failed jobs, critical storage, a partition Slurm reports down or inactive) and orange for warnings. Occupancy is capacity, not a status: allocated nodes are blue and mixed ones a paler blue, never orange. A GPU pool has one tone on every surface (`GPUPool.idleTone`: the overview tile, the cluster header chip, the menu bar row): green while some GPU is idle, orange when the pool is known to be full, never red, and grey when every node is unavailable or nothing is known idle only because allocation is unknown. The Trends capacity signal agrees (adding orange for tight capacity), and the Nodes ring is capped at orange. The visual language uses macOS system materials for the sidebar, cards, menu panel and widget shell, with each cluster's accent colour (AIRE green, Calder violet) on its badge, tabs and terminal chrome. Motion is restrained: hover lift on cards, smooth meter changes, and animated detail surfaces.
+Detail tables are hidden by default behind `Show Details`. State classification, GPU counting and time handling come from HPCCore; `SlurmFormatting.swift` holds the app-side state colours and formatting. Sizes are binary: storage (`formatGB`) reads "12.3 GiB", whole GiB from 100 GiB up to 10 TiB ("2,458 GiB"), then TiB, and node memory on the Nodes and Partitions cards (`formatMemoryGB`) switches to TiB at 1 TiB ("754 GiB", "1.5 TiB"). Nodes that accept no work (down, drained, maintenance) are grey everywhere, and so is a partition with no usable node; red is reserved for faults (failed jobs, critical storage, a partition Slurm reports down or inactive) and orange for warnings. Occupancy is capacity, not a status: allocated nodes are blue and mixed ones a paler blue, never orange. A GPU pool has one tone on every surface (`GPUPool.idleTone`: the overview tile, the cluster header chip, the menu bar row): green while some GPU is idle, orange when the pool is known to be full, never red, and grey when every node is unavailable or nothing is known idle only because allocation is unknown. The Trends capacity signal agrees (adding orange for tight capacity), and the Nodes ring is capped at orange. The visual language uses macOS system materials for the sidebar, cards and widget shell, with each cluster's accent colour (AIRE green, Calder violet) on its badge, tabs and terminal chrome. Motion is restrained: hover lift on cards, smooth meter changes, and animated detail surfaces.
 
 ## Branding
 
@@ -588,7 +652,7 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `JobsDashboard.swift`, `PartitionsDashboard.swift`, `NodesDashboard.swift`, `TrendsDashboard.swift`, `TrendSeries.swift`, `StorageDashboard.swift`, `SlurmFormatting.swift` | cluster tabs |
 | `FilesDashboard.swift`, `FileBrowserModel.swift`, `FileActivity.swift`, `FileActivityStrip.swift`, `FilePreviewSheet.swift`, `TrashSheet.swift`, `RemoteTrashModel.swift`, `RemoteFileService.swift`, `RemoteFileRules.swift`, `RemoteFileScripts.swift` | file manager |
 | `TerminalDashboard.swift`, `TerminalManager.swift`, `TerminalQuickCommands.swift` | terminal |
-| `StatusBarMonitorController.swift`, `StatusBarSummary.swift`, `MenuBarModel.swift`, `MenuBarMonitorView.swift` | menu bar |
+| `StatusBarMonitorController.swift`, `StatusBarSummary.swift`, `MenuBarModel.swift`, `MenuBarMenuLayout.swift`, `StatusMenuBuilder.swift` | menu bar: the status item, the digest, the menu as data, and the native menu |
 | `Sources/AIREDesktopWidget/` | widget: `WidgetModel` (discovery, opening the app), `ClusterFeed` (one cluster's feed), views |
 | `scripts/build_bundle.sh`, `run_macos_app.sh`, `run_desktop_widget.sh` | build, sign and launch the bundles in `.runtime/` |
 | `scripts/install_app.sh` | install, update or remove `Leeds HPC Monitor.app` in `/Applications` (or `HPC_INSTALL_DIR`, `~/Applications`) |

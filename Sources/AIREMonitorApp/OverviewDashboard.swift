@@ -159,20 +159,12 @@ struct OverviewDashboard: View {
     /// cluster view already finds the job when it appears and its
     /// `sheet(item:)` presents it straight away.
     private func openJob(_ entry: OverviewJobEntry) {
-        guard let session = model.session(for: entry.profile.id) else {
-            return
-        }
-        session.dashboard.selectedTab = .jobs
-        session.dashboard.selectedJob = entry.job
-        model.selection = .cluster(entry.profile.id)
+        model.selectJob(entry.job.jobId, on: entry.profile.id)
     }
 
     /// Opens a cluster, on `tab` when given.
     private func openCluster(_ id: ClusterID, _ tab: DashboardTab?) {
-        if let tab, let session = model.session(for: id) {
-            session.dashboard.selectedTab = tab
-        }
-        model.selection = .cluster(id)
+        model.selectCluster(id, tab: tab)
     }
 }
 

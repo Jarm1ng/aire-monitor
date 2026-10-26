@@ -42,7 +42,7 @@ It refreshes every 10 seconds over persistent SSH sessions. Terminal, `scp`, `rs
 - **One sign-in for everything.** Your own `ssh aire` and `ssh calder` aliases (and `ssh rash` on the rash route) ride the app's sessions, and `hpc-session` gives scripts and Claude sessions access that never prompts.
 - **Made for a laptop.** Each session shows how long it has been up, and **Renew all** restarts every clock before a long night of jobs. A session that drops on sleep or a network change is noticed at once and can sign in again with one Duo approval.
 - **More than a dashboard.** Up to six terminals per cluster, a file manager with a restorable Trash, a live `tail -F` of any job's output, and a confirmed **Cancel job**.
-- **Always in view.** The menu bar shows your running job or the idle GPUs. A desktop widget, and alerts when a job starts or ends or a GPU frees up, cover the rest.
+- **Always in view.** The menu bar shows how many of your jobs are running (or the idle GPUs), flags only what needs you, and opens a native menu with every cluster's jobs, GPUs and session age. A desktop widget, and alerts when a job starts or ends or a GPU frees up, cover the rest.
 - **Read-only by default.** Background monitoring never submits or cancels jobs or touches your data on the clusters. Your password lives only in your Keychain and never reaches a file, a log or a command line.
 
 ## A tour
@@ -94,17 +94,28 @@ The **Sessions** card in the sidebar shows how long each SSH session (rash, AIRE
 
 ### Menu bar and desktop widget
 
-The menu bar shows your job when exactly one is running (`C · train 9h 29m`), how many when several are (`3 jobs`), and otherwise the idle GPUs per cluster (`A 6 · C 27`). Its dropdown summarises both clusters:
-- how long each session has been up;
-- running and pending jobs, with elapsed time against the limit;
-- idle GPUs per model;
-- storage, with the shared home quota counted once.
+<img align="right" width="340" src="docs/images/menubar-dark.png" alt="The menu bar menu: per cluster, how long its session has been up, job counts, running jobs, GPU pools and storage warnings">
 
-<p align="center"><img width="380" src="docs/images/menubar-dark.png" alt="The menu bar dropdown: per cluster, the session age, running and pending jobs, idle GPUs and storage"></p>
+The menu bar item is one small rack icon with "7 running" beside it; while nothing runs, it is just the icon. It dims while nothing is live, and shows a small "!" only when something needs you:
+- a session dropped;
+- a sign-in failed;
+- Slurm is not answering.
+
+**Show in Menu Bar** switches the title to idle GPUs per cluster (`A 4 · C 16+`), or to the icon alone.
+
+Click it for a native menu. Per cluster it shows:
+- how long the session has been up;
+- the job counts, with every job in a submenu;
+- the running jobs, with ones whose GPUs sit idle listed first and marked ⚠︎;
+- GPU pools, and storage only when it is filling up.
+
+Every job opens its details, and the arrow keys and typing work as in any menu. **Renew All Sessions…** asks first, as in the sidebar. A dropped or signed-out cluster gets a one-line reason and **Connect**.
 
 The **desktop widget** is a compact always-on-desktop panel with one row per cluster. It follows the app while the app runs, paused clusters included. While the app is closed it refreshes on its own over each cluster's still-open session (it never signs in), except clusters you paused or turned off.
 
 **Notifications** alert you when a job starts or ends, when a session drops and, optionally, when a cluster's free GPUs go from zero to at least one.
+
+<br clear="right">
 
 <details>
 <summary><b>Everything in each view</b></summary>
@@ -121,7 +132,7 @@ The **desktop widget** is a compact always-on-desktop panel with one row per clu
 | **Storage** | Home, scratch and flash against your quota, including file-count limits |
 | **Files** | Remote file browser: preview, upload, download, rename, folder size, delete to a restorable Trash |
 | **Terminal** | Up to six shells per cluster on its login node, with quick commands (`squeue --me`, `sinfo`, quota, GPU nodes). Terminal and Files work as soon as the session is up, before the first snapshot |
-| **Menu bar** | Your running job or idle GPUs per cluster, plus the dropdown summary |
+| **Menu bar** | "7 running" (or idle GPUs, or the icon alone), a "!" only when something needs you, and a native menu with every cluster's jobs, GPUs and warnings |
 | **Desktop widget** | One row per cluster; follows the app, and while the app is closed refreshes on its own over a still-open session |
 | **Notifications** | Job started or ended, a session dropped, and (optional) a GPU freed up |
 

@@ -2,10 +2,11 @@ import HPCCore
 import SwiftUI
 
 // The menu bar's model: everything the status item (StatusBarSummary) and
-// the dropdown (MenuBarMonitorView) show, as plain Equatable values built
-// once per change from the cluster sessions. Both surfaces read the same
-// digest, so a title like "C · train 1h 23m" and the dropdown beneath it can
-// never disagree, and the rules here are unit-testable without AppKit.
+// its native menu (MenuBarMenuLayout, built by StatusMenuBuilder) show, as
+// plain Equatable values built once per change from the cluster sessions.
+// Both surfaces read the same digest, so a title like "7 running" and the
+// menu beneath it can never disagree, and the rules here are unit-testable
+// without AppKit.
 
 // MARK: - Cluster status
 
@@ -139,6 +140,11 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
     /// When the live SSH session was signed in (its master's start), for
     /// the "session up 10 h 12 min" line; nil when not live or unknown.
     let sessionSince: Date?
+    /// The session dropped on its own and has not come back (nil after a
+    /// Disconnect, a route change or once live again).
+    let drop: MenuBarDrop?
+    /// The latest resource-use sample of each running job, by `Job.jobId`.
+    let jobUsage: [String: JobUsageSummary]
 
     var id: ClusterID { profile.id }
     var displayName: String { profile.displayName }
@@ -161,8 +167,27 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
         isDegraded ? "Slurm not answering" : status.headerPhrase
     }
 
+    /// The live session has been up long enough to suggest renewing
+    /// (`SessionAge.renewSuggestedAfter`).
+    func isAging(now: Date) -> Bool {
+        guard isLive, let sessionSince else {
+            return false
+        }
+        return now.timeIntervalSince(sessionSince) >= SessionAge.renewSuggestedAfter
+    }
+
+    /// The session's own record that its last sign-in failed (wrong
+    /// password, Duo declined, …) — never just a failed refresh.
+    let lastSignInFailed: Bool
+
+    /// A sign-in that failed and has not been retried: nothing is live,
+    /// nothing runs, and the cluster is not paused (Resume wins there).
+    var signInFailed: Bool {
+        isEnabled && !isLive && !status.isBusy && status.phase != .paused && lastSignInFailed && drop == nil
+    }
+
     @MainActor
-    init(session: ClusterSession, sessionSince: Date? = nil) {
+    init(session: ClusterSession, sessionSince: Date? = nil, drop: MenuBarDrop? = nil) {
         self.init(
             profile: session.profile,
             status: MenuBarClusterStatus(session.presentation),
@@ -172,7 +197,10 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
             schedulerIssue: session.schedulerIssue,
             snapshot: session.snapshot,
             gpuFleet: session.gpuFleet,
-            sessionSince: session.isLoggedIn ? sessionSince : nil
+            sessionSince: session.isLoggedIn ? sessionSince : nil,
+            drop: session.droppedAt != nil && !session.isLoggedIn ? drop : nil,
+            jobUsage: session.jobUsage,
+            lastSignInFailed: session.signInFailed
         )
     }
 
@@ -188,10 +216,15 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
         schedulerIssue: String? = nil,
         snapshot: ClusterSnapshot?,
         gpuFleet: GPUFleet? = nil,
-        sessionSince: Date? = nil
+        sessionSince: Date? = nil,
+        drop: MenuBarDrop? = nil,
+        jobUsage: [String: JobUsageSummary] = [:],
+        lastSignInFailed: Bool = false
     ) {
         self.profile = profile
+        self.lastSignInFailed = lastSignInFailed
         self.sessionSince = status.isLive ? sessionSince : nil
+        self.drop = status.isLive || !status.isEnabled ? nil : drop
         self.status = status
         self.isRefreshing = isRefreshing
         self.refreshIntervalText = refreshIntervalText
@@ -210,6 +243,8 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
         let pending = queued.filter { $0.jobState.isPending }
         runningJobs = running
         pendingJobs = pending
+        let runningIDs = Set(running.map(\.jobId))
+        self.jobUsage = status.isLive ? jobUsage.filter { runningIDs.contains($0.key) } : [:]
         queueCounts = JobQueueCounts(jobs: queued)
         let others = queued.filter { !$0.jobState.occupiesNodes && !$0.jobState.isPending }
         otherJobCount = others.count
@@ -332,20 +367,6 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
             return status.allowsRefresh
                 ? "showing cached data, retrying every \(refreshIntervalText)"
                 : "showing cached data — sign in for live updates"
-        }
-    }
-
-    /// Guidance next to the Connect/Resume/Turn on button.
-    var connectionHint: String {
-        switch status.phase {
-        case .stale:
-            return "Showing cached data — sign in for live updates"
-        case .paused:
-            return hasSnapshot ? "Monitoring paused — last snapshot shown" : "Monitoring paused — no snapshot collected yet"
-        case .off:
-            return "Monitoring is off for \(displayName)"
-        default:
-            return "Not connected — one Duo approval signs in"
         }
     }
 
@@ -574,15 +595,30 @@ enum MenuBarHealth: Equatable {
     /// Nothing live, nothing shown, and a cluster reports an error.
     case failing
     case offline
+}
 
-    var color: Color {
-        switch self {
-        case .off, .offline, .stale: return .gray
-        case .allLive: return StatusTone.normal.color
-        case .partial, .connecting: return StatusTone.warning.color
-        case .failing: return StatusTone.critical.color
-        }
+// MARK: - Drops and attention
+
+/// A cluster whose session dropped on its own, as the menu words it.
+struct MenuBarDrop: Equatable {
+    let at: Date
+    let note: SessionDropNote
+}
+
+/// Something that earns the status item its badge.
+struct MenuBarAttention: Equatable, Identifiable {
+    enum Kind: String, Equatable {
+        case dropped
+        case signInFailed
+        case slurmDown
     }
+
+    let cluster: ClusterID
+    let kind: Kind
+    /// "Calder session dropped at 14:05", for the tooltip and VoiceOver.
+    let text: String
+
+    var id: String { "\(cluster.rawValue).\(kind.rawValue)" }
 }
 
 // MARK: - Digest
@@ -595,17 +631,37 @@ struct MenuBarDigest: Equatable {
     let sharedHome: MenuBarSharedHome?
     /// App-level problems, e.g. Connect pressed with no saved password.
     let appErrorMessage: String?
+    /// When the shared rash jump session was signed in, on the rash route.
+    let jumpSince: Date?
+    /// "Renew All Sessions…" would do something now (mirrors
+    /// `AppModel.renewConfirmation() != nil`).
+    let canRenew: Bool
 
     @MainActor
     init(model: AppModel) {
+        let clusterNames = Set(model.sessions.map(\.id.rawValue))
+        let jump = model.sharingReport.sessions.filter { !clusterNames.contains($0.name) }.compactMap(\.since).min()
         self.init(
             clusters: model.sessions.map { session in
                 MenuBarClusterDigest(
                     session: session,
-                    sessionSince: model.sharingReport.session(named: session.id.rawValue)?.since
+                    sessionSince: model.sharingReport.session(named: session.id.rawValue)?.since,
+                    drop: model.lastDrops[session.id].map { drop in
+                        MenuBarDrop(
+                            at: drop.at,
+                            note: SessionDropNote.make(
+                                drop: drop,
+                                state: model.autoReconnect.state(of: session.id),
+                                reconnectAutomatically: model.reconnectAutomatically,
+                                isSigningIn: session.isLoggingIn || session.isLoginQueued
+                            )
+                        )
+                    }
                 )
             },
-            appErrorMessage: model.errorMessage
+            appErrorMessage: model.errorMessage,
+            jumpSince: jump,
+            canRenew: model.renewConfirmation() != nil
         )
     }
 
@@ -614,10 +670,53 @@ struct MenuBarDigest: Equatable {
         self.init(clusters: sessions.map { MenuBarClusterDigest(session: $0) })
     }
 
-    init(clusters: [MenuBarClusterDigest], appErrorMessage: String? = nil) {
+    init(
+        clusters: [MenuBarClusterDigest],
+        appErrorMessage: String? = nil,
+        jumpSince: Date? = nil,
+        canRenew: Bool = false
+    ) {
         self.clusters = clusters
         self.appErrorMessage = appErrorMessage?.menuTrimmed.menuNilIfEmpty
+        self.jumpSince = clusters.contains(where: \.isLive) ? jumpSince : nil
+        self.canRenew = canRenew
         sharedHome = Self.freshestSharedHome(in: clusters)
+    }
+
+    /// Nothing is live with Slurm answering: the status item dims.
+    var isDimmed: Bool {
+        live.isEmpty
+    }
+
+    /// What earns the status item its "!" badge: something only the user
+    /// can fix. Deliberately rare — not connected, off, paused, cached, an
+    /// ageing session, storage or GPU verdicts never badge; the menu shows
+    /// those.
+    var attention: [MenuBarAttention] {
+        enabled.compactMap { cluster in
+            if cluster.isDegraded {
+                return MenuBarAttention(cluster: cluster.id, kind: .slurmDown, text: "\(cluster.displayName): Slurm not answering")
+            }
+            if let drop = cluster.drop, !cluster.status.isBusy {
+                return MenuBarAttention(
+                    cluster: cluster.id,
+                    kind: .dropped,
+                    text: "\(cluster.displayName) session dropped at \(drop.note.when)"
+                )
+            }
+            if cluster.signInFailed {
+                return MenuBarAttention(cluster: cluster.id, kind: .signInFailed, text: "\(cluster.displayName): sign-in failed")
+            }
+            return nil
+        }
+    }
+
+    /// The oldest live leg's sign-in, the rash jump session included: what
+    /// "renew soon" is judged on.
+    var oldestLiveSince: Date? {
+        // Every connected cluster, Slurm answering or not: the session
+        // ages either way.
+        (clusters.filter(\.isLive).compactMap(\.sessionSince) + [jumpSince].compactMap { $0 }).min()
     }
 
     var enabled: [MenuBarClusterDigest] {
@@ -718,15 +817,6 @@ struct MenuBarDigest: Equatable {
         }
     }
 
-    /// Changes whenever the dropdown's layout meaningfully changes, so
-    /// sections animate in and out instead of jumping.
-    var animationKey: String {
-        clusters.map { cluster in
-            "\(cluster.id.rawValue):\(cluster.headerPhrase):\(cluster.jobs.count):\(cluster.gpuPools.count):\(cluster.hasSnapshot)"
-        }
-        .joined(separator: "|") + (sharedHome == nil ? "" : "|home") + (appErrorMessage == nil ? "" : "|error")
-    }
-
     /// Picks one enabled cluster's report of the shared home: live ones
     /// first, then the most recently collected; ties go to catalog order.
     /// Disabled clusters contribute no snapshot data at all.
@@ -760,29 +850,6 @@ struct MenuBarDigest: Equatable {
             source: best.cluster.profile,
             sharedBy: sharedBy
         )
-    }
-}
-
-// MARK: - Live digest for the dropdown
-
-/// The digest the open dropdown renders. StatusBarMonitorController pushes
-/// the digest it already built for the status item, and only while the menu
-/// is open; an unchanged digest is not republished. So a refresh on either
-/// cluster, or a keystroke in the sign-in form, no longer re-renders a menu
-/// nobody can see.
-@MainActor
-final class MenuBarDigestStore: ObservableObject {
-    @Published private(set) var digest: MenuBarDigest
-
-    init(digest: MenuBarDigest) {
-        self.digest = digest
-    }
-
-    func update(_ newDigest: MenuBarDigest) {
-        guard newDigest != digest else {
-            return
-        }
-        digest = newDigest
     }
 }
 

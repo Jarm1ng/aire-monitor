@@ -86,9 +86,54 @@ struct ReadmeScreenshotTests {
             try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(sessions, width: 388), name: "sessions-\(suffix)") {
                 sessions
             }
-            let menu = MenuBarMonitorView(model: model, closeMenu: {}).fixedSize(horizontal: false, vertical: true)
-            try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(menu, width: MenuBarMonitorView.panelWidth), name: "menubar-\(suffix)", rounded: 14) {
+            // The menu bar's menu, drawn by the offscreen stand-in (an
+            // NSMenu cannot be rendered), with the first job highlighted.
+            let entries = MenuBarMenuLayout.build(digest: MenuBarDigest(model: model))
+            let firstJob = entries.first { $0.id.contains(".job.") }?.id
+            let menu = MenuBarMenuPreview(entries: entries, highlighted: firstJob)
+            try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(menu, width: MenuMetrics.minimumWidth), name: "menubar-\(suffix)", rounded: 10) {
                 menu
+            }
+        }
+    }
+
+    @Test("Render the status item and menu states for review")
+    func renderMenuBarStates() throws {
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let model = makeDemoModel()
+        let digest = MenuBarDigest(model: model)
+        let calderOnly = MenuBarDigest(clusters: digest.clusters.map { cluster in
+            cluster.id == .calder ? cluster : MenuBarClusterDigest(profile: cluster.profile, status: MenuBarClusterStatus(phase: .notConnected, title: "Not connected", primaryAction: .connect), snapshot: nil)
+        })
+        let note = SessionDropNote.make(drop: SessionDrop(at: Date().addingTimeInterval(-600), lasted: 11 * 3600 + 52 * 60), state: nil, reconnectAutomatically: true, isSigningIn: false)
+        let dropped = MenuBarDigest(clusters: digest.clusters.map { cluster in
+            cluster.id == .calder
+                ? MenuBarClusterDigest(profile: cluster.profile, status: MenuBarClusterStatus(phase: .stale, title: "Cached", primaryAction: .connect), snapshot: model.session(for: .calder)?.snapshot, drop: MenuBarDrop(at: Date().addingTimeInterval(-600), note: note))
+                : cluster
+        }, canRenew: true)
+        let signingIn = MenuBarDigest(clusters: [
+            MenuBarClusterDigest(profile: .aire, status: MenuBarClusterStatus(phase: .signingIn, title: "Signing in", detail: "Waiting for Duo approval on your phone", showsProgress: true), snapshot: nil),
+            MenuBarClusterDigest(profile: .calder, status: MenuBarClusterStatus(phase: .queued, title: "Waiting", showsProgress: true), snapshot: nil)
+        ])
+        for appearance in [NSAppearance.Name.darkAqua, .aqua] {
+            let scheme: ColorScheme = appearance == .darkAqua ? .dark : .light
+            let suffix = appearance == .darkAqua ? "dark" : "light"
+            let strip = StatusItemPreviewStrip(summaries: [
+                ("Jobs running", StatusBarSummary(digest: digest)),
+                ("Nothing running", StatusBarSummary(digest: MenuBarDigest(clusters: digest.clusters.map { MenuBarClusterDigest(profile: $0.profile, status: $0.status, snapshot: ClusterSnapshot(collectedAt: "2026-10-13T12:00:00Z")) }))),
+                ("Signing in (dimmed)", StatusBarSummary(digest: signingIn)),
+                ("Calder dropped (badge)", StatusBarSummary(digest: dropped)),
+                ("Show: Idle GPUs", StatusBarSummary(digest: digest, mode: .idleGPUs)),
+                ("Show: Icon Only", StatusBarSummary(digest: digest, mode: .iconOnly))
+            ]).environment(\.colorScheme, scheme)
+            try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(strip, width: 340), name: "statusitem-\(suffix)") { strip }
+            for (name, state) in [("two-live", digest), ("one-not-connected", calderOnly), ("dropped", dropped), ("signing-in", signingIn)] {
+                let menu = MenuBarMenuPreview(entries: MenuBarMenuLayout.build(digest: state))
+                try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(menu, width: MenuMetrics.minimumWidth), name: "menu-\(name)-\(suffix)", rounded: 10) { menu }
+            }
+            if let calder = digest.clusters.first(where: { $0.id == .calder }) {
+                let submenu = MenuBarMenuPreview(entries: MenuBarMenuLayout.submenu(for: calder.id, digest: digest))
+                try renderPanel(scheme: scheme, appearance: appearance, size: Self.naturalSize(submenu, width: MenuMetrics.minimumWidth), name: "menu-submenu-\(suffix)", rounded: 10) { submenu }
             }
         }
     }

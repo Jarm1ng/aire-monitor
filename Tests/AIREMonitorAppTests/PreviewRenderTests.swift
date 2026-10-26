@@ -228,8 +228,15 @@ struct PreviewRenderTests {
                 name: "sidebar-\(suffix)"
             )
 
-            // Menu bar dropdown.
-            try render(MenuBarMonitorView(model: model, closeMenu: {}).fixedSize(horizontal: false, vertical: true), size: CGSize(width: 400, height: 900), appearance: appearance, name: "menubar-live-\(suffix)")
+            // Menu bar menu (a stand-in: an NSMenu cannot be drawn offscreen).
+            try render(
+                MenuBarMenuPreview(entries: MenuBarMenuLayout.build(digest: MenuBarDigest(model: model)))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10),
+                size: CGSize(width: MenuMetrics.minimumWidth + 20, height: 760),
+                appearance: appearance,
+                name: "menubar-live-\(suffix)"
+            )
 
             // Job detail sheet for the first job anywhere.
             if let session = model.sessions.first(where: { ($0.snapshot?.jobs.isEmpty ?? true) == false }),
@@ -332,7 +339,14 @@ struct PreviewRenderTests {
                     name: "sidebar-sign-in-\(suffix)"
                 )
                 // The menu bar while Calder is signed in but has no snapshot yet.
-                try render(MenuBarMonitorView(model: partial, closeMenu: {}).fixedSize(horizontal: false, vertical: true), size: CGSize(width: 400, height: 900), appearance: appearance, name: "menubar-partial-\(suffix)")
+                try render(
+                    MenuBarMenuPreview(entries: MenuBarMenuLayout.build(digest: MenuBarDigest(model: partial)))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(10),
+                    size: CGSize(width: MenuMetrics.minimumWidth + 20, height: 760),
+                    appearance: appearance,
+                    name: "menubar-partial-\(suffix)"
+                )
             }
         }
     }

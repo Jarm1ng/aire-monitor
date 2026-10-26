@@ -1,3 +1,4 @@
+import AppKit
 import HPCCore
 import SwiftUI
 
@@ -497,5 +498,75 @@ struct ClusterSessionMenu: View {
         .fixedSize()
         .help("More \(name) session actions: pause, reconnect, disconnect")
         .accessibilityLabel("\(name) session actions")
+    }
+}
+
+// MARK: - Opening things from outside the dashboard
+
+@MainActor
+extension AppModel {
+    /// Selects `jobId` on `id`'s Jobs tab, with its sheet open while the job
+    /// is still in the queue (otherwise just the tab).
+    func selectJob(_ jobId: String, on id: ClusterID) {
+        guard let session = session(for: id) else {
+            return
+        }
+        session.dashboard.selectedTab = .jobs
+        session.dashboard.selectedJob = session.snapshot?.jobs.first { $0.jobId == jobId }
+        selection = .cluster(id)
+    }
+
+    /// Selects `id`, on `tab` when given.
+    func selectCluster(_ id: ClusterID, tab: DashboardTab? = nil) {
+        if let tab, let session = session(for: id) {
+            session.dashboard.selectedTab = tab
+        }
+        selection = .cluster(id)
+    }
+
+    /// `selectJob` and bring the dashboard forward (the menu bar's job rows).
+    func showJob(_ jobId: String, on id: ClusterID) {
+        selectJob(jobId, on: id)
+        DashboardWindowPresenter.shared.show()
+    }
+
+    func showCluster(_ id: ClusterID, tab: DashboardTab? = nil) {
+        selectCluster(id, tab: tab)
+        DashboardWindowPresenter.shared.show()
+    }
+}
+
+/// A `SessionActionConfirmation` asked with an NSAlert, for places that
+/// cannot host SwiftUI's confirmationDialog (the menu bar's menu). Return
+/// never confirms: the action ends live sessions and costs Duo pushes.
+enum SessionActionAlert {
+    @MainActor
+    static func run(_ confirmation: SessionActionConfirmation, model: AppModel) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = confirmation.title
+        alert.informativeText = confirmation.message
+        let confirm = alert.addButton(withTitle: confirmation.confirmTitle)
+        confirm.keyEquivalent = ""
+        confirm.hasDestructiveAction = true
+        let cancel = alert.addButton(withTitle: "Cancel")
+        cancel.keyEquivalent = "\u{1b}"
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+        // A sign-in may have started while the alert was open; ask the
+        // model again rather than acting on the stale confirmation.
+        guard !model.isAnyLoginActive else {
+            return
+        }
+        switch confirmation.kind {
+        case .renew:
+            if let fresh = model.renewConfirmation() {
+                model.perform(fresh)
+            }
+        default:
+            model.perform(confirmation)
+        }
     }
 }
