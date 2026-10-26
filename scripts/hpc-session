@@ -1,8 +1,9 @@
 #!/usr/bin/env zsh
 # hpc-session — run commands over Leeds HPC Monitor's SSH sessions from any
 # shell: Terminal, scripts, Claude sessions. It never asks for a password or
-# Duo, never starts a session of its own, and waits out a dropped session
-# instead of failing half-way.
+# Duo, never starts a session of its own, and can wait for a down session to
+# come back before running a command (`wait`, `run --wait S`). A session that
+# drops while a command runs ends it with exit 75.
 #
 #   hpc-session status                      every shared session: up/down, age
 #   hpc-session check <name>                exit 0 if <name>'s session answers, 75 if not
@@ -215,7 +216,8 @@ case "$command" in
     exec ssh -t ${(f)"$(ssh_options "$sock")"} "hpc-session"
     ;;
   -h|--help|help)
-    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+    # The header comment, whatever its length.
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     ;;
   *)
     usage

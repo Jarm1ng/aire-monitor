@@ -499,6 +499,13 @@ final class ClusterSession: ObservableObject, Identifiable {
     }
 
     #if DEBUG
+    /// Preview hook: shows these job usage figures and trends (the Jobs
+    /// tab's Resource use, the job sheet) without sampling anything.
+    func installPreviewJobUsage(_ usage: [String: JobUsageSummary], history: JobUsageHistory) {
+        jobUsage = usage
+        jobUsageHistory = history
+    }
+
     /// Preview/test hook: shows the given state without touching SSH, the
     /// cache directory or timers. The state counts as settled (the first
     /// probe has completed), so presentations do not read "Checking".

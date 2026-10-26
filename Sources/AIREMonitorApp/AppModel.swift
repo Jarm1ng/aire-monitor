@@ -1174,8 +1174,14 @@ final class AppModel: ObservableObject, ClusterSessionHost {
     #if DEBUG
     /// Preview/test hook: shows these sessions, drops and automatic sign-in
     /// states without touching ~/.ssh.
-    func installPreviewSharing(_ report: SessionSharingReport, drops: [ClusterID: SessionDrop] = [:], dropped: [ClusterID] = []) {
+    func installPreviewSharing(
+        _ report: SessionSharingReport,
+        drops: [ClusterID: SessionDrop] = [:],
+        dropped: [ClusterID] = [],
+        hasSavedPassword: Bool = false
+    ) {
         sharingReport = report
+        self.hasSavedPassword = hasSavedPassword
         lastDrops = drops
         for id in dropped {
             autoReconnect.sessionDropped(id, at: Date())

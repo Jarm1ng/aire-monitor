@@ -596,6 +596,7 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `scripts/hpc_snapshot.py` | the collector |
 | `scripts/hpc-session` | command line for other programs: `status`, `check`, `wait`, `run`, `shell` over the shared sessions |
 | `scripts/test_all.sh`, `render_previews.sh`, `scripts/tests/` | test runner, renders, Python suites and the fake ssh |
+| `scripts/render_readme_images.sh`, `docs/images/` | the README screenshots, drawn from fixtures and demo data (`ReadmeScreenshotTests`), scaled and compressed |
 | `Tests/AIREMonitorAppTests/`, `Tests/Fixtures/` | Swift tests and their runner, collector contract fixtures |
 
 ## Current Limitations

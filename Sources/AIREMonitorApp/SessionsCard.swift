@@ -177,7 +177,7 @@ struct SessionsCard: View {
             ForEach(model.sharingReport.aliases) { alias in
                 Text("ssh \(alias.alias): \(Self.describe(alias.state))")
             }
-            Text("Claude sessions: `scripts/hpc-session status`, `wait <name>`, `run <name> -- <command>` never prompt and wait out a drop instead of failing. `ssh -O exit <alias>` would close the app's session too.")
+            Text("Claude sessions: `scripts/hpc-session status`, `wait <name>`, `run <name> -- <command>` never prompt, and `run --wait S` waits for a down session to come back. `ssh -O exit <alias>` would close the app's session too.")
         }
     }
 
