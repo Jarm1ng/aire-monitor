@@ -293,6 +293,8 @@ final class ClusterSession: ObservableObject, Identifiable {
     private var jobBaseline: JobStateSnapshot?
     private var lastJobBaselineWrite: Date?
     private var historyTimestamps = Set<String>()
+    /// `history.count` after the last `HistoryRetention` pass.
+    private var historyCountAfterRetention = 0
     /// Lines in snapshot_history.jsonl; compaction rewrites it to `history`.
     private var historyLinesInLog = 0
     /// The last identity this session was live under, kept after a logout
@@ -635,8 +637,9 @@ final class ClusterSession: ObservableObject, Identifiable {
         if let jobBaseline {
             cacheWriter.saveJobStates(jobBaseline, to: cache)
         }
-        if historyLinesInLog > history.count {
-            cacheWriter.rewriteHistory(history, to: cache)
+        let retained = HistoryRetention.retained(history)
+        if historyLinesInLog > retained.count {
+            cacheWriter.rewriteHistory(retained, to: cache)
         }
         // Both synchronous: they wait for every write queued above.
         if isPaused || !isEnabled {
@@ -1836,8 +1839,10 @@ final class ClusterSession: ObservableObject, Identifiable {
 
     // MARK: - History
 
+    /// `points` have been through `HistoryRetention`.
     private func setHistory(_ points: [TrendPoint]) {
         historyTimestamps = Set(points.map(\.collectedAt))
+        historyCountAfterRetention = points.count
         if history != points {
             history = points
         }
@@ -1856,23 +1861,23 @@ final class ClusterSession: ObservableObject, Identifiable {
     }
 
     /// In-memory history is the source of truth; the log gets one appended
-    /// line per new point and an occasional compaction.
+    /// line per new point and an occasional compaction. Retention thins
+    /// and ages out points in batches (`HistoryRetention.passInterval`), so
+    /// memory holds at most that many points more than it keeps.
     private func appendToHistory(_ point: TrendPoint, cache: SnapshotCache) {
         guard historyTimestamps.insert(point.collectedAt).inserted else {
             return
         }
         var updated = history
         updated.append(point)
-        let excess = updated.count - SnapshotCache.historyCapacity
-        if excess > 0 {
-            for dropped in updated.prefix(excess) {
-                historyTimestamps.remove(dropped.collectedAt)
-            }
-            updated.removeFirst(excess)
+        if updated.count >= historyCountAfterRetention + HistoryRetention.passInterval {
+            updated = HistoryRetention.retained(updated)
+            historyTimestamps = Set(updated.map(\.collectedAt))
+            historyCountAfterRetention = updated.count
         }
         history = updated
         historyLinesInLog += 1
-        if historyLinesInLog > SnapshotCache.historyCapacity + SnapshotCache.historyCompactionSlack {
+        if historyLinesInLog > updated.count + SnapshotCache.historyCompactionSlack {
             cacheWriter.rewriteHistory(updated, to: cache)
             historyLinesInLog = updated.count
         } else {

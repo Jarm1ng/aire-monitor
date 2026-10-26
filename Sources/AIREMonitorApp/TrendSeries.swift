@@ -68,21 +68,25 @@ struct TrendWindowPicker: View {
 // MARK: - Timeline
 
 /// A cluster's history with every timestamp parsed once, in time order.
-/// Parsing 1,440 ISO timestamps costs milliseconds, and the dashboards
-/// re-render several times per refresh, so timelines are memoised per
-/// history version (`TrendTimeline.cached(for:)`).
+/// Parsing 1,740 timestamps costs milliseconds even read by hand
+/// (`TrendPoint.collectionDate`), and the dashboards re-render several
+/// times per refresh, so timelines are memoised per history version
+/// (`TrendTimeline.cached(for:)`).
 struct TrendTimeline {
     let points: [TrendPoint]
     let dates: [Date]
-    /// Median spacing between consecutive points (the refresh cadence when
-    /// healthy).
+    /// Median spacing between consecutive points of the newest hour (the
+    /// refresh cadence when healthy).
     let typicalSpacing: TimeInterval
+    /// Points before this were thinned to one a minute (HistoryRetention);
+    /// a minute between them is no gap.
+    let thinnedBefore: Date
 
     init(history: [TrendPoint]) {
         var pairs: [(TrendPoint, Date)] = []
         pairs.reserveCapacity(history.count)
         for point in history {
-            if let date = SlurmTimestamp.parse(point.collectedAt) {
+            if let date = point.collectionDate {
                 pairs.append((point, date))
             }
         }
@@ -95,14 +99,28 @@ struct TrendTimeline {
         }
         points = pairs.map(\.0)
         dates = pairs.map(\.1)
-        let gaps = zip(dates, dates.dropFirst()).map { $1.timeIntervalSince($0) }.sorted()
+        let thinnedBefore = (dates.last ?? .distantPast).addingTimeInterval(-HistoryRetention.fullResolutionSpan)
+        self.thinnedBefore = thinnedBefore
+        // From the newest hour only: a day of minute points would make
+        // every minute the norm, and hide a two-minute outage there.
+        let gaps = zip(dates, dates.dropFirst())
+            .filter { $0.0 >= thinnedBefore }
+            .map { $1.timeIntervalSince($0) }
+            .sorted()
         typicalSpacing = gaps.isEmpty ? HPCDefaults.refreshInterval : gaps[gaps.count / 2]
     }
 
-    /// A pause longer than this breaks the line: three refresh intervals,
-    /// so one slow or failed refresh does not, but sleep or an outage does.
+    /// A pause longer than this after the newest point breaks the line:
+    /// three refresh intervals, so one slow or failed refresh does not, but
+    /// sleep or an outage does.
     var gapThreshold: TimeInterval {
         3 * max(typicalSpacing, HPCDefaults.refreshInterval)
+    }
+
+    /// The same rule for a pause after the point at `date`: three times the
+    /// spacing expected there, a minute where history was thinned.
+    func gapThreshold(after date: Date) -> TimeInterval {
+        date < thinnedBefore ? 3 * max(typicalSpacing, HistoryRetention.thinnedSpacing, HPCDefaults.refreshInterval) : gapThreshold
     }
 
     var lastDate: Date? { dates.last }
@@ -181,15 +199,15 @@ struct TrendSlice {
         guard let first = indices.first, let last = indices.last else {
             return 0
         }
-        let threshold = timeline.gapThreshold
+        let dates = timeline.dates
         var gaps = 0
-        if first > 0, timeline.dates[first].timeIntervalSince(max(start, timeline.dates[first - 1])) > threshold {
+        if first > 0, dates[first].timeIntervalSince(max(start, dates[first - 1])) > timeline.gapThreshold(after: dates[first - 1]) {
             gaps += 1
         }
-        for index in indices.dropFirst() where timeline.dates[index].timeIntervalSince(timeline.dates[index - 1]) > threshold {
+        for index in indices.dropFirst() where dates[index].timeIntervalSince(dates[index - 1]) > timeline.gapThreshold(after: dates[index - 1]) {
             gaps += 1
         }
-        if end.timeIntervalSince(timeline.dates[last]) > threshold {
+        if end.timeIntervalSince(dates[last]) > timeline.gapThreshold(after: dates[last]) {
             gaps += 1
         }
         return gaps
@@ -206,7 +224,7 @@ struct TrendSlice {
         var previousDate: Date?
         for index in indices {
             let date = timeline.dates[index]
-            let brokeByGap = previousDate.map { date.timeIntervalSince($0) > timeline.gapThreshold } ?? false
+            let brokeByGap = previousDate.map { date.timeIntervalSince($0) > timeline.gapThreshold(after: $0) } ?? false
             previousDate = date
             guard let raw = value(timeline.points[index]), raw.isFinite else {
                 // A missing value is a gap too — never bridged, never zero.

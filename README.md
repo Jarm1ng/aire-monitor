@@ -76,7 +76,7 @@ Every job also has a live `tail -F` of its output, a shortcut to its working dir
 
 <img src="docs/images/trends-dark.png" alt="AIRE's trends: idle GPUs, GPU allocation, queue pressure, unavailable nodes and storage">
 
-**Trends** charts idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window. The app keeps the newest 1,440 points, about the last 4 hours at the 10-second cadence, so the longer windows show at most that.
+**Trends** charts idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window. The app keeps the last hour at the 10-second cadence and one point a minute before that, back 24 hours: about 1,740 points per cluster.
 
 Also per cluster: **Partitions** (capacity and walltime limits), **Storage** (home, scratch and flash against your quotas, file counts included), **Files** (preview, upload, download, rename, folder sizes, and delete to a Trash you can restore from) and **Terminal**.
 
@@ -117,7 +117,7 @@ The **desktop widget** is a compact always-on-desktop panel with one row per clu
 | **Jobs** | Your queue with details per job, **Resource use** for running jobs, a live `tail -F`, the working directory, and a confirmed **Cancel job** |
 | **Sessions** | Each session's age, **Renew all**, what happened when a session dropped, sharing and automatic sign-in |
 | **Partitions / Nodes** | Partition capacity and walltime limits, the GPU fleet and heatmap, node health (down, drained, not responding) |
-| **Trends** | Idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window (about the last 4 hours are kept) |
+| **Trends** | Idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window (24 hours kept, one point a minute beyond the last hour) |
 | **Storage** | Home, scratch and flash against your quota, including file-count limits |
 | **Files** | Remote file browser: preview, upload, download, rename, folder size, delete to a restorable Trash |
 | **Terminal** | Up to six shells per cluster on its login node, with quick commands (`squeue --me`, `sinfo`, quota, GPU nodes). Terminal and Files work as soon as the session is up, before the first snapshot |
