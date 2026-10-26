@@ -290,6 +290,50 @@ class StorageSummary:
 
 
 @dataclass(frozen=True)
+class GPUUsage:
+    # nvidia-smi's minor number: /dev/nvidia<N>, the index Slurm's GRES
+    # "(IDX:...)" uses, so a GPU can be attributed to the job holding it.
+    index: int | None
+    name: str
+    # Percent of the last sample period a kernel was running.
+    utilization_percent: float | None
+    # Percent of the period device memory was being read or written.
+    memory_activity_percent: float | None
+    memory_used_mb: float | None
+    memory_total_mb: float | None
+    power_watts: float | None
+    power_limit_watts: float | None
+    temperature_c: float | None
+
+
+@dataclass(frozen=True)
+class JobNodeUsage:
+    """What one running job is using on one of its nodes, sampled on the
+    node itself (see REMOTE_JOB_USAGE_SECTION)."""
+    # Slurm's own id (squeue %A): the cgroup's job_<id>.
+    job_id: str
+    # The id the job list shows (squeue %i): '123_4' for an array task.
+    display_id: str
+    node: str
+    # CPUs allocated on this node (scontrol -d CPU_IDs), and how many were
+    # busy on average over the ~1 s sample window (cgroup cpu.stat).
+    cpus_allocated: int | None
+    cpus_busy: float | None
+    # cgroup memory: anonymous (process) memory, everything charged to the
+    # job (page cache included), the high-water mark, and the limit.
+    memory_used_mb: float | None
+    memory_charged_mb: float | None
+    memory_peak_mb: float | None
+    memory_limit_mb: float | None
+    # GRES indices allocated on this node; the sampled GPUs among them.
+    gpu_indices: list[int]
+    gpus: list[GPUUsage]
+    # Why something is missing ("node not reachable", "GPU figures belong
+    # to another of your jobs on this node", ...); None when complete.
+    note: str | None = None
+
+
+@dataclass(frozen=True)
 class ClusterSnapshot:
     # When the round trip returned (UTC, ISO 8601): the moment the data
     # describes, as closely as one timestamp can.
@@ -320,6 +364,10 @@ class ClusterSnapshot:
     # section measured on the login node's clock ("prelude", "remote",
     # "partitions", "nodes", "jobs_json", "node_details", "storage", ...).
     timings: dict[str, int] = field(default_factory=dict)
+    # Per-job resource use on the compute nodes (--job-usage only). None =
+    # not sampled this time (the caller keeps its previous figures); [] =
+    # sampled, nothing running.
+    job_usage: list[JobNodeUsage] | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -390,6 +438,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Do not collect storage this time (quotas change slowly). The output has "
             '"storage": null and "storage_skipped": true; the caller keeps its previous rows.'
+        ),
+    )
+    parser.add_argument(
+        "--job-usage",
+        action="store_true",
+        help=(
+            "Also sample what each of your RUNNING jobs uses on its compute nodes: GPU utilisation and "
+            "memory (nvidia-smi), CPU and memory (the job's cgroup). Reaches each node with ssh from the "
+            "login node, which pam_slurm_adopt allows only where you have a job; read-only, no job steps."
         ),
     )
     parser.add_argument(
@@ -2113,6 +2170,250 @@ def parse_storage(
     return storage, warnings
 
 
+# ---------------------------------------------------------------------------
+# Per-job resource use (--job-usage)
+# ---------------------------------------------------------------------------
+
+
+def _split_top_level(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for char in text:
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    if current:
+        parts.append(current)
+    return parts
+
+
+def expand_hostlist(text: str, limit: int = 4096) -> list[str]:
+    """Slurm hostlist -> names: 'gpu[01-03,07]' -> gpu01, gpu02, gpu03,
+    gpu07; plain names and comma lists pass through. One bracket group per
+    name (what Leeds node names use)."""
+    names: list[str] = []
+    for part in _split_top_level(text.strip()):
+        match = re.match(r"^(.*?)\[([^\]]+)\](.*)$", part)
+        if not match:
+            if part:
+                names.append(part)
+            continue
+        prefix, ranges, suffix = match.groups()
+        for item in ranges.split(","):
+            low, dash, high = item.partition("-")
+            if dash and low.isdigit() and high.isdigit():
+                for number in range(int(low), int(high) + 1):
+                    names.append(f"{prefix}{number:0{len(low)}d}{suffix}")
+                    if len(names) >= limit:
+                        return names
+            elif item:
+                names.append(f"{prefix}{item}{suffix}")
+    return names
+
+
+def parse_index_list(text: str) -> list[int]:
+    """'0-3,8,10-11' -> [0, 1, 2, 3, 8, 10, 11]; junk is skipped."""
+    indices: list[int] = []
+    for item in text.split(","):
+        low, dash, high = item.strip().partition("-")
+        if dash and low.isdigit() and high.isdigit() and int(high) - int(low) < 4096:
+            indices.extend(range(int(low), int(high) + 1))
+        elif low.isdigit() and not dash:
+            indices.append(int(low))
+    return indices
+
+
+def parse_job_allocation(detail: str) -> dict[str, object]:
+    """One `scontrol -d show job` allocation line:
+    'Nodes=gpu[01-02] CPU_IDs=0-31 Mem=256000 GRES=gpu:h200:4(IDX:0-3)'."""
+    nodes = re.search(r"(?:^|\s)Nodes=(\S+)", detail)
+    cpus = re.search(r"(?:^|\s)CPU_IDs=(\S+)", detail)
+    memory = re.search(r"(?:^|\s)Mem=(\d+)", detail)
+    gres = re.search(r"(?:^|\s)GRES=(\S*)", detail)
+    gpu_indices: list[int] = []
+    if gres:
+        for spec in re.finditer(r"IDX:([0-9,\-]+)", gres.group(1)):
+            gpu_indices.extend(parse_index_list(spec.group(1)))
+    return {
+        "nodes": expand_hostlist(nodes.group(1)) if nodes else [],
+        "cpus": len(parse_index_list(cpus.group(1))) if cpus else None,
+        "memory_mb": int(memory.group(1)) if memory else None,
+        "gpu_indices": sorted(set(gpu_indices)),
+    }
+
+
+def _bytes_to_mb(value: str) -> float | None:
+    number = parse_int(value)
+    return None if number is None else round(number / 1048576, 1)
+
+
+def parse_gpu_usage_line(line: str) -> GPUUsage | None:
+    """One nvidia-smi CSV row (noheader, nounits) in the probe's field
+    order; '[N/A]' and '[Not Supported]' become None."""
+    fields = [field.strip() for field in line.split(",")]
+    if len(fields) != 9:
+        return None
+
+    def number(value: str) -> float | None:
+        return None if value.startswith("[") else parse_float(value)
+
+    index = parse_int(fields[0])
+    if index is None or not fields[1]:
+        return None
+    return GPUUsage(
+        index=index,
+        name=fields[1],
+        utilization_percent=number(fields[2]),
+        memory_activity_percent=number(fields[3]),
+        memory_used_mb=number(fields[4]),
+        memory_total_mb=number(fields[5]),
+        power_watts=number(fields[6]),
+        power_limit_watts=number(fields[7]),
+        temperature_c=number(fields[8]),
+    )
+
+
+def _node_failure(lines: list[str], code: int | None) -> str:
+    detail = next((line for line in lines if line and not re.match(r"^(t|cg|self|gpu|nogpu|rc)\|", line)), "")
+    if code == 124:
+        return "the node did not answer in time"
+    if "no active jobs" in detail.lower() or "access denied" in detail.lower():
+        return "the job ended before the node could be sampled"
+    return detail[:160] or f"ssh to the node failed (exit {code})"
+
+
+def parse_job_usage(text: str) -> list[JobNodeUsage]:
+    """The job_usage section: one entry per (running job, node)."""
+    jobs: dict[str, tuple[str, str]] = {}
+    allocations: dict[tuple[str, str], dict[str, object]] = {}
+    placements: list[tuple[str, str]] = []
+    node_lines: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        kind, _, rest = line.partition("|")
+        if kind == "job":
+            fields = rest.split("|")
+            if len(fields) >= 2 and fields[0]:
+                jobs[fields[0]] = (fields[1] or fields[0], fields[2] if len(fields) > 2 else "")
+        elif kind == "detail":
+            job_id, _, detail = rest.partition("|")
+            allocation = parse_job_allocation(detail)
+            for node in allocation["nodes"]:  # type: ignore[union-attr]
+                allocations[(job_id, node)] = allocation
+        elif kind == "on":
+            node, _, job_id = rest.partition("|")
+            if node and job_id and (job_id, node) not in placements:
+                placements.append((job_id, node))
+        elif kind == "node":
+            node, _, payload = rest.partition("|")
+            node_lines.setdefault(node, []).append(payload)
+
+    usage: list[JobNodeUsage] = []
+    for job_id, node in placements:
+        display_id = jobs.get(job_id, (job_id, ""))[0]
+        allocation = allocations.get((job_id, node), {})
+        gpu_indices: list[int] = list(allocation.get("gpu_indices") or [])  # type: ignore[arg-type]
+        limit_from_slurm = allocation.get("memory_mb")
+        lines = node_lines.get(node)
+        common = dict(
+            job_id=job_id,
+            display_id=display_id,
+            node=node,
+            cpus_allocated=allocation.get("cpus"),  # type: ignore[arg-type]
+            gpu_indices=gpu_indices,
+        )
+        if lines is None:
+            usage.append(JobNodeUsage(
+                **common, cpus_busy=None, memory_used_mb=None, memory_charged_mb=None,
+                memory_peak_mb=None, memory_limit_mb=float(limit_from_slurm) if limit_from_slurm else None,
+                gpus=[], note="not sampled (too many nodes, or the section was cut short)",
+            ))
+            continue
+
+        times: dict[str, float] = {}
+        counters: dict[str, list[str]] = {}
+        adopted: str | None = None
+        gpus: list[GPUUsage] = []
+        gpu_problem: str | None = None
+        code: int | None = None
+        for payload in lines:
+            kind, _, rest = payload.partition("|")
+            if kind == "t":
+                phase, _, stamp = rest.partition("|")
+                seconds = parse_remote_clock(stamp)
+                if seconds is not None:
+                    times[phase] = seconds
+            elif kind == "cg":
+                fields = rest.split("|")
+                if len(fields) >= 7 and fields[1] == job_id:
+                    counters[fields[0]] = fields
+            elif kind == "self":
+                match = re.search(r"/job_(\d+)(?:/|$)", rest)
+                adopted = match.group(1) if match else None
+            elif kind == "gpu":
+                row = parse_gpu_usage_line(rest)
+                if row is not None:
+                    gpus.append(row)
+                elif rest.strip():
+                    gpu_problem = rest.strip()[:160]
+            elif kind == "rc":
+                code = parse_int(rest)
+
+        first, last = counters.get("0"), counters.get("1")
+        if code != 0 and not last:
+            usage.append(JobNodeUsage(
+                **common, cpus_busy=None, memory_used_mb=None, memory_charged_mb=None,
+                memory_peak_mb=None, memory_limit_mb=float(limit_from_slurm) if limit_from_slurm else None,
+                gpus=[], note=_node_failure(lines, code),
+            ))
+            continue
+
+        notes: list[str] = []
+        cpus_busy = None
+        window = (times.get("1") or 0) - (times.get("0") or 0)
+        if first and last and first[2] and last[2] and window > 0.2:
+            used = parse_int(last[2]), parse_int(first[2])
+            if used[0] is not None and used[1] is not None and used[0] >= used[1]:
+                cpus_busy = round((used[0] - used[1]) / 1e6 / window, 2)
+        if last is None or not last[2]:
+            notes.append("the job's cgroup counters could not be read")
+        limit = _bytes_to_mb(last[6]) if last and last[6] and last[6] != "max" else None
+        if limit is None and limit_from_slurm:
+            limit = float(limit_from_slurm)
+
+        if gpu_indices:
+            job_gpus = [gpu for gpu in gpus if gpu.index in gpu_indices]
+            if not job_gpus:
+                if adopted and adopted != job_id:
+                    notes.append(f"GPU figures on {node} come from your job {jobs.get(adopted, (adopted, ''))[0]} (one job per node can be sampled)")
+                elif gpu_problem:
+                    notes.append(f"nvidia-smi: {gpu_problem}")
+                else:
+                    notes.append("nvidia-smi reported no GPUs")
+        else:
+            # No GRES indices from Slurm: the GPUs nvidia-smi could see
+            # belong to the job the session was adopted into.
+            job_gpus = gpus if adopted == job_id else []
+
+        usage.append(JobNodeUsage(
+            **common,
+            cpus_busy=cpus_busy,
+            memory_used_mb=_bytes_to_mb(last[3]) if last else None,
+            memory_charged_mb=_bytes_to_mb(last[4]) if last else None,
+            memory_peak_mb=_bytes_to_mb(last[5]) if last else None,
+            memory_limit_mb=limit,
+            gpus=job_gpus,
+            note="; ".join(notes) or None,
+        ))
+    return usage
+
+
 def nonempty_lines(output: str) -> Iterable[str]:
     for line in output.splitlines():
         stripped = line.strip()
@@ -2220,6 +2521,86 @@ finish node_details $?
 """
 
 
+# What each running job uses on its nodes. From the login node, every node
+# that runs one of the user's jobs is reached with ssh (in parallel, each
+# bounded): pam_slurm_adopt admits the user only there, and adopts the
+# session into one of their jobs, so nvidia-smi sees that job's GPUs. The
+# probe below then reads every listed job's cgroup counters twice, about a
+# second apart, around one nvidia-smi query. Nothing is started inside a
+# job (no srun steps) and nothing is written on the node. Per node the
+# output is prefixed 'node|<node>|' and ends with 'rc|<ssh exit>'.
+# HPC_CGROUP_ROOT / HPC_SELF_CGROUP exist for the tests only: sshd never
+# passes them on (AcceptEnv covers LANG/LC_* at most).
+REMOTE_NODE_PROBE = r"""
+hpc_cgroot=${HPC_CGROUP_ROOT:-/sys/fs/cgroup}
+hpc_cg() {
+    for d in "$hpc_cgroot"/system.slice/slurmstepd.scope/job_$1 "$hpc_cgroot"/system.slice/*slurmstepd.scope/job_$1; do
+        if [ -r "$d/cpu.stat" ]; then
+            printf 'cg|%s|%s|%s|%s|%s|%s|%s\n' "$2" "$1" "$(awk '$1=="usage_usec"{print $2}' "$d/cpu.stat")" "$(awk '$1=="anon"{print $2}' "$d/memory.stat" 2>/dev/null)" "$(cat "$d/memory.current" 2>/dev/null)" "$(cat "$d/memory.peak" 2>/dev/null)" "$(cat "$d/memory.max" 2>/dev/null)"
+            return
+        fi
+    done
+    printf 'cg|%s|%s||||||\n' "$2" "$1"
+}
+printf 't|0|%s\n' "$(date +%s.%N)"
+for j in "$@"; do hpc_cg "$j" 0; done
+printf 'self|%s\n' "$(head -n 1 "${HPC_SELF_CGROUP:-/proc/self/cgroup}" 2>/dev/null)"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=minor_number,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>&1 | sed 's/^/gpu|/'
+else
+    printf 'nogpu|\n'
+fi
+sleep 1
+printf 't|1|%s\n' "$(date +%s.%N)"
+for j in "$@"; do hpc_cg "$j" 1; done
+"""
+
+# The job ids reach the node as `sh -s $(awk ...)`: an unquoted command
+# substitution is split into words by every shell, zsh included (which does
+# not split an unquoted $variable).
+# Nodes probed per collection: a user with more nodes than this sees the
+# rest as "not sampled".
+MAX_USAGE_NODES = 24
+# Per-node bound (connect + nvidia-smi + the one-second CPU window).
+USAGE_NODE_TIMEOUT = 12
+
+REMOTE_JOB_USAGE_SECTION = r"""
+section job_usage
+hpc_usage_rc=0
+hpc_usage_dir=$(mktemp -d 2>/dev/null) || hpc_usage_rc=1
+if [ "$hpc_usage_rc" -eq 0 ]; then
+    hpc_node_probe=$(cat <<'HPC_NODE_PROBE'
+@NODE_PROBE@
+HPC_NODE_PROBE
+)
+    squeue -u "$USER" -h -t R -o '%A|%i|%N' 2>/dev/null | while IFS='|' read -r hpc_jid hpc_shown hpc_nl; do
+        [ -n "$hpc_jid" ] || continue
+        printf 'job|%s|%s|%s\n' "$hpc_jid" "$hpc_shown" "$hpc_nl"
+        scontrol -d show job "$hpc_jid" 2>/dev/null | sed -n 's/^[[:space:]]*\(Nodes=.*\)$/detail|'"$hpc_jid"'|\1/p'
+        for hpc_n in $(scontrol show hostnames "$hpc_nl" 2>/dev/null); do
+            printf 'on|%s|%s\n' "$hpc_n" "$hpc_jid"
+        done
+    done > "$hpc_usage_dir/map"
+    cat "$hpc_usage_dir/map"
+    for hpc_n in $(awk -F'|' '$1=="on"{print $2}' "$hpc_usage_dir/map" | sort -u | head -n @MAX_NODES@); do
+        (
+            printf '%s\n' "$hpc_node_probe" | timeout @NODE_TIMEOUT@ ssh -T -x -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=5 -o ServerAliveCountMax=1 "$hpc_n" sh -s $(awk -F'|' -v n="$hpc_n" '$1=="on" && $2==n {print $3}' "$hpc_usage_dir/map") > "$hpc_usage_dir/n.$hpc_n" 2>&1
+            printf 'rc|%s\n' "$?" >> "$hpc_usage_dir/n.$hpc_n"
+        ) &
+    done
+    wait
+    for hpc_f in "$hpc_usage_dir"/n.*; do
+        [ -f "$hpc_f" ] || continue
+        sed "s/^/node|${hpc_f##*/n.}|/" "$hpc_f"
+    done
+    rm -rf "$hpc_usage_dir"
+fi
+finish job_usage $hpc_usage_rc
+""".replace("@NODE_PROBE@", REMOTE_NODE_PROBE.strip("\n")) \
+   .replace("@MAX_NODES@", str(MAX_USAGE_NODES)) \
+   .replace("@NODE_TIMEOUT@", str(USAGE_NODE_TIMEOUT))
+
+
 def _indent(text: str, prefix: str = "    ") -> str:
     return "\n".join(prefix + line if line.strip() else line for line in text.strip("\n").splitlines())
 
@@ -2246,6 +2627,7 @@ def build_remote_script(
     volumes: list[StorageVolume],
     budget: int = DEFAULT_TIMEOUT,
     include_storage: bool = True,
+    include_job_usage: bool = False,
 ) -> str:
     """The single round trip's script.
 
@@ -2269,6 +2651,10 @@ def build_remote_script(
         parts.append("section storage")
         parts.append(build_storage_script(volumes, budget))
         parts.append("finish storage 0")
+    if include_job_usage:
+        # Last: per node it is bounded on its own, and it is the one
+        # section that leaves the login node.
+        parts.append(REMOTE_JOB_USAGE_SECTION)
     return _compact_shell("snapshot", parts)
 
 
@@ -2306,6 +2692,7 @@ ENRICHMENT_SECTIONS = (
     "node_details",
     "job_details",
     "storage",
+    "job_usage",
 )
 
 
@@ -2483,6 +2870,7 @@ def assemble_snapshot(
     timed_out: bool,
     *,
     skip_storage: bool = False,
+    job_usage: bool = False,
     now: datetime | None = None,
     started_at: str | None = None,
     duration_ms: int | None = None,
@@ -2536,7 +2924,9 @@ def assemble_snapshot(
         used_fallback = "jobs" in sections or "jobs" in statuses
         expected = [
             name for name in ENRICHMENT_SECTIONS
-            if (name != "job_details" or used_fallback) and (name != "storage" or not skip_storage)
+            if (name != "job_details" or used_fallback)
+            and (name != "storage" or not skip_storage)
+            and (name != "job_usage" or job_usage)
         ]
         for name in expected:
             code = statuses.get(name)
@@ -2580,6 +2970,11 @@ def assemble_snapshot(
         if storage is None:
             storage_skipped = True
 
+    # Job usage: None unless sampled this time and the section finished.
+    usage: list[JobNodeUsage] | None = None
+    if job_usage and statuses.get("job_usage") == 0:
+        usage = parse_job_usage(sections.get("job_usage", ""))
+
     timings = dict(local_timings or {})
     timings.update(section_timings(output))
 
@@ -2597,6 +2992,7 @@ def assemble_snapshot(
         started_at=started_at,
         duration_ms=duration_ms,
         timings=timings,
+        job_usage=usage,
     )
 
 
@@ -2609,6 +3005,7 @@ def collect_snapshot(
     cluster: ClusterInfo,
     volumes: list[StorageVolume],
     skip_storage: bool = False,
+    job_usage: bool = False,
 ) -> ClusterSnapshot:
     started_at = utc_now_iso()
     started = time.monotonic()
@@ -2629,7 +3026,8 @@ def collect_snapshot(
 
     remaining = max(1.0, deadline - time.monotonic())
     output, error, timed_out = run_ssh(
-        config, build_remote_script(volumes, config.timeout, include_storage=not skip_storage),
+        config,
+        build_remote_script(volumes, config.timeout, include_storage=not skip_storage, include_job_usage=job_usage),
         run_timeout=remaining,
     )
     returned = time.monotonic()
@@ -2655,6 +3053,7 @@ def collect_snapshot(
     return assemble_snapshot(
         config, cluster, volumes, utc_now_iso(), output, error, timed_out,
         skip_storage=skip_storage,
+        job_usage=job_usage,
         started_at=started_at,
         duration_ms=_elapsed_ms(started, returned),
         local_timings=timings,
@@ -2718,7 +3117,9 @@ def main() -> int:
         snapshot = empty_snapshot(config, cluster, utc_now_iso(), spec_error)
     else:
         try:
-            snapshot = collect_snapshot(config, cluster, volumes, skip_storage=args.skip_storage)
+            snapshot = collect_snapshot(
+                config, cluster, volumes, skip_storage=args.skip_storage, job_usage=args.job_usage
+            )
         except Exception as exc:  # noqa: BLE001 - last line of defence
             # A collector bug must still produce JSON: with no stdout the app
             # can only say "snapshot script produced no output". The

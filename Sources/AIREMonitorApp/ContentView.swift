@@ -250,7 +250,13 @@ struct ClusterDashboardView: View {
                 },
                 onBrowseWorkDir: { job in
                     openFileBrowser(for: job)
-                }
+                },
+                usage: session.jobUsage,
+                usageHistory: session.jobUsageHistory,
+                isSamplingUsage: Binding(
+                    get: { model.sampleJobUsage },
+                    set: { model.sampleJobUsage = $0 }
+                )
             )
         case .partitions:
             PartitionsDashboard(

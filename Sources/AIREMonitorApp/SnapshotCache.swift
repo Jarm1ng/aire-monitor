@@ -319,6 +319,13 @@ struct AppPreferences: Codable, Equatable {
     /// "Remember in Keychain". Persisted so an opt-out survives relaunch;
     /// files written before it existed decode as true (the old default).
     var rememberPassword: Bool = true
+    /// Link the live sessions into ~/.ssh so `ssh aire` and friends ride
+    /// them (see SessionSharing.swift).
+    var shareSessions: Bool = true
+    /// Sign a dropped session in again by itself (AutoReconnectPolicy).
+    var reconnectAutomatically: Bool = true
+    /// Sample running jobs' GPU, CPU and memory use on their nodes.
+    var sampleJobUsage: Bool = true
     /// Keyed by ClusterID.rawValue.
     var clusters: [String: ClusterPreference] = [:]
     /// "overview" or "cluster:<id>".
@@ -332,6 +339,9 @@ struct AppPreferences: Codable, Equatable {
         // Stored as "rememberInKeychain": preferences.json is password-free
         // by construction, and stays free of the word too.
         case rememberPassword = "rememberInKeychain"
+        case shareSessions
+        case reconnectAutomatically
+        case sampleJobUsage
         case clusters
         case selection
     }
@@ -345,6 +355,9 @@ struct AppPreferences: Codable, Equatable {
         jumpHostname = try container.decodeIfPresent(String.self, forKey: .jumpHostname) ?? HPCDefaults.jumpHostname
         duoOption = try container.decodeIfPresent(String.self, forKey: .duoOption) ?? HPCDefaults.duoOption
         rememberPassword = (try? container.decodeIfPresent(Bool.self, forKey: .rememberPassword)) ?? true
+        shareSessions = (try? container.decodeIfPresent(Bool.self, forKey: .shareSessions)) ?? true
+        reconnectAutomatically = (try? container.decodeIfPresent(Bool.self, forKey: .reconnectAutomatically)) ?? true
+        sampleJobUsage = (try? container.decodeIfPresent(Bool.self, forKey: .sampleJobUsage)) ?? true
         clusters = try container.decodeIfPresent([String: ClusterPreference].self, forKey: .clusters) ?? [:]
         selection = try container.decodeIfPresent(String.self, forKey: .selection)
     }

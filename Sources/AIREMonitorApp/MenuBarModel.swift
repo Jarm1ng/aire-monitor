@@ -136,6 +136,9 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
     /// start time, then highest Slurm id. Ids are compared only within this
     /// cluster, never across clusters.
     let newestRunningJob: MenuBarRunningJob?
+    /// When the live SSH session was signed in (its master's start), for
+    /// the "session up 10 h 12 min" line; nil when not live or unknown.
+    let sessionSince: Date?
 
     var id: ClusterID { profile.id }
     var displayName: String { profile.displayName }
@@ -159,7 +162,7 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
     }
 
     @MainActor
-    init(session: ClusterSession) {
+    init(session: ClusterSession, sessionSince: Date? = nil) {
         self.init(
             profile: session.profile,
             status: MenuBarClusterStatus(session.presentation),
@@ -168,7 +171,8 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
             errorMessage: session.errorMessage,
             schedulerIssue: session.schedulerIssue,
             snapshot: session.snapshot,
-            gpuFleet: session.gpuFleet
+            gpuFleet: session.gpuFleet,
+            sessionSince: session.isLoggedIn ? sessionSince : nil
         )
     }
 
@@ -183,9 +187,11 @@ struct MenuBarClusterDigest: Identifiable, Equatable {
         errorMessage: String? = nil,
         schedulerIssue: String? = nil,
         snapshot: ClusterSnapshot?,
-        gpuFleet: GPUFleet? = nil
+        gpuFleet: GPUFleet? = nil,
+        sessionSince: Date? = nil
     ) {
         self.profile = profile
+        self.sessionSince = status.isLive ? sessionSince : nil
         self.status = status
         self.isRefreshing = isRefreshing
         self.refreshIntervalText = refreshIntervalText
@@ -593,14 +599,19 @@ struct MenuBarDigest: Equatable {
     @MainActor
     init(model: AppModel) {
         self.init(
-            clusters: model.sessions.map(MenuBarClusterDigest.init(session:)),
+            clusters: model.sessions.map { session in
+                MenuBarClusterDigest(
+                    session: session,
+                    sessionSince: model.sharingReport.session(named: session.id.rawValue)?.since
+                )
+            },
             appErrorMessage: model.errorMessage
         )
     }
 
     @MainActor
     init(sessions: [ClusterSession]) {
-        self.init(clusters: sessions.map(MenuBarClusterDigest.init(session:)))
+        self.init(clusters: sessions.map { MenuBarClusterDigest(session: $0) })
     }
 
     init(clusters: [MenuBarClusterDigest], appErrorMessage: String? = nil) {

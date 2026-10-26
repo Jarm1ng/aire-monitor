@@ -26,7 +26,8 @@ Sign in once with your university account and the app keeps a live, read-only vi
 | **Overview** | What needs attention first (storage over quota or 90 % full, held jobs or jobs that can never start, a GPU model with no usable node, a cluster that is not refreshing), then your jobs from every cluster in one list, then one card per cluster: your jobs, idle GPUs per model, idle CPU cores, storage |
 | **Cluster header** | Idle GPUs per model (`6 of 84 L40S idle`), connection state, **Refresh** and a **⋯** menu: Pause monitoring, Reconnect…, Disconnect…, Turn off. Counts sit on the tabs: jobs, unavailable nodes, storage at 75 % or more, open terminals |
 | **Status strip** | Why a cluster is not updating, worded by what fixes it: a setup problem on this Mac, Slurm trouble over a live session, or no connection. **Details** shows the raw output and how many refreshes in a row failed |
-| **Jobs** | Your queue with details per job, a live `tail -F` of its output, a shortcut to its working directory, and a confirmation-gated **Cancel job** |
+| **Jobs** | Your queue with details per job, a live `tail -F` of its output, a shortcut to its working directory, and a confirmation-gated **Cancel job**. **Resource use** shows what each running job really uses, sampled on its nodes once a minute: GPU utilisation and memory per GPU, CPUs busy against CPUs allocated, and memory against the limit, with a verdict such as "2 of 4 GPUs idle" and a trend |
+| **Sessions** | How long each SSH session (rash, AIRE, Calder) has been up, **Renew all** to start every clock over before a long stretch, and what happened when a session dropped |
 | **Partitions / Nodes** | Partition capacity and walltime limits, a GPU fleet heatmap, and node health (down, drained, not responding) |
 | **Trends** | Idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage over the last 1, 6 or 24 hours |
 | **Storage** | Home, scratch and flash usage against your quota, including file-count limits |
@@ -113,6 +114,22 @@ Then sign in from the sidebar:
 - **Wrong password, no retries.** If the password is rejected or has expired, the remaining queued sign-ins are cancelled instead of repeating it, so the account is not pushed towards a lockout. A rejected saved password is not sent again.
 - **Duo declined or timed out** is reported as exactly that: your password was accepted. The queued sign-ins stop and the saved password is kept; connect again and approve the new push.
 - **"Not allowed at this time" on Calder** is a busy login node refusing the connection, not a wrong password. Wait a minute and connect again.
+
+## Using the sessions from Terminal and Claude
+
+While the app is signed in, your own `~/.ssh/config` aliases for AIRE, Calder and rash ride its sessions: `ssh aire`, `scp`, `rsync` and `ssh` in a Claude session need no password and no Duo. Any alias works whose host and user match, with a `ControlPath` set. An alias your own live `ssh` session already holds is left alone, and is linked once that session ends.
+
+For scripts and Claude sessions, `scripts/hpc-session` never prompts and waits out a drop instead of failing half-way:
+
+```bash
+scripts/hpc-session status
+```
+
+```bash
+scripts/hpc-session run calder --wait 1800 -- 'squeue --me'
+```
+
+It exits 75 when a session is down; sign in again from the app. On a laptop that sleeps or changes networks the app re-checks every session at once. With **Sign in again after a drop** on, it signs in again with the saved password while you are at the Mac, and you approve the Duo push.
 
 ## How it works
 

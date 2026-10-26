@@ -26,4 +26,7 @@ enum Log {
     static let app = Logger(subsystem: subsystem, category: "app")
     /// Keychain access (never the secret itself).
     static let keychain = Logger(subsystem: subsystem, category: "keychain")
+    /// Session sharing links, dropped sessions, wake/network changes and
+    /// automatic sign-ins.
+    static let sharing = Logger(subsystem: subsystem, category: "sharing")
 }

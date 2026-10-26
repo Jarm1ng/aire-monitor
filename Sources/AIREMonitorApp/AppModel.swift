@@ -105,6 +105,37 @@ final class AppModel: ObservableObject, ClusterSessionHost {
     /// The desktop widget is being built and launched (a few seconds).
     @Published private(set) var isPreparingDesktopWidget = false
 
+    /// "Show what running jobs use": sample GPU, CPU and memory on the
+    /// compute nodes about once a minute (see ClusterSession.wantsJobUsage).
+    @Published var sampleJobUsage: Bool {
+        didSet {
+            guard sampleJobUsage != oldValue else {
+                return
+            }
+            for session in sessions {
+                session.jobUsageSamplingChanged(isOn: sampleJobUsage)
+            }
+        }
+    }
+
+    /// "Share sessions with Terminal": link the live masters into ~/.ssh so
+    /// `ssh aire`, scp, rsync and Claude sessions ride them.
+    @Published var shareSessions: Bool
+    /// "Sign in again after a drop" (see `AutoReconnectPolicy`).
+    @Published var reconnectAutomatically: Bool {
+        didSet {
+            if !reconnectAutomatically {
+                autoReconnect.reset()
+            }
+        }
+    }
+    /// The last sharing pass: each live master's age, its stable link and
+    /// what happened to every matching ~/.ssh/config alias.
+    @Published private(set) var sharingReport = SessionSharingReport()
+    /// The most recent drop of each cluster, for the Sessions card.
+    @Published private(set) var lastDrops: [ClusterID: SessionDrop] = [:]
+    @Published private(set) var autoReconnect = AutoReconnectPolicy()
+
     private static let notifyWhenGPUFreesKey = "notifyWhenGPUFrees"
     private static let projectRootKey = "projectRoot"
     private static let rejectedPasswordKeyPrefix = "savedPasswordRejected:"
@@ -132,6 +163,16 @@ final class AppModel: ObservableObject, ClusterSessionHost {
     private var errorSource: ErrorSource?
     private var persistenceProblems: [ClusterID: String] = [:]
     private var hasStarted = false
+    /// nil in tests and previews: they must never touch the real ~/.ssh.
+    private let sharingService: SessionSharingService?
+    private var sharingTask: Task<Void, Never>?
+    private var sharingPassRequested = false
+    private var continuityTimer: Timer?
+    private var connectivity: ConnectivityMonitor?
+    private var connectivityTask: Task<Void, Never>?
+    /// Each shared master's start time from the last pass, kept so a drop
+    /// can say how long the session lasted once its socket is gone.
+    private var lastKnownSessionStart: [String: Date] = [:]
 
     private enum ErrorSource {
         case projectRoot
@@ -161,7 +202,8 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             projectRoot: root,
             defaults: defaults,
             credentials: KeychainCredentialStore(),
-            notificationService: JobNotificationService()
+            notificationService: JobNotificationService(),
+            sharingService: SessionSharingService()
         )
     }
 
@@ -172,9 +214,11 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         projectRoot: String,
         defaults: UserDefaults,
         credentials: CredentialStore,
-        notificationService: JobNotificationService
+        notificationService: JobNotificationService,
+        sharingService: SessionSharingService? = nil
     ) {
         self.sessions = sessions
+        self.sharingService = sharingService
         self.defaults = defaults
         self.credentials = credentials
         self.notificationService = notificationService
@@ -185,6 +229,9 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         jumpHostname = preferences.jumpHostname
         duoOption = preferences.duoOption
         rememberPassword = preferences.rememberPassword
+        shareSessions = preferences.shareSessions
+        sampleJobUsage = preferences.sampleJobUsage
+        reconnectAutomatically = preferences.reconnectAutomatically
         notifyWhenGPUFrees = defaults.bool(forKey: Self.notifyWhenGPUFreesKey)
         selection = SidebarSelection(storageKey: preferences.selection) ?? .overview
         if case .cluster(let id) = selection, !sessions.contains(where: { $0.id == id }) {
@@ -249,6 +296,7 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             session.start()
         }
         startHeartbeat()
+        startSessionContinuity()
     }
 
     /// App termination: cancels sign-ins (their helper process groups get
@@ -259,6 +307,10 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         cancelLogins()
         heartbeat?.invalidate()
         heartbeat = nil
+        // The masters outlive the app, and so do their shared links.
+        continuityTimer?.invalidate()
+        continuityTimer = nil
+        connectivity?.stop()
         for session in sessions {
             session.prepareForTermination()
         }
@@ -371,6 +423,19 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         enqueueLogins(for: ids.compactMap { session(for: $0) }, forceReplace: true)
     }
 
+    /// "Renew all": signs in to `ids` again from scratch — on the rash
+    /// route the shared jump master first — so every session's age starts
+    /// over (the bedtime refresh before a long unattended stretch). Like
+    /// Reconnect it replaces healthy masters, one Duo push per leg, so
+    /// callers confirm first (`renewConfirmation()`).
+    func renew(_ ids: [ClusterID]) {
+        enqueueLogins(
+            for: ids.compactMap { session(for: $0) },
+            forceReplace: true,
+            renewJumpHost: connectionRoute == .rashJump
+        )
+    }
+
     /// Signs out of one cluster: closes its ControlMaster, which ends every
     /// terminal and transfer on it — callers confirm first
     /// (`runningTerminalCount(on:)`). The last snapshot stays on screen.
@@ -382,6 +447,7 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             return
         }
         let stopJump = Self.disconnectLeavesJumpHostUnused(session, among: sessions)
+        autoReconnect.forget(id)
         Task {
             await session.disconnect(stopJumpIfUnused: stopJump)
         }
@@ -406,6 +472,9 @@ final class AppModel: ObservableObject, ClusterSessionHost {
     /// Stops every queued and running sign-in. The running helper's process
     /// group is signalled at once, and no queued cluster sends a Duo push.
     func cancelLogins() {
+        for id in autoReconnect.states.keys {
+            autoReconnect.record(.cancelled, for: id, automatic: true, at: Date())
+        }
         loginChainGeneration += 1
         // The tail link stops as soon as it resumes. It is deliberately kept
         // as `loginChain`: a sign-in requested right after this waits for
@@ -423,7 +492,15 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             .reduce(0) { $0 + $1.terminals.sessions.filter(\.isRunning).count }
     }
 
-    private func enqueueLogins(for targets: [ClusterSession], forceReplace: Bool) {
+    /// `automatic` marks a sign-in the app started by itself after a
+    /// dropped session (`AutoReconnectPolicy`); its outcomes are recorded
+    /// there so a declined or unanswered push is never followed by another.
+    private func enqueueLogins(
+        for targets: [ClusterSession],
+        forceReplace: Bool,
+        renewJumpHost: Bool = false,
+        automatic: Bool = false
+    ) {
         let candidates = targets.filter { $0.isEnabled && !$0.isLoggingIn && !$0.isLoginQueued }
         guard !candidates.isEmpty else {
             return
@@ -482,6 +559,8 @@ final class AppModel: ObservableObject, ClusterSessionHost {
                 account: account,
                 configuration: configuration,
                 forceReplace: forceReplace,
+                renewJumpHost: renewJumpHost,
+                automatic: automatic,
                 generation: generation
             )
         }
@@ -523,8 +602,13 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         account: String,
         configuration: SignInConfiguration,
         forceReplace: Bool,
+        renewJumpHost: Bool,
+        automatic: Bool,
         generation: Int
     ) async {
+        // Only the first cluster that actually signs in renews the shared
+        // jump master; the others ride the new one.
+        var jumpRenewalPending = renewJumpHost
         for (index, id) in ids.enumerated() {
             // A cancelled link stops without touching any session:
             // `cancelLogins()` already un-queued every cluster it held, and
@@ -539,8 +623,13 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             let outcome = await session.performLogin(
                 password: loginPassword,
                 configuration: configuration,
-                forceReplace: forceReplace
+                forceReplace: forceReplace,
+                renewJumpHost: jumpRenewalPending
             )
+            if outcome != .skipped {
+                jumpRenewalPending = false
+            }
+            autoReconnect.record(outcome, for: id, automatic: automatic, at: Date())
             // Cancelled while this cluster signed in: its own outcome is
             // still handled below, but the clusters after it are left alone,
             // as above.
@@ -834,6 +923,9 @@ final class AppModel: ObservableObject, ClusterSessionHost {
         preferences.jumpHostname = jumpHostname.trimmingCharacters(in: .whitespacesAndNewlines)
         preferences.duoOption = duoOption.trimmingCharacters(in: .whitespacesAndNewlines)
         preferences.rememberPassword = rememberPassword
+        preferences.shareSessions = shareSessions
+        preferences.sampleJobUsage = sampleJobUsage
+        preferences.reconnectAutomatically = reconnectAutomatically
         preferences.selection = selection.storageKey
         for session in sessions {
             preferences.clusters[session.id.rawValue] = .init(
@@ -853,6 +945,9 @@ final class AppModel: ObservableObject, ClusterSessionHost {
             $jumpHostname.map { _ in () }.eraseToAnyPublisher(),
             $duoOption.map { _ in () }.eraseToAnyPublisher(),
             $rememberPassword.map { _ in () }.eraseToAnyPublisher(),
+            $shareSessions.map { _ in () }.eraseToAnyPublisher(),
+            $sampleJobUsage.map { _ in () }.eraseToAnyPublisher(),
+            $reconnectAutomatically.map { _ in () }.eraseToAnyPublisher(),
             $selection.map { _ in () }.eraseToAnyPublisher()
         ]
         for session in sessions {
@@ -935,6 +1030,210 @@ final class AppModel: ObservableObject, ClusterSessionHost {
                 }
             }
             .store(in: &cancellables)
+    }
+
+    // MARK: - Shared sessions, drops and automatic sign-in
+
+    /// Every live master other programs may ride: each live cluster's own,
+    /// and on the rash route the shared jump master (as "rash").
+    var sharedMasters: [SharedMaster] {
+        var masters: [SharedMaster] = []
+        for session in enabledSessions where session.isLoggedIn {
+            guard let live = session.activeConnection else {
+                continue
+            }
+            masters.append(SharedMaster(
+                name: session.id.rawValue,
+                displayName: session.displayName,
+                hostname: live.hostname,
+                username: live.username,
+                socketPath: live.controlPath
+            ))
+            if live.useJumpHost, !live.jumpControlPath.isEmpty,
+               !masters.contains(where: { $0.socketPath == live.jumpControlPath }) {
+                let label = live.jumpHostname.split(separator: ".").first.map(String.init) ?? ""
+                let usable = SessionSharing.isLiteralAlias(label) && !masters.contains { $0.name == label }
+                masters.append(SharedMaster(
+                    name: usable ? label : "jump",
+                    displayName: label.isEmpty ? live.jumpHostname : label,
+                    hostname: live.jumpHostname,
+                    username: live.username,
+                    socketPath: live.jumpControlPath
+                ))
+            }
+        }
+        return masters
+    }
+
+    private func startSessionContinuity() {
+        var sharingTriggers: [AnyPublisher<Void, Never>] = [
+            $shareSessions.map { _ in () }.eraseToAnyPublisher(),
+            $connectionRoute.map { _ in () }.eraseToAnyPublisher()
+        ]
+        for session in sessions {
+            sharingTriggers.append(session.$isLoggedIn.map { _ in () }.eraseToAnyPublisher())
+            sharingTriggers.append(session.$activeConnection.map { _ in () }.eraseToAnyPublisher())
+            sharingTriggers.append(session.$hasCompletedFirstProbe.map { _ in () }.eraseToAnyPublisher())
+            session.$droppedAt
+                .dropFirst()
+                .compactMap { $0 }
+                .removeDuplicates()
+                .sink { [weak self, weak session] date in
+                    MainActor.assumeIsolated {
+                        guard let self, let session else {
+                            return
+                        }
+                        self.sessionDropped(session, at: date)
+                    }
+                }
+                .store(in: &cancellables)
+        }
+        Publishers.MergeMany(sharingTriggers)
+            .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.scheduleSharingPass()
+                }
+            }
+            .store(in: &cancellables)
+
+        // Sharing passes pick up aliases freed by masters that ended on
+        // their own (the user's own `ssh aire-rash`, say) and the timers in
+        // the Sessions card; the policy checks whether a dropped cluster
+        // may be signed in again now that the user is back at the Mac.
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scheduleSharingPass()
+                self?.considerAutomaticSignIn()
+            }
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        continuityTimer = timer
+
+        let monitor = ConnectivityMonitor { [weak self] change in
+            self?.connectivityChanged(change)
+        }
+        monitor.start()
+        connectivity = monitor
+    }
+
+    /// Runs a sharing pass soon; passes requested while one runs coalesce
+    /// into one more.
+    func scheduleSharingPass() {
+        guard let sharingService, hasStarted else {
+            return
+        }
+        sharingPassRequested = true
+        guard sharingTask == nil else {
+            return
+        }
+        sharingTask = Task { [weak self] in
+            while let self, self.sharingPassRequested {
+                self.sharingPassRequested = false
+                // Until every cluster's startup probe has answered, "not
+                // live" may only mean "not checked yet": a pass now would
+                // remove links to masters that are fine.
+                guard self.enabledSessions.allSatisfy(\.hasCompletedFirstProbe) else {
+                    break
+                }
+                let report = await sharingService.reconcile(masters: self.sharedMasters, share: self.shareSessions)
+                self.applySharingReport(report)
+            }
+            self?.sharingTask = nil
+        }
+    }
+
+    private func applySharingReport(_ report: SessionSharingReport) {
+        for status in report.sessions {
+            lastKnownSessionStart[status.name] = status.since
+        }
+        set(\.sharingReport, report)
+    }
+
+    /// How long `id`'s session has been up, from its master's socket.
+    func sessionAge(of id: ClusterID, now: Date = Date()) -> TimeInterval? {
+        sharingReport.session(named: id.rawValue)?.since.map { now.timeIntervalSince($0) }
+    }
+
+    private func sessionDropped(_ session: ClusterSession, at date: Date) {
+        let lasted = lastKnownSessionStart[session.id.rawValue].map { date.timeIntervalSince($0) }
+        lastDrops[session.id] = SessionDrop(at: date, lasted: lasted)
+        let willSignIn = reconnectAutomatically && canSignInAutomatically
+        Log.sharing.info(
+            "\(session.id.rawValue, privacy: .public): dropped after \(lasted.map { SessionAge.text($0) } ?? "an unknown time", privacy: .public); automatic sign-in \(willSignIn ? "allowed" : "off or not possible", privacy: .public)"
+        )
+        if reconnectAutomatically {
+            autoReconnect.sessionDropped(session.id, at: date)
+        }
+        notificationService.notifySessionDropped(cluster: session.profile, lasted: lasted, signingInAgain: willSignIn)
+        scheduleSharingPass()
+        considerAutomaticSignIn()
+    }
+
+    #if DEBUG
+    /// Preview/test hook: shows these sessions, drops and automatic sign-in
+    /// states without touching ~/.ssh.
+    func installPreviewSharing(_ report: SessionSharingReport, drops: [ClusterID: SessionDrop] = [:], dropped: [ClusterID] = []) {
+        sharingReport = report
+        lastDrops = drops
+        for id in dropped {
+            autoReconnect.sessionDropped(id, at: Date())
+        }
+    }
+    #endif
+
+    /// A saved password the app may send without asking.
+    private var canSignInAutomatically: Bool {
+        rememberPassword && hasSavedPassword && !savedPasswordRejected
+    }
+
+    /// Signs dropped clusters in again when the policy says one is due and
+    /// the user is at the Mac with a working network. A plain sign-in: a
+    /// master that survived is reused without a push.
+    func considerAutomaticSignIn(now: Date = Date()) {
+        guard reconnectAutomatically, !autoReconnect.isEmpty else {
+            return
+        }
+        // Back on its own (a probe found the master answering again).
+        for id in autoReconnect.states.keys where session(for: id).map({ $0.isLoggedIn || !$0.isEnabled }) ?? true {
+            autoReconnect.forget(id)
+        }
+        autoReconnect.sweepLostAttempts(at: now)
+        guard !isAnyLoginActive, canSignInAutomatically,
+              connectivity?.isNetworkAvailable ?? true,
+              UserPresence.isActive() else {
+            return
+        }
+        let due = autoReconnect.due(at: now).compactMap { session(for: $0) }
+        guard !due.isEmpty else {
+            return
+        }
+        for session in due {
+            autoReconnect.attemptStarted(session.id, at: now)
+        }
+        Log.sharing.info("Signing in again automatically: \(due.map(\.id.rawValue).joined(separator: ", "), privacy: .public)")
+        enqueueLogins(for: due, forceReplace: false, automatic: true)
+        for session in due where !session.isLoginQueued && !session.isLoggingIn {
+            autoReconnect.record(.skipped, for: session.id, automatic: true, at: now)
+        }
+    }
+
+    /// Wake or a new network: look at every session now rather than at the
+    /// next (possibly backed-off) refresh, once the network had a moment.
+    private func connectivityChanged(_ change: ConnectivityMonitor.Change) {
+        Log.sharing.info("Connectivity changed (\(change.rawValue, privacy: .public)); checking every session")
+        connectivityTask?.cancel()
+        connectivityTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(change == .wake ? 5 : 3))
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            self.refreshAllQuietly()
+            await self.sharingService?.invalidateAliases()
+            self.scheduleSharingPass()
+            self.considerAutomaticSignIn()
+        }
     }
 
     // MARK: - Widget lease heartbeat

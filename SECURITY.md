@@ -104,10 +104,29 @@ On the rash route, every cluster's target master reaches its login host through 
 - **S12** proves that a plain login reuses a healthy master without Duo, and that a master answering its socket but running no command is left untouched (exit 5: same pid, no password sent, no Duo) until a forced login replaces it with one push. It also proves the `password sent` contract the Keychain save relies on (a fresh login prints it, a reused master never does), and that `HPC_REUSE_ONLY=1` adopts a master without a password or exits 4. **S13** proves that a timeout leaves no ssh and no FIFO behind.
 - **S15** proves that the stop helper stops exactly one route's master, refuses the jump socket, and stops the jump master only once nothing rides on it. Its masters are titled as real `-N` masters are (their own argv, never `[mux]`), so it also proves that the jump master's own argv is never counted as its own rider. **S16** proves that no master runs a remote command, every ProxyCommand is hardened, nothing uses `ControlMaster=auto`, and the collector keeps `ControlMaster=no` and `BatchMode=yes`.
 
+### Shared sessions, Renew all and automatic sign-in
+
+- **Sharing** only adds symlinks in `~/.ssh/ctl/` and at the `ControlPath` of your own matching `~/.ssh/config` aliases. Access is unchanged: a unix socket is reachable only by your user (0600 sockets in 0700 directories), symlink or not. Any program running as you could already open the app's sockets. Sharing makes them easy to find, so `ssh -O exit <alias>` closes the app's session too. Turn sharing off to remove every link. The app never deletes anything it did not create, apart from a dead socket that ssh would unlink itself, and never touches a socket another live session holds. Alias resolution runs `ssh -G`, which evaluates your config locally (including any `Match exec`) and never connects.
+- **Renew all** is confirmed first and costs one Duo push per leg.
+- **Sign in again after a drop** sends the saved password and a Duo push without a click. It is bounded so a push never arrives unasked:
+  - it needs keyboard or mouse input in the last two minutes and a working network;
+  - each cluster gets at most three attempts per drop;
+  - nothing is retried after a declined or unanswered push, a rejected or expired password, or Cancel sign-in;
+  - the existing never-resend rule for a rejected saved password still applies.
+
+  Turn it off in the Sessions card.
+- `scripts/hpc-session` never authenticates. It uses `BatchMode`, no config file and `ProxyCommand=false`, so a vanished master fails instead of dialling the host.
+
 ## Read-Only Monitoring
 
 - The collector (`scripts/hpc_snapshot.py`) makes one batched round trip per refresh (rarely a second, jobs-only one) over the cluster's existing master. It runs only read-only commands: `sinfo`, `squeue`, `scontrol show node|job`, `df`, `quota`, `lfs quota|project`, `test -d`, `ps`, `hostname` and `whoami`. It writes nothing on the cluster, submits or cancels nothing, and never receives a password.
 - It can only be a client: `BatchMode=yes`, password, keyboard-interactive, public-key and GSSAPI authentication off, `ControlMaster=no`, and the same hardened jump ProxyCommand. It checks the master with `ssh -O check` first and reports "control master is not running" instead of dialling out.
+- **Job resource use** (`--job-usage`, the Jobs tab's **Sample** switch, default on) is the one section that leaves the login node:
+  - Once a minute, while one of your jobs runs, the login node reaches each node of your running jobs with `ssh -o BatchMode=yes`. That uses the cluster's own key setup, and `pam_slurm_adopt` admits you only where you have a job.
+  - On the node it reads cgroup counter files and runs one `nvidia-smi --query-gpu` and `sleep 1` inside the adopted job's allocation. It writes nothing, starts no job step, and never sends a password.
+  - The only touch on a running job is that second of `nvidia-smi` (tens of MB charged to its cgroup).
+  - A first visit may add the node's host key to your cluster-side `~/.ssh/known_hosts` (`StrictHostKeyChecking=accept-new`).
+  - Switch **Sample** off to stop it.
 - Usernames and hostnames must be plain SSH words (never starting with `-`), and storage path templates may expand only `$USER` and `$HOME`; everything else is single-quoted into the remote script.
 - Storage commands are bounded with coreutils `timeout` where the login node has it. Killing the local ssh does not stop a remote command stuck in filesystem I/O, so a `ps -u "$USER"` check skips the whole storage section while a `df`, `quota`, `lfs` or `test -d` from an earlier refresh is still stuck, instead of piling up more. It uses no lock file and writes nothing.
 - The desktop widget never handles a password. It reads the app's per-cluster snapshots. Only when the app is not feeding a cluster (no fresh `app_state.json`) does it run the collector itself, with the password-free arguments the app recorded in `collector.json`, and never when the control socket is missing. It executes only a script path that resolves inside the checkout (no absolute path, `~`, `..` or symlink escape).

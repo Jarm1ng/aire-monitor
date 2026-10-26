@@ -1185,7 +1185,8 @@ class AssembleTests(unittest.TestCase):
         self.assertEqual(keys[0], "schema_version")
         self.assertEqual(payload["schema_version"], hs.SCHEMA_VERSION)
         self.assertEqual(keys[1:], ["collected_at", "cluster", "remote", "jobs", "partitions", "nodes", "storage",
-                                    "errors", "warnings", "storage_skipped", "started_at", "duration_ms", "timings"])
+                                    "errors", "warnings", "storage_skipped", "started_at", "duration_ms", "timings",
+                                    "job_usage"])
         job_keys = list(payload["jobs"][0])
         self.assertEqual(job_keys[-4:], ["array_job_id", "array_pending_tasks", "array_throttle",
                                          "pending_task_count"])
@@ -1847,6 +1848,190 @@ class ContractFixtureTests(unittest.TestCase):
         self.assertEqual([row["label"] for row in payload["storage"]], ["Home", "Scratch"])
         # Dates are rendered in UTC for the fixture, whatever the host's TZ.
         self.assertEqual(jobs["40188"]["start_time"], "2026-10-12T08:34:50")
+
+
+class JobUsageParsingTests(unittest.TestCase):
+    def test_hostlists_and_indices(self):
+        self.assertEqual(hs.expand_hostlist("calder-h200-[01-03,07]"),
+                         ["calder-h200-01", "calder-h200-02", "calder-h200-03", "calder-h200-07"])
+        self.assertEqual(hs.expand_hostlist("gpu001,cpu[9-10]"), ["gpu001", "cpu9", "cpu10"])
+        self.assertEqual(hs.parse_index_list("0-3,8,x,10-11"), [0, 1, 2, 3, 8, 10, 11])
+
+    def test_allocation_line(self):
+        allocation = hs.parse_job_allocation(
+            "Nodes=calder-h200-[01-02] CPU_IDs=0-31,64-95 Mem=256000 GRES=gpu:nvidia_h200:4(IDX:0-3)")
+        self.assertEqual(allocation, {"nodes": ["calder-h200-01", "calder-h200-02"], "cpus": 64,
+                                      "memory_mb": 256000, "gpu_indices": [0, 1, 2, 3]})
+        self.assertEqual(hs.parse_job_allocation("Nodes=cpu1 CPU_IDs=4 Mem=1000 GRES=")["gpu_indices"], [])
+
+    def test_gpu_rows(self):
+        row = hs.parse_gpu_usage_line("2, NVIDIA H200, 97, 41, 70123, 143771, 655.30, 700.00, 61")
+        self.assertEqual((row.index, row.name, row.utilization_percent, row.memory_used_mb, row.power_watts),
+                         (2, "NVIDIA H200", 97.0, 70123.0, 655.3))
+        self.assertIsNone(hs.parse_gpu_usage_line("0, NVIDIA L40S, [N/A], 0, 1, 2, [Not Supported], 3, 4")
+                          .utilization_percent)
+        self.assertIsNone(hs.parse_gpu_usage_line("No devices were found"))
+
+    def test_section(self):
+        text = "\n".join([
+            "job|500|500|gpu01",
+            "detail|500|Nodes=gpu01 CPU_IDs=0-7 Mem=64000 GRES=gpu:h200:2(IDX:0-1)",
+            "on|gpu01|500",
+            "job|501|77_3|gpu01",
+            "detail|501|Nodes=gpu01 CPU_IDs=8-15 Mem=64000 GRES=gpu:h200:2(IDX:2-3)",
+            "on|gpu01|501",
+            "job|502|502|gone01",
+            "on|gone01|502",
+            "job|503|503|slow01",
+            "on|slow01|503",
+            "node|gpu01|t|0|1000.0",
+            "node|gpu01|cg|0|500|1000000|0|0|0|max",
+            "node|gpu01|cg|0|501|5000000|0|0|0|max",
+            "node|gpu01|self|0::/system.slice/slurmstepd.scope/job_500/step_extern/user/task_special",
+            "node|gpu01|gpu|0, NVIDIA H200, 97, 40, 70000, 143771, 650, 700, 60",
+            "node|gpu01|gpu|1, NVIDIA H200, 12, 3, 9000, 143771, 120, 700, 41",
+            "node|gpu01|t|1|1001.0",
+            "node|gpu01|cg|1|500|7000000|2147483648|4294967296|5368709120|68719476736",
+            "node|gpu01|cg|1|501|5100000|1048576|1048576|1048576|max",
+            "node|gpu01|rc|0",
+            "node|gone01|Access denied: user alice (uid=1) has no active jobs on this node.",
+            "node|gone01|rc|255",
+            "node|slow01|rc|124",
+        ])
+        usage = {(row.job_id, row.node): row for row in hs.parse_job_usage(text)}
+        first = usage[("500", "gpu01")]
+        self.assertEqual(first.cpus_allocated, 8)
+        self.assertEqual(first.cpus_busy, 6.0)
+        self.assertEqual((first.memory_used_mb, first.memory_charged_mb, first.memory_peak_mb, first.memory_limit_mb),
+                         (2048.0, 4096.0, 5120.0, 65536.0))
+        self.assertEqual([gpu.index for gpu in first.gpus], [0, 1])
+        self.assertIsNone(first.note)
+        second = usage[("501", "gpu01")]
+        self.assertEqual(second.display_id, "77_3")
+        self.assertEqual(second.cpus_busy, 0.1)
+        self.assertEqual(second.memory_limit_mb, 64000.0)
+        self.assertEqual(second.gpus, [])
+        self.assertIn("come from your job 500", second.note)
+        self.assertIn("ended before", usage[("502", "gone01")].note)
+        self.assertIn("in time", usage[("503", "slow01")].note)
+
+    def test_not_requested_means_not_sampled(self):
+        snapshot = assemble(round_trip_output())
+        self.assertIsNone(snapshot.job_usage)
+        self.assertFalse(any("job_usage" in warning for warning in snapshot.warnings))
+
+
+class JobUsageScriptTests(unittest.TestCase):
+    """The job_usage section run for real, in every available shell, with
+    stub squeue/scontrol/ssh/nvidia-smi/date/sleep and fake cgroup files.
+    The ssh stub runs the probe locally as if on the named node."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="hpc-usage-test.")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        root = hs.shell_single_quote(self.root)
+        _write_stub(self.bin, "squeue", 'printf "500|500|gpu01\\n501|77_3|cpu[01-02]\\n502|502|gone01\\n"\n')
+        _write_stub(self.bin, "scontrol", (
+            'if [ "$1" = show ] && [ "$2" = hostnames ]; then\n'
+            '  case "$3" in "cpu[01-02]") printf "cpu01\\ncpu02\\n" ;; *) printf "%s\\n" "$3" ;; esac; exit 0\n'
+            'fi\n'
+            'case "$4" in\n'
+            '500) printf "JobId=500 JobName=train\\n   Nodes=gpu01 CPU_IDs=0-3 Mem=8000 GRES=gpu:h200:2(IDX:0-1)\\n" ;;\n'
+            '501) printf "JobId=501\\n   Nodes=cpu[01-02] CPU_IDs=0-1 Mem=2000 GRES=\\n" ;;\n'
+            '502) printf "JobId=502\\n   Nodes=gone01 CPU_IDs=0 Mem=100 GRES=\\n" ;;\n'
+            'esac\n'
+        ))
+        _write_stub(self.bin, "timeout", 'shift\nexec "$@"\n')
+        _write_stub(self.bin, "ssh", (
+            'while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -T|-x) shift ;; *) break ;; esac; done\n'
+            'host=$1; shift\n'
+            'if [ "$host" = gone01 ]; then echo "Access denied: user alice (uid=1) has no active jobs on this node." >&2; exit 1; fi\n'
+            'HPC_TEST_NODE=$host; HPC_CGROUP_ROOT=' + root + '/cg/$host; HPC_SELF_CGROUP=' + root + '/cg/$host/self\n'
+            'export HPC_TEST_NODE HPC_CGROUP_ROOT HPC_SELF_CGROUP\n'
+            'exec "$@"\n'
+        ))
+        # Each node's clock: date prints it, sleep advances it by one second
+        # and charges the jobs' cgroups 2 s (gpu01) or 0.5 s (cpu nodes) of CPU.
+        _write_stub(self.bin, "date", 'cat "$HPC_CGROUP_ROOT/clock" 2>/dev/null || echo 1000.0\n')
+        _write_stub(self.bin, "sleep", (
+            '[ -n "${HPC_CGROUP_ROOT:-}" ] || exit 0\n'
+            'echo 1001.0 > "$HPC_CGROUP_ROOT/clock"\n'
+            'for f in "$HPC_CGROUP_ROOT"/system.slice/slurmstepd.scope/job_*/cpu.stat; do\n'
+            '  read -r key value < "$f"; printf "usage_usec %s\\n" $((value + $(cat "$HPC_CGROUP_ROOT/charge"))) > "$f"\n'
+            'done\n'
+        ))
+        _write_stub(self.bin, "nvidia-smi", (
+            'case "$HPC_TEST_NODE" in\n'
+            'gpu01) printf "0, NVIDIA H200, 95, 40, 70000, 143771, 650.5, 700.0, 60\\n1, NVIDIA H200, 15, 2, 4000, 143771, 120.0, 700.0, 40\\n" ;;\n'
+            '*) echo "NVIDIA-SMI has failed because it couldn\'t communicate with the NVIDIA driver."; exit 9 ;;\n'
+            'esac\n'
+        ))
+        self.env = {"PATH": self.bin + os.pathsep + "/usr/bin:/bin", "USER": "alice", "HOME": self.root,
+                    "LC_ALL": "C"}
+        for node, jobs, charge in (("gpu01", ["500"], 2000000), ("cpu01", ["501"], 500000), ("cpu02", ["501"], 500000)):
+            base = os.path.join(self.root, "cg", node)
+            for job in jobs:
+                directory = os.path.join(base, "system.slice", "slurmstepd.scope", "job_" + job)
+                os.makedirs(directory)
+                for name, content in (("cpu.stat", "usage_usec 1000000\n"),
+                                      ("memory.stat", "anon 1073741824\nfile 5\n"),
+                                      ("memory.current", "2147483648\n"), ("memory.peak", "3221225472\n"),
+                                      ("memory.max", "max\n")):
+                    with open(os.path.join(directory, name), "w") as handle:
+                        handle.write(content)
+            with open(os.path.join(base, "charge"), "w") as handle:
+                handle.write(str(charge))
+            with open(os.path.join(base, "clock"), "w") as handle:
+                handle.write("1000.0\n")
+            with open(os.path.join(base, "self"), "w") as handle:
+                handle.write("0::/system.slice/slurmstepd.scope/job_%s/step_extern/user/task_special\n" % jobs[0])
+
+    def reset_clocks(self):
+        for node in ("gpu01", "cpu01", "cpu02"):
+            base = os.path.join(self.root, "cg", node)
+            with open(os.path.join(base, "clock"), "w") as handle:
+                handle.write("1000.0\n")
+            for job in os.listdir(os.path.join(base, "system.slice", "slurmstepd.scope")):
+                with open(os.path.join(base, "system.slice", "slurmstepd.scope", job, "cpu.stat"), "w") as handle:
+                    handle.write("usage_usec 1000000\n")
+
+    def test_section_in_every_shell(self):
+        script = hs.build_remote_script([], include_storage=False, include_job_usage=True)
+        for shell in available_shells():
+            with self.subTest(shell=shell):
+                self.reset_clocks()
+                completed = subprocess.run([shell, "-c", script], check=False, capture_output=True, text=True,
+                                           env=self.env, cwd=self.root, stdin=subprocess.DEVNULL, timeout=60)
+                sections, statuses = hs.split_sections(completed.stdout)
+                self.assertEqual(statuses.get("job_usage"), 0, completed.stdout + completed.stderr)
+                usage = {(row.job_id, row.node): row for row in hs.parse_job_usage(sections["job_usage"])}
+                self.assertEqual(sorted(usage), [("500", "gpu01"), ("501", "cpu01"), ("501", "cpu02"),
+                                                 ("502", "gone01")])
+                gpu = usage[("500", "gpu01")]
+                self.assertEqual((gpu.cpus_allocated, gpu.cpus_busy), (4, 2.0))
+                self.assertEqual((gpu.memory_used_mb, gpu.memory_charged_mb, gpu.memory_peak_mb, gpu.memory_limit_mb),
+                                 (1024.0, 2048.0, 3072.0, 8000.0))
+                self.assertEqual([(g.index, g.utilization_percent) for g in gpu.gpus], [(0, 95.0), (1, 15.0)])
+                self.assertIsNone(gpu.note)
+                cpu = usage[("501", "cpu02")]
+                self.assertEqual((cpu.display_id, cpu.cpus_busy, cpu.gpus, cpu.note), ("77_3", 0.5, [], None))
+                self.assertIn("ended before", usage[("502", "gone01")].note)
+
+    def test_snapshot_carries_usage_only_when_asked(self):
+        script = hs.build_remote_script([], include_storage=False, include_job_usage=True)
+        completed = subprocess.run(["/bin/sh", "-c", script], check=False, capture_output=True, text=True,
+                                   env=self.env, cwd=self.root, stdin=subprocess.DEVNULL, timeout=60)
+        config = calder_config(username="alice")
+        asked = hs.assemble_snapshot(config, CALDER, [], "now", completed.stdout, None, False,
+                                     skip_storage=True, job_usage=True)
+        self.assertEqual(len(asked.job_usage), 4)
+        payload = json.loads(json.dumps(hs.snapshot_payload(asked)))
+        self.assertEqual(payload["job_usage"][0]["gpus"][0]["name"], "NVIDIA H200")
+        not_asked = hs.assemble_snapshot(config, CALDER, [], "now", completed.stdout, None, False,
+                                         skip_storage=True, job_usage=False)
+        self.assertIsNone(not_asked.job_usage)
 
 
 def main(argv=None):

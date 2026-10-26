@@ -235,7 +235,7 @@ The sidebar offers exactly two routes, which apply to every cluster. **Both are 
 
 ### Login sequence
 
-`MonitorService.login(settings:password:forceReplace:onStatus:)` signs in to one cluster:
+`MonitorService.login(settings:password:forceReplace:renewJumpHost:onStatus:)` signs in to one cluster:
 
 1. **Jump leg (rash route only).** `scripts/hpc_ssh_login.expect` runs with the password on stdin and `HPC_SKIP_TARGET=1`, so it only makes sure the shared jump master is up (see the [shared jump master policy](#shared-jump-master-policy)) and exits. It reads stdin first and falls back to `HPC_PASSWORD` only when stdin is empty. The app attributes this leg's failures to "rash.leeds.ac.uk (jump host)", not to the cluster: exit 13 means rash rejected the password, exit 15 that the rash Duo push was not approved. On the direct route this step is skipped.
 2. **Target leg (both routes).** `scripts/hpc_start_target_master.zsh` runs, again with the password as the first stdin line (read with `IFS= read -rs`; `HPC_PASSWORD` only when stdin is empty, and every password variable, including the pre-rename `AIRE_*` names, is scrubbed at once).
@@ -264,7 +264,8 @@ Set by `MonitorService` for both legs and for adoption:
 | `HPC_JUMP_HOSTNAME`, `HPC_JUMP_CONTROL_PATH` | jump host and shared jump socket (socket set on the rash route only) |
 | `HPC_CONTROL_PATH` | this cluster's socket |
 | `HPC_DUO_OPTION` | Duo menu answer (default `1` = push) |
-| `HPC_FORCE_RELOGIN` | `1` only for the confirmed Reconnect, otherwise `0`; applies to the **target** master only |
+| `HPC_FORCE_RELOGIN` | `1` only for the confirmed Reconnect and Renew all, otherwise `0`; applies to the **target** master only |
+| `HPC_RENEW_JUMP_HOST` | `1` only for the first cluster of a confirmed Renew all on the rash route: the jump leg replaces even a healthy jump master; otherwise `0` |
 | `HPC_REUSE_ONLY` | `1` only for adoption, otherwise `0`: adopt a healthy master or exit 4, with no password, teardown or Duo |
 | `HPC_LOGIN_DEBUG_LOG` | `.runtime/clusters/<id>/login_debug.log` |
 | `HPC_TIMEOUT` | `180`: the starter's deadline for connect, password and Duo (its default is 150), and the expect helper's per-prompt limit (its default is 120) |
@@ -342,6 +343,32 @@ Other failures are matched against common ssh output by `MonitorService.explainS
 
 A collector killed by its watchdog and a `scancel` that times out get their own messages, never the login-timeout wording. Every message includes the raw ssh output.
 
+## Sessions: Sharing, Renewal and Drops
+
+### Sharing with Terminal and Claude sessions
+
+`SessionSharing.swift` lets every other program ride the app's sign-in. Another program might be `ssh`, `scp` or `rsync` in Terminal, or a Claude session running commands on a cluster. With **Share with Terminal and Claude sessions** on (the Sessions card; default on), `AppModel` runs a sharing pass whenever a session goes live or away, and every 30 s:
+
+- **Stable links.** `~/.ssh/ctl/<name>.sock` points at each live master: `aire`, `calder`, and on the rash route `rash` (the jump master). `scripts/hpc-session` and `ssh -S` use these.
+- **Alias links.** Every literal `Host` alias in `~/.ssh/config` (and the files it `Include`s) is resolved with `ssh -G <alias>`. That runs locally, never connects, and is cached until the config files change. An alias whose host, user and port 22 match a live master gets a symlink at its own `ControlPath` (`%C` and friends expanded by ssh). A plain `ssh aire` then multiplexes over the app's session: no password, no Duo. An alias with `ProxyJump rash` rides the shared rash session for its first hop as well.
+- **Never over someone else's live session.** A path where another live master listens is reported as held by your own session and left alone. That covers your own `ssh aire-rash`, or a link you made yourself. It is linked once that master has gone. A dead socket left behind is replaced, as ssh itself would unlink it. Links are created with `symlink(2)` only, never renamed over a path, so a master ssh binds there at the same moment is never clobbered.
+- **Cleaned up.** The links the app made are recorded with their targets in `~/.ssh/ctl/shared-sessions.json` (0600), which also lists every session's start time and each alias's state for the CLI. When a master goes away, or sharing is switched off, each recorded link that still points where the app put it is removed, so `ssh <alias>` can become a master of its own again. Links survive an app quit, like the masters.
+- A Reconnect binds the same socket path, so links keep working without a pass; a route change moves them.
+
+Passes run only once every enabled cluster's startup probe has answered, so a relaunch never removes links to masters that are fine. `scripts/hpc-session` (`status`, `check`, `wait`, `run <name> [--wait S] -- <command>`, `shell`) rides the stable links with `-F /dev/null`, `BatchMode` and `ProxyCommand=false`. It never prompts and never dials directly, and it exits 75 when a session is down or dropped mid-command.
+
+### Session ages and Renew all
+
+A master's age is its socket's birth time (`st_birthtime`). That is the moment the sign-in completed, for masters adopted from an earlier run too. The Sessions card shows each age (rash, AIRE, Calder), and so do the menu bar dropdown and `hpc-session status`. An age of 11 h or more turns orange: sessions have ended about 12 h after the VPN session began.
+
+**Renew all…** (Sessions card, and the Reconnect… menu) is a confirmed forced sign-in of every enabled cluster (`AppModel.renew`). On the rash route the first cluster's jump leg runs with `HPC_RENEW_JUMP_HOST=1`, so the shared jump master is replaced too. That drops every tunnelled cluster, which the same chain then signs in again over the new one. Cost: one Duo push per leg (rash, AIRE, Calder), one at a time. Everything riding the old sessions closes first, shared `ssh` commands included. If the 12 h limit comes from the VPN, renewing SSH does not extend the VPN itself; reconnect the VPN first, or use the rash route off-VPN.
+
+### Drops on a Mac that moves around
+
+- `ConnectivityMonitor` (wake notifications and `NWPathMonitor`) has every session checked a few seconds after wake or a network change, instead of at the next, possibly backed-off, refresh. Dead links go in the same pass.
+- A session that was live and loses its master, or stops answering three times, gets `ClusterSession.droppedAt`. A Disconnect, route change or failed sign-in never does. The app posts "<cluster> session dropped after N h" and the Sessions card shows when it dropped and how long it had lasted.
+- **Sign in again after a drop** (default on) lets `AutoReconnectPolicy` queue a plain sign-in, reusing any master that survived. Every condition must hold: a saved Keychain password that was not rejected, keyboard or mouse input in the last two minutes, and a usable network. Each cluster gets at most three attempts per drop, 150 s apart (ssh closes a dead master within five minutes). After a declined or unanswered push, a rejected or expired password, a rash failure or Cancel sign-in, nothing is retried until the user signs in themselves.
+
 ## Runtime Layout
 
 All paths are relative to the project root unless they start with `~`.
@@ -400,6 +427,17 @@ Control sockets live in `~/.ssh/ctl/` (mode 700) with short SHA-256-based names.
 - The script exits 0 when `errors` is empty and 1 otherwise. Its unit tests live in `scripts/tests/test_snapshot.py` (`--self-test` runs them). `Tests/Fixtures/collector_snapshot.json` and `collector_contract.json` pin the contract; regenerate them with `python3 scripts/tests/test_snapshot.py --write-fixture`.
 
 See [MONITORING_PROTOTYPE.md](MONITORING_PROTOTYPE.md) for the collector's command list and JSON details.
+
+## Job Resource Use
+
+With **Sample** on (Jobs → Resource use; default on), a refresh adds the collector's `--job-usage` section once a minute while one of the user's jobs runs (`ClusterSession.wantsJobUsage`; a manual Refresh always). The section lists running jobs (`squeue -t R -o '%A|%i|%N'`) and their per-node allocation (`scontrol -d show job`: `CPU_IDs`, `Mem`, GRES `IDX`). It then reaches each node with ssh from the login node, in parallel and bounded at 12 s each, at most 24 nodes. `pam_slurm_adopt` admits the user only where they have a job and adopts the session into one of them. On the node a short probe:
+
+- reads every listed job's cgroup v2 counters twice, a second apart: `cpu.stat` `usage_usec` for CPUs busy, `memory.stat` `anon`, `memory.current`, `memory.peak` and `memory.max`;
+- runs one `nvidia-smi --query-gpu=minor_number,...` query in between.
+
+GPUs are attributed by minor number against Slurm's IDX. Only the adopted job's GPUs are visible, so on a node running several of the user's jobs the others' GPU figures are reported as missing, with a note. Nothing is started in a job (no `srun` steps) and nothing is written on the node. The probe's `nvidia-smi` and `sleep` run about a second inside the adopted job's cgroup (tens of MB). The section is never part of `collector.json`, so the widget's own collections stay on the login node.
+
+`snapshot.job_usage` holds one row per (job, node): `null` when not sampled, `[]` when sampled with nothing running. The session keeps the rows itself (`jobUsage`, keyed by `Job.jobId`) with a two-hour trend per job (`JobUsageHistory`). The Jobs tab shows a card per running job: a verdict (well used, N of M GPUs idle, partly used, mostly idle), GPU utilisation, GPU memory, CPUs busy against allocated, memory against the limit, and the trend. The job sheet adds per-node and per-GPU rows (memory, power, temperature) and a chart. Sampling off clears the figures.
 
 ## Terminal
 
@@ -542,7 +580,9 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `ClusterBackend.swift`, `MonitorService.swift`, `SSHMuxOptions.swift` | the process boundary: helpers, collector, remote commands, scp, stop and adopt; client options for anything riding a master |
 | `ClusterCacheWriter.swift`, `SnapshotCache.swift` | runtime files: background writer, snapshot, history, job baseline, lease, preferences, migration |
 | `ClusterProfile.swift`, `KeychainPasswordStore.swift`, `Logging.swift` | profiles and catalog; the Keychain item; unified-log categories |
-| `JobStateDiff.swift`, `JobNotifications.swift` | job events, notifications, GPU-free alert |
+| `JobStateDiff.swift`, `JobNotifications.swift` | job events, notifications, GPU-free alert, session-dropped alert |
+| `SessionSharing.swift`, `SessionContinuity.swift`, `SessionsCard.swift` | sharing the masters with `~/.ssh` aliases; wake/network handling, drops and `AutoReconnectPolicy`; the Sessions card |
+| `JobUsageViews.swift`, `Sources/HPCCore/JobUsage.swift` | per-job resource use: Resource use cards, the job sheet's section; the decoded rows, summaries and trend |
 | `ContentView.swift`, `Sidebar.swift`, `ClusterViews.swift`, `ShellStatusStrip.swift`, `Components.swift`, `Theme.swift` | window, sidebar, session menu and confirmations, status strip, shared components |
 | `OverviewDashboard.swift`, `OverviewModel.swift` | overview |
 | `JobsDashboard.swift`, `PartitionsDashboard.swift`, `NodesDashboard.swift`, `TrendsDashboard.swift`, `TrendSeries.swift`, `StorageDashboard.swift`, `SlurmFormatting.swift` | cluster tabs |
@@ -554,6 +594,7 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `scripts/install_app.sh` | install, update or remove `Leeds HPC Monitor.app` in `/Applications` (or `HPC_INSTALL_DIR`, `~/Applications`) |
 | `scripts/hpc_ssh_login.expect`, `hpc_start_target_master.zsh`, `hpc_stop_master.zsh`, `hpc_ssh_askpass.sh`, `hpc_ssh_common.zsh` | jump leg, target master, sign-out, askpass, and the shared ssh option sets and kill rules (sourced, never executed) |
 | `scripts/hpc_snapshot.py` | the collector |
+| `scripts/hpc-session` | command line for other programs: `status`, `check`, `wait`, `run`, `shell` over the shared sessions |
 | `scripts/test_all.sh`, `render_previews.sh`, `scripts/tests/` | test runner, renders, Python suites and the fake ssh |
 | `Tests/AIREMonitorAppTests/`, `Tests/Fixtures/` | Swift tests and their runner, collector contract fixtures |
 

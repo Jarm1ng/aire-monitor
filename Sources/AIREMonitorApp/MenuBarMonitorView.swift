@@ -276,6 +276,20 @@ private struct MenuClusterSection: View {
             statusRow(text: error, color: StatusTone.warning.color, action: nil)
         }
 
+        if let since = cluster.sessionSince {
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                let age = context.date.timeIntervalSince(since)
+                Label(
+                    "Session up \(SessionAge.text(age))" + (age >= SessionAge.renewSuggestedAfter ? " — renew soon" : ""),
+                    systemImage: "timer"
+                )
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(age >= SessionAge.renewSuggestedAfter ? AnyShapeStyle(StatusTone.warning.color) : AnyShapeStyle(.secondary))
+                .lineLimit(1)
+            }
+            .help("Signed in at \(since.formatted(date: .omitted, time: .shortened)). Renew all (in the dashboard sidebar) starts every session's clock over.")
+        }
+
         if cluster.hasSnapshot {
             if let asOf = cluster.asOfText {
                 Label("Figures \(asOf) — not live", systemImage: "clock.arrow.circlepath")
