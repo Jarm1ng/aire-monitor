@@ -21,6 +21,11 @@ struct JobsDashboard: View {
     /// Wired by DashboardView: closes the sheet, switches to the Files tab,
     /// and opens the job's working directory.
     var onBrowseWorkDir: (@MainActor (Job) -> Void)? = nil
+    /// What running jobs use on their nodes (`ClusterSession.jobUsage`),
+    /// with the recent trend, and the "Sample" switch.
+    var usage: [String: JobUsageSummary] = [:]
+    var usageHistory = JobUsageHistory()
+    var isSamplingUsage: Binding<Bool> = .constant(false)
 
     /// When the selected job was last present in a snapshot, for the
     /// "no longer in the queue" banner.
@@ -56,6 +61,17 @@ struct JobsDashboard: View {
                     systemImage: "checkmark.circle"
                 )
             } else {
+                if summary.running > 0 {
+                    JobUsagePanel(
+                        rows: rows,
+                        usage: usage,
+                        history: usageHistory,
+                        isSampling: isSamplingUsage,
+                        onSelect: { selectedJob = $0 }
+                    )
+                    .transition(.opacity)
+                }
+
                 JobPulsePanel(profile: profile, rows: rows, summary: summary)
                     .transition(.opacity.combined(with: .move(edge: .top)))
 
@@ -110,6 +126,9 @@ struct JobsDashboard: View {
                 isGone: live == nil,
                 lastSeen: selectedLastSeen?.id == selected.jobId ? selectedLastSeen?.at : nil,
                 runningSiblings: Self.runningSiblings(of: job, in: jobs),
+                usage: usage[job.jobId],
+                usageSeries: usageHistory.series(for: job.jobId),
+                isSamplingUsage: isSamplingUsage.wrappedValue,
                 onTailOutput: onTailOutput,
                 onCancelJob: onCancelJob,
                 onBrowseWorkDir: onBrowseWorkDir
@@ -794,6 +813,10 @@ struct JobDetailView: View {
     /// Running tasks of the same array, for a pending remainder's cancel
     /// dialog; nil when the caller does not know the rest of the queue.
     var runningSiblings: [Job]? = nil
+    /// The job's latest usage sample and recent trend (running jobs only).
+    var usage: JobUsageSummary? = nil
+    var usageSeries: [JobUsagePoint] = []
+    var isSamplingUsage = false
     var onTailOutput: (@MainActor (Job) -> Void)? = nil
     var onCancelJob: (@MainActor (Job) async throws -> Void)? = nil
     var onBrowseWorkDir: (@MainActor (Job) -> Void)? = nil
@@ -868,6 +891,10 @@ struct JobDetailView: View {
                                 }
                             }
                         }
+                    }
+
+                    if state.occupiesNodes && !isGone && !job.isArrayRemainder {
+                        JobUsageDetailSection(summary: usage, series: usageSeries, isSampling: isSamplingUsage)
                     }
 
                     DetailSection(title: "Resources", systemImage: "square.stack.3d.up") {

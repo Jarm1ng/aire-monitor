@@ -228,8 +228,15 @@ struct PreviewRenderTests {
                 name: "sidebar-\(suffix)"
             )
 
-            // Menu bar dropdown.
-            try render(MenuBarMonitorView(model: model, closeMenu: {}).fixedSize(horizontal: false, vertical: true), size: CGSize(width: 400, height: 900), appearance: appearance, name: "menubar-live-\(suffix)")
+            // Menu bar menu (a stand-in: an NSMenu cannot be drawn offscreen).
+            try render(
+                MenuBarMenuPreview(entries: MenuBarMenuLayout.build(digest: MenuBarDigest(model: model)))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10),
+                size: CGSize(width: MenuMetrics.minimumWidth + 20, height: 760),
+                appearance: appearance,
+                name: "menubar-live-\(suffix)"
+            )
 
             // Job detail sheet for the first job anywhere.
             if let session = model.sessions.first(where: { ($0.snapshot?.jobs.isEmpty ?? true) == false }),
@@ -332,8 +339,100 @@ struct PreviewRenderTests {
                     name: "sidebar-sign-in-\(suffix)"
                 )
                 // The menu bar while Calder is signed in but has no snapshot yet.
-                try render(MenuBarMonitorView(model: partial, closeMenu: {}).fixedSize(horizontal: false, vertical: true), size: CGSize(width: 400, height: 900), appearance: appearance, name: "menubar-partial-\(suffix)")
+                try render(
+                    MenuBarMenuPreview(entries: MenuBarMenuLayout.build(digest: MenuBarDigest(model: partial)))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(10),
+                    size: CGSize(width: MenuMetrics.minimumWidth + 20, height: 760),
+                    appearance: appearance,
+                    name: "menubar-partial-\(suffix)"
+                )
             }
+        }
+    }
+
+    @Test("Render the Sessions card, Resource use and a job's usage")
+    func renderSessionsAndUsage() throws {
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let now = Date()
+        let report = SessionSharingReport(
+            sessions: [
+                SharedSessionStatus(name: "rash", displayName: "rash", socketPath: "/tmp/jump.sock", stableLinkPath: "/tmp/rash.sock", since: now.addingTimeInterval(-23 * 3600 - 300)),
+                SharedSessionStatus(name: "aire", displayName: "AIRE", socketPath: "/tmp/aire.sock", stableLinkPath: "/tmp/aire.sock", since: now.addingTimeInterval(-10 * 3600 - 49 * 60))
+            ],
+            aliases: [
+                SharedAliasStatus(alias: "aire", sessionName: "aire", state: .linked),
+                SharedAliasStatus(alias: "rash", sessionName: "rash", state: .linked),
+                SharedAliasStatus(alias: "aire-rash", sessionName: "aire", state: .heldByOtherSession(since: now.addingTimeInterval(-36_000)))
+            ],
+            isSharing: true
+        )
+        let jobs = [
+            Job(jobId: "489997", partition: "calder-gpu-hopper", name: "train-llm", state: "RUNNING", elapsed: "3:12:09", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:4"),
+            Job(jobId: "490008", partition: "calder-cpu-turin", name: "preprocess", state: "RUNNING", elapsed: "0:42:10", nodes: "1"),
+            Job(jobId: "490032", partition: "calder-gpu-hopper", name: "eval", state: "PENDING", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:1")
+        ]
+        func gpu(_ index: Int, _ utilization: Double, _ memory: Double) -> GPUUsage {
+            GPUUsage(index: index, name: "NVIDIA H200", utilizationPercent: utilization, memoryUsedMB: memory, memoryTotalMB: 143_771, powerWatts: 120 + utilization * 5.5, temperatureC: 38 + utilization / 3)
+        }
+        let rows = [
+            JobNodeUsage(jobID: "489997", displayID: "489997", node: "calder-h200-03", cpusAllocated: 64, cpusBusy: 9.4,
+                         memoryUsedMB: 98_000, memoryPeakMB: 120_000, memoryLimitMB: 512_000, gpuIndices: [0, 1, 2, 3],
+                         gpus: [gpu(0, 97, 121_000), gpu(1, 1, 600), gpu(2, 0, 600), gpu(3, 95, 118_000)]),
+            JobNodeUsage(jobID: "490008", displayID: "490008", node: "calder-cpu-12", cpusAllocated: 32, cpusBusy: 30.1,
+                         memoryUsedMB: 40_000, memoryPeakMB: 52_000, memoryLimitMB: 128_000)
+        ]
+        let usage = JobUsageSummary.summaries(from: rows, sampledAt: now.addingTimeInterval(-25))
+        var history = JobUsageHistory()
+        for minute in stride(from: 90, through: 0, by: -1) {
+            let wobble = Double((minute * 37) % 23) - 11
+            let sample = JobUsageSummary.summaries(from: [
+                JobNodeUsage(jobID: "489997", displayID: "489997", node: "calder-h200-03", cpusAllocated: 64, cpusBusy: 9 + wobble / 4,
+                             memoryUsedMB: 98_000, memoryLimitMB: 512_000, gpuIndices: [0, 1, 2, 3],
+                             gpus: [gpu(0, 90 + wobble / 2, 121_000), gpu(1, 1, 600), gpu(2, 0, 600), gpu(3, 88 + wobble / 2, 118_000)])
+            ], sampledAt: now.addingTimeInterval(Double(-minute) * 60))
+            history.record(sample, running: ["489997", "490008"])
+        }
+        let profile = ClusterProfile.calder
+        let jobRows = JobRow.rows(for: jobs, profile: profile)
+
+        for appearance in [NSAppearance.Name.darkAqua, .aqua] {
+            let suffix = appearance == .darkAqua ? "dark" : "light"
+            let model = makeModel()
+            model.installPreviewSharing(
+                report,
+                drops: [.calder: SessionDrop(at: now.addingTimeInterval(-600), lasted: 3 * 3600 + 610)],
+                dropped: [.calder]
+            )
+            model.sessions.first { $0.id == .calder }?.installPreviewState(snapshot: nil, isLoggedIn: false)
+            try render(
+                SessionsCard(model: model, confirmation: .constant(nil))
+                    .padding(16)
+                    .environment(\.colorScheme, appearance == .darkAqua ? .dark : .light),
+                size: CGSize(width: 360, height: 420),
+                appearance: appearance,
+                name: "sessions-card-\(suffix)"
+            )
+            try render(
+                ScrollView {
+                    JobUsagePanel(rows: jobRows, usage: usage, history: history, isSampling: .constant(true), onSelect: { _ in })
+                        .padding(18)
+                },
+                size: CGSize(width: 1000, height: 420),
+                appearance: appearance,
+                name: "calder-job-usage-\(suffix)"
+            )
+            let sheet = JobDetailView(
+                profile: profile,
+                job: jobs[0],
+                usage: usage["489997"],
+                usageSeries: history.series(for: "489997"),
+                isSamplingUsage: true,
+                onTailOutput: { _ in },
+                onCancelJob: { _ in },
+                onBrowseWorkDir: { _ in }
+            )
+            try render(sheet, size: CGSize(width: 720, height: 1100), appearance: appearance, name: "calder-job-sheet-usage-\(suffix)")
         }
     }
 

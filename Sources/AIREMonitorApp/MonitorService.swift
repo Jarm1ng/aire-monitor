@@ -380,6 +380,7 @@ struct MonitorService: Sendable {
         }
         environment["HPC_FORCE_RELOGIN"] = "0"
         environment["HPC_REUSE_ONLY"] = "0"
+        environment["HPC_RENEW_JUMP_HOST"] = "0"
         environment["HPC_LOGIN_DEBUG_LOG"] = "\(settings.runtimeDirectory)/login_debug.log"
         // Per-prompt expect timeout; the watchdogs below derive from it.
         environment["HPC_TIMEOUT"] = String(HPCDefaults.loginPromptTimeout)
@@ -397,7 +398,10 @@ struct MonitorService: Sendable {
     /// socket but not a command is left running too (exit 5,
     /// `existingSessionUnresponsive`). `forceReplace` (the confirmed
     /// Reconnect only) sets HPC_FORCE_RELOGIN=1, which tears the existing
-    /// master down and authenticates afresh.
+    /// master down and authenticates afresh. `renewJumpHost` (the first
+    /// cluster of a confirmed "Renew all" on the rash route) also replaces
+    /// the shared jump master, which drops every other tunnelled cluster —
+    /// the renewal signs those in again right after.
     ///
     /// The result says whether any leg actually had the password checked
     /// (`LoginResult.passwordVerified`): a sign-in that only reused masters
@@ -406,6 +410,7 @@ struct MonitorService: Sendable {
         settings: ConnectionSettings,
         password: String,
         forceReplace: Bool = false,
+        renewJumpHost: Bool = false,
         onStatus: (@Sendable (String) -> Void)? = nil
     ) async throws -> LoginResult {
         try requireFile("\(settings.projectRoot)/\(Self.targetStarterScript)")
@@ -413,6 +418,7 @@ struct MonitorService: Sendable {
 
         var environment = helperEnvironment(settings: settings)
         environment["HPC_FORCE_RELOGIN"] = forceReplace ? "1" : "0"
+        environment["HPC_RENEW_JUMP_HOST"] = renewJumpHost && settings.useJumpHost ? "1" : "0"
 
         var statusLineHandler: (@Sendable (String) -> Void)?
         if let onStatus {
@@ -622,8 +628,9 @@ struct MonitorService: Sendable {
     /// part of `collectorArguments`, which collector.json hands to the
     /// widget verbatim — the widget would otherwise never collect storage.
     static let skipStorageFlag = "--skip-storage"
+    static let jobUsageFlag = "--job-usage"
 
-    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool = false) async throws -> ClusterSnapshot {
+    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool = false, jobUsage: Bool = false) async throws -> ClusterSnapshot {
         // Check the script first: the project root is a free-text field, and
         // creating runtime directories under a half-typed path would litter
         // the disk (and turn "missing file" into a confusing mkdir error).
@@ -633,7 +640,7 @@ struct MonitorService: Sendable {
 
         let result = try await runProcess(
             executable: "/usr/bin/python3",
-            arguments: [script] + Self.collectorArguments(settings: settings, skipStorage: skipStorage),
+            arguments: [script] + Self.collectorArguments(settings: settings, skipStorage: skipStorage, jobUsage: jobUsage),
             currentDirectory: settings.projectRoot,
             environment: Self.childEnvironment(),
             stdin: nil,
@@ -853,7 +860,7 @@ struct MonitorService: Sendable {
     /// widget can run the identical collection when the app is not running.
     /// `skipStorage` is for the app's own runs only; collector.json is
     /// always written from the default (storage collected).
-    static func collectorArguments(settings: ConnectionSettings, skipStorage: Bool = false) -> [String] {
+    static func collectorArguments(settings: ConnectionSettings, skipStorage: Bool = false, jobUsage: Bool = false) -> [String] {
         var arguments = [
             "--cluster-id", settings.clusterID.rawValue,
             "--cluster-name", settings.clusterName,
@@ -870,6 +877,11 @@ struct MonitorService: Sendable {
         }
         if skipStorage {
             arguments.append(skipStorageFlag)
+        }
+        // Never in collector.json: the widget's own collections stay on
+        // the login node.
+        if jobUsage {
+            arguments.append(jobUsageFlag)
         }
         return arguments
     }

@@ -43,6 +43,7 @@ struct ConnectionSidebar: View {
                 sessionPanel
                 signInCard
                 actions
+                SessionsCard(model: model, confirmation: $confirmation)
                 notificationsPanel
             }
             .padding(16)
@@ -463,6 +464,10 @@ struct ConnectionSidebar: View {
                     Button("Reconnect all…") {
                         confirmation = model.reconnectConfirmation(candidates.map(\.id))
                     }
+                }
+                Divider()
+                Button("Renew all sessions…") {
+                    confirmation = model.renewConfirmation()
                 }
             } label: {
                 Text("Reconnect…")

@@ -6,8 +6,8 @@ import Testing
 @testable import AIREMonitorApp
 
 // Menu bar: which clusters feed the status item, how jobs, array tasks and
-// GPU pools are counted and worded, whether the title fits its cap, and
-// that the dropdown's store only republishes real changes.
+// GPU pools are counted and worded, and the title's modes and width
+// classes. The menu's rows are in MenuBarMenuLayoutTests.swift.
 
 // MARK: - Fixtures
 
@@ -125,33 +125,29 @@ struct MenuBarDigestTests {
         #expect(digest.runningCount == 1)
         #expect(digest.primaryRunningJob?.cluster.id == .aire)
         let summary = StatusBarSummary(digest: digest)
-        guard case .singleJob(let owner, let job) = summary.mode else {
-            Issue.record("expected the single live job, got \(summary.mode)")
-            return
-        }
-        #expect(owner.id == .aire)
-        #expect(job.jobId == "8248307_0")
-        #expect(summary.title.hasPrefix("A · "))
+        #expect(summary.title == "1 running")
+        #expect(summary.widthClass == .running(digits: 2))
         // Calder's cached figures are named with their time instead.
         #expect(summary.tooltip.contains("17 running · 0 pending (as of "))
         #expect(digest.health == .partial)
     }
 
-    @Test("Only cached data: the title says Cached and shows no frozen elapsed time")
+    @Test("Only cached data: the glyph dims, no title, and no frozen elapsed time anywhere")
     func onlyCached() {
         let aire = cluster(.aire, .stale, jobs: [runningJob("1"), runningJob("2")], nodes: [mixedL40SNode])
         let calder = cluster(.calder, .notConnected, hasSnapshot: false)
         let digest = MenuBarDigest(clusters: [aire, calder])
         let summary = StatusBarSummary(digest: digest)
         #expect(digest.runningCount == 0)
-        #expect(summary.title == "Cached")
+        #expect(summary.title == "")
+        #expect(summary.widthClass == .glyph)
+        #expect(summary.isDimmed)
+        #expect(!summary.hasAttention)
         #expect(digest.health == .stale)
-        #expect(summary.tint == .secondaryLabelColor)
 
-        // The dropdown greys the cached rows and drops their elapsed time.
-        let row = MenuJobSummary(job: runningJob("1", elapsed: "9:29:15"), isLive: false)
-        #expect(row.timing == "Running")
-        #expect(row.color == .secondary)
+        // The menu's cached rows show the state, not an elapsed time.
+        let row = MenuJobLine(job: runningJob("1", elapsed: "9:29:15"), usage: nil, isLive: false, clash: false)
+        #expect(row.trailing == "Running")
         #expect(aire.asOfText?.hasPrefix("as of ") == true)
     }
 
@@ -161,7 +157,9 @@ struct MenuBarDigestTests {
             cluster(.aire, .checking, jobs: [runningJob("1")]),
             cluster(.calder, .off(hasCache: false), hasSnapshot: false)
         ])
-        #expect(StatusBarSummary(digest: digest).title == "Checking")
+        let summary = StatusBarSummary(digest: digest)
+        #expect(summary.title == "")
+        #expect(summary.isDimmed)
         #expect(digest.health == .connecting)
         #expect(digest.headerStatusLine == "AIRE checking")
     }
@@ -225,8 +223,11 @@ struct MenuBarDigestTests {
         #expect(digest.health == .partial)
         #expect(digest.headerStatusLine == "Calder Slurm not answering")
         let summary = StatusBarSummary(digest: digest)
-        #expect(summary.title == "Slurm error")
-        #expect(summary.tint == .systemOrange)
+        #expect(summary.title == "")
+        #expect(summary.isDimmed)
+        #expect(summary.hasAttention)
+        #expect(digest.attention.map(\.kind) == [.slurmDown])
+        #expect(summary.tooltip.contains("Needs a look: Calder: Slurm not answering"))
         #expect(summary.tooltip.contains("Slurm is not answering"))
         #expect(summary.tooltip.contains("1 running · 0 pending (not current)"))
 
@@ -274,9 +275,10 @@ struct MenuBarJobTests {
         #expect(digest.otherJobCount == 1)
         #expect(digest.jobCountsText == "1 running · 6 pending · 1 suspended")
 
-        let row = MenuJobSummary(job: remainder, isLive: true)
-        #expect(row.detail.hasPrefix("8248307_[2-5] (4 tasks) · gpu · reason JobArrayTaskLimit"))
-        #expect(row.timing == "Pending")
+        let row = MenuJobLine(job: remainder, usage: nil, isLive: true, clash: false)
+        #expect(row.title == "c3-d1a-pack (4 tasks)")
+        #expect(row.toolTip.hasPrefix("8248307_[2-5] (4 tasks) · gpu · reason JobArrayTaskLimit"))
+        #expect(row.trailing == "JobArrayTaskLimit")
     }
 
     @Test("Held jobs are never counted as pending: Calder's live queue reads '9 running · 1 pending · 11 held'")
@@ -332,11 +334,15 @@ struct MenuBarJobTests {
         #expect(cluster(.calder, .live, jobs: [runningJob("1")]).hiddenJobsText(afterFirst: 0) == "+1 more on Calder")
     }
 
-    @Test("A live running row shows elapsed and limit")
+    @Test("A live running row shows elapsed and limit compactly; the seconds go to the tooltip")
     func liveRow() {
-        let row = MenuJobSummary(job: runningJob("1", elapsed: "1:22:16"), isLive: true)
-        #expect(row.timing == "1:22:16 / 4:00:00")
-        #expect(row.iconName == "play.fill")
+        let row = MenuJobLine(job: runningJob("1", elapsed: "1:22:16"), usage: nil, isLive: true, clash: false)
+        #expect(row.title == "train")
+        #expect(row.trailing == "1h 22m of 4h")
+        #expect(!row.flagged)
+        #expect(row.toolTip.hasPrefix("1 · gpu · gpu003 — 1:22:16 of 4:00:00"))
+        let clash = MenuJobLine(job: runningJob("8248307_0", name: "train-resnet50"), usage: nil, isLive: true, clash: true)
+        #expect(clash.title == "train-resnet50 · 8248307_0")
     }
 }
 
@@ -411,12 +417,15 @@ struct MenuBarGPUPoolTests {
     func idleTitle() {
         let aire = cluster(.aire, .live, nodes: [mixedL40SNode, strandedNode])
         let calder = cluster(.calder, .live, nodes: calderNodes(l40State: "idle"))
-        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [aire, calder]))
+        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [aire, calder]), mode: .idleGPUs)
         #expect(summary.title == "A 2 · C 1+")
-        #expect(summary.widthTemplateTitle == "A 88 · C 88+")
+        #expect(summary.widthClass == .gpus(template: "A 88 · C 88+"))
         #expect(summary.accessibilityLabel.contains("Calder 1 idle H200 GPUs and 3 idle L40 GPUs"))
+        #expect(summary.tooltip.hasPrefix("Idle GPUs — AIRE 2 of 6 L40S; Calder 1 of 16 H200, 3 of 3 L40"))
+        // The default mode never shows GPUs: nothing runs, so the glyph only.
+        #expect(StatusBarSummary(digest: MenuBarDigest(clusters: [aire, calder])).title == "")
 
-        let drained = StatusBarSummary(digest: MenuBarDigest(clusters: [cluster(.calder, .live, nodes: calderNodes())]))
+        let drained = StatusBarSummary(digest: MenuBarDigest(clusters: [cluster(.calder, .live, nodes: calderNodes())]), mode: .idleGPUs)
         #expect(drained.title == "C 1")
     }
 }
@@ -433,10 +442,10 @@ struct UnknownGPUAllocationGlanceTests {
     @Test("Node details missing: the status item reads 'A ?', never 'A 0'")
     func statusItemTitle() {
         let aire = cluster(.aire, .live, nodes: unknownL40SNodes(3))
-        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [aire]))
+        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [aire]), mode: .idleGPUs)
         #expect(summary.title == "A ?")
-        #expect(summary.widthTemplateTitle == "A 88")
-        #expect(summary.accessibilityLabel == "Idle GPUs: AIRE idle L40S GPUs unknown")
+        #expect(summary.widthClass == .gpus(template: "A 88"))
+        #expect(summary.accessibilityLabel == "Leeds HPC Monitor: idle GPUs: AIRE idle L40S GPUs unknown")
         #expect(!summary.accessibilityLabel.contains("0 idle"))
         #expect(summary.tooltip.contains("L40S: ? of 9 idle · 9 unknown"))
 
@@ -445,9 +454,9 @@ struct UnknownGPUAllocationGlanceTests {
         let unknownPrimary = cluster(.calder, .live, nodes: [
             unknownH200Node("calder-h200-01"), unknownH200Node("calder-h200-02"), calderNodes(l40State: "idle")[2]
         ])
-        #expect(StatusBarSummary(digest: MenuBarDigest(clusters: [unknownPrimary])).title == "C ?+")
+        #expect(StatusBarSummary(digest: MenuBarDigest(clusters: [unknownPrimary]), mode: .idleGPUs).title == "C ?+")
         let unknownOther = cluster(.calder, .live, nodes: Array(calderNodes().prefix(2)) + unknownL40SNodes(1))
-        #expect(StatusBarSummary(digest: MenuBarDigest(clusters: [unknownOther])).title == "C 1")
+        #expect(StatusBarSummary(digest: MenuBarDigest(clusters: [unknownOther]), mode: .idleGPUs).title == "C 1")
     }
 
     @Test("Dropdown row: '?' and the unknown count, no '0 idle' or '0 in use'")
@@ -501,45 +510,98 @@ struct UnknownGPUAllocationGlanceTests {
 @MainActor
 @Suite("Status item title")
 struct StatusItemTitleTests {
-    @Test("A long name and a day-long elapsed still fit; the elapsed time is never cut")
-    func fitsCap() {
-        let job = runningJob("9926", name: "c2-mirrorsynth-gov", elapsed: "1-02:03:04")
-        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [cluster(.calder, .live, jobs: [job])]))
-        #expect(summary.title.hasPrefix("C · "))
-        #expect(summary.title.hasSuffix(" 1d 02h"))
-        #expect(summary.title.contains("…"))
-        let needed = StatusItemLayout.iconWidth + StatusItemLayout.textWidth(summary.widthTemplateTitle) + StatusItemLayout.padding
-        #expect(needed <= StatusItemLayout.maxLength)
-        #expect(StatusItemLayout.textWidth(summary.title) <= StatusItemLayout.maxTextWidth)
-        #expect(summary.reservedLength(hasIcon: true) <= StatusItemLayout.maxLength)
+    private func digest(running: Int) -> MenuBarDigest {
+        MenuBarDigest(clusters: [cluster(.aire, .live, jobs: (0..<running).map { runningJob("\($0)") })])
     }
 
-    @Test("A short name is kept whole")
-    func shortName() {
-        let job = runningJob("1", name: "train", elapsed: "9:29:15")
-        let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [job])]))
-        #expect(summary.title == "A · train 9h 29m")
-        #expect(summary.widthTemplateTitle == "A · train 8h 88m")
-        #expect(summary.accessibilityLabel == "train running on AIRE for 9 h 29 min")
+    @Test("The title is the live running count; the width holds from 1 to 99 and across ticks")
+    func runningCount() {
+        let widths = [1, 9, 10, 99].map { StatusBarSummary(digest: digest(running: $0)).reservedLength() }
+        #expect(Set(widths).count == 1)
+        #expect(widths[0] <= StatusItemLayout.maxRunningLength)
+        #expect(StatusBarSummary(digest: digest(running: 7)).title == "7 running")
+        // Elapsed times change on every refresh; the item never does.
+        let early = MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [runningJob("1", elapsed: "0:05:00")])])
+        let late = MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [runningJob("1", elapsed: "9:29:15")])])
+        #expect(StatusBarSummary(digest: early).title == StatusBarSummary(digest: late).title)
+        #expect(StatusBarSummary(digest: early).reservedLength() == StatusBarSummary(digest: late).reservedLength())
+        #expect(StatusBarSummary(digest: digest(running: 100)).widthClass == .running(digits: 3))
+        // The drawn title fills its slot exactly, so the centred glyph
+        // never moves between 9 and 10 running.
+        let drawn = [1, 9, 10, 99].map { StatusItemLayout.textWidth(StatusBarSummary(digest: digest(running: $0)).displayTitle) }
+        #expect(Set(drawn).count == 1)
+        #expect(drawn[0] == StatusItemLayout.textWidth("88 running"))
     }
 
-    @Test("Several live jobs: a count, broken down per cluster in the tooltip")
+    @Test("Idle GPUs: a second pool's idle count crossing zero never resizes or shifts the item")
+    func gpuWidthStable() {
+        func calder(_ l40State: String) -> MenuBarDigest {
+            MenuBarDigest(clusters: [cluster(.calder, .live, nodes: calderNodes(l40State: l40State))])
+        }
+        let none = StatusBarSummary(digest: calder("drain*"), mode: .idleGPUs)
+        let some = StatusBarSummary(digest: calder("idle"), mode: .idleGPUs)
+        #expect(none.title == "C 1")
+        #expect(some.title == "C 1+")
+        #expect(none.widthClass == some.widthClass)
+        #expect(none.reservedLength() == some.reservedLength())
+        #expect(StatusItemLayout.textWidth(none.displayTitle) == StatusItemLayout.textWidth(some.displayTitle))
+    }
+
+    @Test("Nothing running, or Icon Only: the glyph alone at the system's square length")
+    func glyphOnly() {
+        let idle = StatusBarSummary(digest: digest(running: 0))
+        #expect(idle.title == "")
+        #expect(idle.reservedLength() == NSStatusItem.squareLength)
+        #expect(!idle.isDimmed)
+        let iconOnly = StatusBarSummary(digest: digest(running: 3), mode: .iconOnly)
+        #expect(iconOnly.title == "")
+        #expect(iconOnly.reservedLength() == NSStatusItem.squareLength)
+    }
+
+    @Test("No state word is ever a title, in any phase")
+    func noStateWords() {
+        let phases: [ClusterPresentation.Phase] = [.notConnected, .checking, .queued, .signingIn, .loadingFirstSnapshot, .paused, .stale, .off(hasCache: false)]
+        for phase in phases {
+            for mode in StatusTitleMode.allCases {
+                let summary = StatusBarSummary(digest: MenuBarDigest(clusters: [cluster(.aire, phase, jobs: [runningJob("1")])]), mode: mode)
+                #expect(summary.title == "", "\(phase) in \(mode)")
+                #expect(summary.isDimmed, "\(phase)")
+            }
+        }
+    }
+
+    @Test("Several live jobs: one count, broken down per cluster in the tooltip and for VoiceOver")
     func multiple() {
         let digest = MenuBarDigest(clusters: [
             cluster(.aire, .live, jobs: [runningJob("1")]),
             cluster(.calder, .live, jobs: [runningJob("2"), runningJob("3")])
         ])
         let summary = StatusBarSummary(digest: digest)
-        #expect(summary.title == "3 jobs")
-        #expect(summary.tooltip.hasPrefix("3 running jobs — AIRE 1, Calder 2"))
+        #expect(summary.title == "3 running")
+        #expect(summary.tooltip.hasPrefix("3 jobs running — AIRE 1, Calder 2"))
+        #expect(summary.accessibilityLabel == "Leeds HPC Monitor: 3 jobs running, AIRE 1, Calder 2")
     }
 
     @Test("Middle truncation keeps both ends")
     func middleTruncation() {
-        let measure: StatusBarSummary.Measure = { CGFloat($0.count * 10) }
-        #expect(StatusBarSummary.middleTruncated("abcdefghij", toFit: 60, measure: measure) == "abc…ij")
-        #expect(StatusBarSummary.middleTruncated("abc", toFit: 60, measure: measure) == "abc")
-        #expect(StatusBarSummary.middleTruncated("abcdef", toFit: 10, measure: measure) == "")
+        let measure: (String) -> CGFloat = { CGFloat($0.count * 10) }
+        #expect(TextFitting.middleTruncated("abcdefghij", toFit: 60, measure: measure) == "abc…ij")
+        #expect(TextFitting.middleTruncated("abc", toFit: 60, measure: measure) == "abc")
+        #expect(TextFitting.middleTruncated("abcdef", toFit: 10, measure: measure) == "")
+    }
+
+    @Test("Compact limits", arguments: [
+        ("4:00:00", "4h" as String?),
+        ("12:00:00", "12h"),
+        ("2-00:00:00", "2d"),
+        ("1-12:00:00", "1d 12h"),
+        ("30:00", "30m"),
+        ("1:30:00", "1h 30m"),
+        ("UNLIMITED", nil),
+        ("", nil)
+    ])
+    func compactLimit(raw: String, expected: String?) {
+        #expect(StatusElapsedText.compactLimit(raw) == expected)
     }
 
     @Test("Compact elapsed", arguments: [
@@ -658,24 +720,5 @@ struct MenuBarTimeTests {
             runningJob("11", start: nil)
         ])
         #expect(digest.newestRunningJob?.job.jobId == "9")
-    }
-}
-
-// MARK: - Store
-
-@MainActor
-@Suite("Menu bar digest store")
-struct MenuBarDigestStoreTests {
-    @Test("An unchanged digest is not republished")
-    func deduplicates() {
-        let digest = MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [runningJob("1")])])
-        let store = MenuBarDigestStore(digest: digest)
-        var publishes = 0
-        let subscription = store.objectWillChange.sink { publishes += 1 }
-        store.update(MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [runningJob("1")])]))
-        #expect(publishes == 0)
-        store.update(MenuBarDigest(clusters: [cluster(.aire, .live, jobs: [runningJob("1"), runningJob("2")])]))
-        #expect(publishes == 1)
-        subscription.cancel()
     }
 }

@@ -735,6 +735,44 @@ def s4_force_relogin_keeps_jump_and_calder(h):
     return c
 
 
+def s18_renew_replaces_healthy_jump(h):
+    """The app's confirmed "Renew all": HPC_RENEW_JUMP_HOST=1 on the first
+    cluster replaces a HEALTHY jump master (one rash Duo), and every cluster
+    is then signed in again through the new one."""
+    c = Check()
+    for cid in ("aire", "calder"):
+        c.ok(h.ensure_live(cid, "jump"), "precondition: %s live on the rash route" % cid)
+    old_jump = h.jump_pid()
+    rash0 = h.duo_count(RASH)
+    aire0 = h.duo_count(CLUSTERS["aire"][1])
+    calder0 = h.duo_count(CLUSTERS["calder"][1])
+
+    jump = h.run_expect_jump("aire", extra={"HPC_RENEW_JUMP_HOST": "1"})
+    names = status_lines(jump)
+    c.ok(jump.returncode == 0, "renewing jump leg exit %d: %s" % (jump.returncode, err(jump)))
+    c.ok(any("replacing the shared jump-host session" in n for n in names),
+         "the renewal did not say it replaces the jump session: %r" % names)
+    c.ok("password sent (jump host)" in names, "a renewed jump login must send the password: %r" % names)
+    c.ok(h.jump_alive() and h.jump_pid() != old_jump,
+         "jump master not replaced (%s -> %s)" % (old_jump, h.jump_pid()))
+    c.ok(old_jump is None or _wait_dead(old_jump), "the old jump master is still running")
+    c.ok(h.duo_count(RASH) - rash0 == 1, "renewal cost %d rash Duo, want 1" % (h.duo_count(RASH) - rash0))
+
+    for cid in ("aire", "calder"):
+        target = h.run_target_starter(cid, "jump", force=True)
+        c.ok(target.returncode == 0, "%s forced target after renewal exit %d: %s" % (cid, target.returncode, err(target)))
+        c.ok(h.master_alive(cid, "jump"), "%s not live after the renewal" % cid)
+    c.ok(h.duo_count(RASH) - rash0 == 1, "the clusters' sign-ins re-authenticated rash again")
+    c.ok(h.duo_count(CLUSTERS["aire"][1]) - aire0 == 1, "AIRE Duo prompts != 1")
+    c.ok(h.duo_count(CLUSTERS["calder"][1]) - calder0 == 1, "Calder Duo prompts != 1")
+
+    # Without the flag a healthy jump master is still reused.
+    plain = h.run_expect_jump("calder")
+    c.ok(plain.returncode == 0 and h.duo_count(RASH) - rash0 == 1,
+         "a plain jump leg after the renewal did not reuse the new master")
+    return c
+
+
 def s5_dead_jump_reauth(h):
     c = Check()
     calder_host = CLUSTERS["calder"][1]
@@ -1464,6 +1502,7 @@ SCENARIOS = [
     ("S14", "special-character password", s14_special_character_password),
     ("S15", "stop helper: one route, jump only if unused", s15_stop_master),
     ("S16", "ssh option sets", s16_option_sets),
+    ("S18", "Renew all replaces a healthy jump master", s18_renew_replaces_healthy_jump),
     ("S7", "password never leaks", s7_password_never_leaks),
 ]
 

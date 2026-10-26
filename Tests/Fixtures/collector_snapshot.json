@@ -369,5 +369,6 @@
     "jobs_json": 357,
     "node_details": 120,
     "storage": 450
-  }
+  },
+  "job_usage": null
 }

@@ -331,6 +331,36 @@ struct AppModelTests {
         #expect(harness.backend(.calder).loginCalls.last?.forceReplace == true)
     }
 
+    @Test("Renew all replaces every master and renews the shared rash master once, first")
+    func renewRenewsJumpOnce() async throws {
+        var preferences = AppPreferences()
+        preferences.route = .rashJump
+        let harness = try ModelHarness(preferences: preferences)
+        harness.model.password = "secret"
+
+        harness.model.renew([.aire, .calder])
+        try await harness.waitForLoginsToFinish()
+        #expect(harness.backend(.aire).loginCalls.map(\.forceReplace) == [true])
+        #expect(harness.backend(.aire).loginCalls.map(\.renewJumpHost) == [true])
+        #expect(harness.backend(.calder).loginCalls.map(\.forceReplace) == [true])
+        #expect(harness.backend(.calder).loginCalls.map(\.renewJumpHost) == [false])
+
+        // Reconnect never renews rash.
+        harness.model.password = "secret"
+        harness.model.reconnect([.aire])
+        try await harness.waitForLoginsToFinish()
+        #expect(harness.backend(.aire).loginCalls.last?.renewJumpHost == false)
+    }
+
+    @Test("Renew is confirmed first and covers every enabled cluster")
+    func renewConfirmationTargets() throws {
+        let harness = try ModelHarness()
+        let confirmation = try #require(harness.model.renewConfirmation())
+        #expect(confirmation.kind == .renew)
+        #expect(confirmation.clusterIDs == [.aire, .calder])
+        #expect(!confirmation.usesJumpHost)
+    }
+
     @Test("Connect all never signs in a cluster whose startup probe is still running")
     func connectAllSkipsChecking() async throws {
         let harness = try ModelHarness()
