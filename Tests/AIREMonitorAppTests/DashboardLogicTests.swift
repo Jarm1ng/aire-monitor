@@ -506,11 +506,13 @@ struct NodesDashboardLogicTests {
 @Suite("Trends")
 struct TrendsLogicTests {
     private let start = Date(timeIntervalSince1970: 1_800_000_000)
+    // Shared (it is thread-safe): a day of points would build 9,000.
+    nonisolated(unsafe) private static let formatter = ISO8601DateFormatter()
 
     private func point(_ offset: TimeInterval, scratch: Double?) -> TrendPoint {
         let date = start.addingTimeInterval(offset)
         let storage = scratch.map { [StorageSummary(label: "Scratch", usedPercent: $0)] } ?? []
-        return TrendPoint(snapshot: ClusterSnapshot(collectedAt: ISO8601DateFormatter().string(from: date), storage: storage))
+        return TrendPoint(snapshot: ClusterSnapshot(collectedAt: Self.formatter.string(from: date), storage: storage))
     }
 
     @Test("Points are placed by time, and a long pause breaks the line")
@@ -629,6 +631,104 @@ struct TrendsLogicTests {
         let stale = timeline.slice(.hour, now: start.addingTimeInterval(7_190 + 3 * 3600))
         #expect(stale.isEmpty)
         #expect(timeline.slice(.sixHours, now: start.addingTimeInterval(7_195)).count == 720)
+    }
+
+    /// 25 hours at the 10 s cadence, offsets 0 ... 89,990 s.
+    private var dayAndAnHour: [TrendPoint] {
+        (0..<9_000).map { point(Double($0) * 10, scratch: Double($0 % 100)) }
+    }
+
+    @Test("History keeps the last hour whole and one point a minute back to 24 h")
+    func historyRetention() throws {
+        let raw = dayAndAnHour
+        let kept = HistoryRetention.retained(raw)
+        let dates = kept.compactMap { SlurmTimestamp.parse($0.collectedAt) }
+        let newest = start.addingTimeInterval(89_990)
+        // 361 points from the last hour, then minutes 59 ... 1439 of the day:
+        // the oldest is the first point of the minute 24 h back.
+        #expect(kept.count == 1_742)
+        #expect(kept.last == raw.last)
+        #expect(try #require(dates.first) == start.addingTimeInterval(59 * 60))
+        #expect(dates.filter { $0 >= newest.addingTimeInterval(-3600) }.count == 361)
+        let thinned = dates.filter { $0 < newest.addingTimeInterval(-3600) }
+        #expect(Set(thinned.map { Int($0.timeIntervalSince1970) / 60 }).count == thinned.count)
+        // Idempotent, and thinning in batches keeps what thinning at once does.
+        #expect(HistoryRetention.retained(kept) == kept)
+        #expect(HistoryRetention.retained(HistoryRetention.retained(Array(raw.prefix(8_000))) + raw.dropFirst(8_000)) == kept)
+    }
+
+    @Test("Retention drops points it cannot date and caps a runaway cadence")
+    func historyRetentionEdges() {
+        // The collector's own stamp (microseconds) is kept.
+        let collector = TrendPoint(snapshot: ClusterSnapshot(collectedAt: "2026-10-13T11:49:45.636173+00:00"))
+        let undated = TrendPoint(snapshot: ClusterSnapshot(collectedAt: "x"))
+        #expect(HistoryRetention.retained([undated, collector]) == [collector])
+        #expect(HistoryRetention.retained([undated]).isEmpty)
+        // A point a second for an hour, all of it full resolution.
+        let burst = (0..<3_600).map { point(Double($0), scratch: 50) }
+        let capped = HistoryRetention.retained(burst)
+        #expect(capped.count == HistoryRetention.capacity)
+        #expect(capped.last == burst.last)
+    }
+
+    @Test("Collection times are read by hand exactly as the ISO 8601 formatter reads them, and anything else falls back to it")
+    func collectionDates() throws {
+        let stamps = [
+            "2026-10-13T11:49:45.636173+00:00", "2026-10-13T11:49:45+00:00", "2026-10-13T11:49:45Z",
+            "2026-10-13T11:49:45.5Z", "2028-02-29T23:59:59.999+05:30", "2026-01-01T00:00:00-08:00",
+            "1999-12-31T23:59:59+01:00", "2100-03-01T00:00:00Z"
+        ]
+        for stamp in stamps {
+            let fast = try #require(CollectorTimestamp.parse(stamp), "\(stamp)")
+            let general = try #require(SlurmTimestamp.parse(stamp), "\(stamp)")
+            #expect(abs(fast.timeIntervalSince(general)) < 0.001, "\(stamp)")
+        }
+        // Zone-less Slurm times, impossible dates and anything loose are
+        // left to the general parser.
+        for stamp in ["2026-10-12T14:05:20", "2026-10-12 14:05:20", "2026-02-29T00:00:00Z", "2026-13-01T00:00:00Z",
+                      "2026-10-13T24:00:00Z", "2026-10-13T11:49:45.Z", "2026-10-13T11:49:45+0000", "2026-10-13t11:49:45z", "x", ""] {
+            #expect(CollectorTimestamp.parse(stamp) == nil, "\(stamp)")
+        }
+        let slurm = TrendPoint(snapshot: ClusterSnapshot(collectedAt: "2026-10-12T14:05:20"))
+        #expect(slurm.collectionDate == SlurmTimestamp.parse("2026-10-12T14:05:20"))
+    }
+
+    @Test("The 6 h and 24 h windows span their whole period of retained history, with no false gaps")
+    func longWindows() throws {
+        let timeline = TrendTimeline(history: HistoryRetention.retained(dayAndAnHour))
+        let now = start.addingTimeInterval(89_995)
+        #expect(timeline.typicalSpacing == 10)
+        let day = timeline.slice(.day, now: now)
+        #expect(day.coveredSpan > 24 * 3600 - 60)
+        #expect(day.gapCount == 0)
+        #expect(Set(day.series { $0.scratchUsedPercent }.samples.map(\.segment)) == [0])
+        let sixHours = timeline.slice(.sixHours, now: now)
+        #expect(sixHours.coveredSpan > 6 * 3600 - 60)
+        #expect(sixHours.gapCount == 0)
+        #expect(timeline.slice(.hour, now: now).count == 361)
+
+        // Two hours: the thinned hour is the minority, and its minute
+        // spacing must still not read as a break every minute.
+        let twoHours = TrendTimeline(history: HistoryRetention.retained((0..<720).map { point(Double($0) * 10, scratch: 50) }))
+        let recent = twoHours.slice(.sixHours, now: start.addingTimeInterval(7_195))
+        #expect(twoHours.points.count == 60 + 361)
+        #expect(recent.coveredSpan == 7_190)
+        #expect(recent.gapCount == 0)
+        #expect(Set(recent.series { $0.scratchUsedPercent }.samples.map(\.segment)) == [0])
+    }
+
+    @Test("Outages still break the line, in thinned history and in the last hour")
+    func gapsAcrossResolutions() {
+        // Ten minutes missing twelve hours back, one minute 20 minutes back.
+        let raw = (0..<9_000).map { Double($0) * 10 }
+            .filter { !(45_000..<45_600).contains($0) && !(88_000..<88_060).contains($0) }
+            .map { point($0, scratch: 50) }
+        let timeline = TrendTimeline(history: HistoryRetention.retained(raw))
+        let now = start.addingTimeInterval(89_995)
+        #expect(timeline.typicalSpacing == 10)
+        #expect(timeline.slice(.day, now: now).gapCount == 2)
+        #expect(timeline.slice(.hour, now: now).gapCount == 1)
+        #expect(Set(timeline.slice(.day, now: now).series { $0.scratchUsedPercent }.samples.map(\.segment)) == [0, 1, 2])
     }
 
     @Test("Thinning caps the marks and keeps the extremes")

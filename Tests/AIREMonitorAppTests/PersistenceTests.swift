@@ -284,7 +284,7 @@ struct SnapshotCacheTests {
         #expect(known.gpuAllocated == 3)
 
         // A line written before the field existed, then a new point.
-        let legacyLine = #"{"collectedAt":"2026-10-12T09:00:00Z","totalJobs":3,"runningJobs":1,"pendingJobs":2,"gpuTotal":56,"gpuAllocated":40,"gpuIdle":16,"unavailableGpuNodes":0,"homeUsedPercent":41.5}"#
+        let legacyLine = #"{"collectedAt":"2026-10-13T09:00:00Z","totalJobs":3,"runningJobs":1,"pendingJobs":2,"gpuTotal":56,"gpuAllocated":40,"gpuIdle":16,"unavailableGpuNodes":0,"homeUsedPercent":41.5}"#
         try root.write(legacyLine + "\n", to: ".runtime/clusters/calder/snapshot_history.jsonl")
         let cache = SnapshotCache(projectRoot: root.path, clusterID: .calder)
         try cache.appendHistory(point)
@@ -294,6 +294,51 @@ struct SnapshotCacheTests {
         #expect(history.first?.gpuAllocated == 40)
         #expect(history.first?.gpuUnknown == nil)
         #expect(history.last?.gpuUnknown == 8)
+    }
+
+    @Test("The history log holds what retention keeps: a long log loads thinned, and compaction rewrites it to those points")
+    func historyLogRetention() throws {
+        let root = try TemporaryProjectRoot()
+        defer { root.remove() }
+        let cache = SnapshotCache(projectRoot: root.path, clusterID: .aire)
+        let formatter = ISO8601DateFormatter()
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        func point(_ index: Int) -> TrendPoint {
+            TrendPoint(snapshot: makeSnapshot(collectedAt: formatter.string(from: start.addingTimeInterval(Double(index) * 10))))
+        }
+
+        // 25 hours at the 10 s cadence, every point a line (as an older
+        // build or a crash before compaction can leave it).
+        let raw = (0..<9_000).map(point)
+        try cache.rewriteHistory(raw)
+        let log = cache.loadHistoryLog()
+        #expect(log.lineCount == 9_000)
+        #expect(log.points == HistoryRetention.retained(raw))
+        #expect(log.points.count == 1_742)
+        #expect(log.needsCompaction)
+
+        // The next point compacts the log to exactly what is kept.
+        let history = try cache.recordHistory(from: makeSnapshot(collectedAt: formatter.string(from: start.addingTimeInterval(90_000))))
+        let compacted = cache.loadHistoryLog()
+        #expect(compacted.points == history)
+        #expect(compacted.lineCount == history.count)
+        #expect(!compacted.needsCompaction)
+
+        // A compacted day, then an hour of appended lines: still within the
+        // slack. Another hour is past it.
+        let day = HistoryRetention.retained(Array(raw.prefix(8_640)))
+        try cache.rewriteHistory(day)
+        for index in 8_640..<9_000 {
+            try cache.appendHistory(point(index))
+        }
+        let anHourLater = cache.loadHistoryLog()
+        #expect(anHourLater.points == HistoryRetention.retained(raw))
+        #expect(anHourLater.lineCount == day.count + 360)
+        #expect(!anHourLater.needsCompaction)
+        for index in 9_000..<9_360 {
+            try cache.appendHistory(point(index))
+        }
+        #expect(cache.loadHistoryLog().needsCompaction)
     }
 
     @Test("Job-state baselines are separate per cluster")

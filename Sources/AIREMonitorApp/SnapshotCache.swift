@@ -77,12 +77,9 @@ private enum JSONFile {
 /// writers only through `ClusterCacheWriter` (a serial background queue),
 /// never on the main actor during a refresh.
 struct SnapshotCache: Sendable {
-    /// Points kept in memory and in the history log after compaction: 4 h
-    /// at the 10 s cadence. Trends draws the most recent part; Storage uses
-    /// all of it.
-    static let historyCapacity = 1440
-    /// Lines the append-only history log may grow past the capacity before
-    /// it is rewritten: about one rewrite an hour at the 10 s cadence.
+    /// Lines the append-only history log may hold beyond the points
+    /// `HistoryRetention` keeps before it is rewritten: about one rewrite
+    /// an hour at the 10 s cadence.
     static let historyCompactionSlack = 360
 
     let projectRoot: String
@@ -140,16 +137,18 @@ struct SnapshotCache: Sendable {
     // MARK: History
 
     struct HistoryLog: Equatable {
-        /// Deduplicated by collection time, oldest first, capped.
+        /// Deduplicated by collection time, oldest first, as
+        /// `HistoryRetention` keeps them.
         var points: [TrendPoint]
         /// Lines currently in the jsonl log (what a rewrite would shrink).
         var lineCount: Int
         /// The legacy JSON array exists, or the log holds malformed lines or
-        /// more lines than the capacity: the next write should be a rewrite.
+        /// more than `historyCompactionSlack` lines retention dropped: the
+        /// next write should be a rewrite.
         var needsCompaction: Bool
     }
 
-    func loadHistoryLog(capacity: Int = SnapshotCache.historyCapacity) -> HistoryLog {
+    func loadHistoryLog() -> HistoryLog {
         let fileManager = FileManager.default
         var points: [TrendPoint] = []
         let hasLegacy = fileManager.fileExists(atPath: legacyHistoryURL.path)
@@ -180,14 +179,11 @@ struct SnapshotCache: Sendable {
         // can reappear non-adjacently after an error gap, and TrendPoint.id
         // is collectedAt, so duplicates would break SwiftUI identity.
         var seen = Set<String>()
-        points = points.filter { seen.insert($0.collectedAt).inserted }
-        if points.count > capacity {
-            points = Array(points.suffix(capacity))
-        }
+        points = HistoryRetention.retained(points.filter { seen.insert($0.collectedAt).inserted })
         return HistoryLog(
             points: points,
             lineCount: lineCount,
-            needsCompaction: hasLegacy || malformed > 0 || lineCount > capacity
+            needsCompaction: hasLegacy || malformed > 0 || lineCount > points.count + Self.historyCompactionSlack
         )
     }
 
@@ -228,18 +224,14 @@ struct SnapshotCache: Sendable {
     /// Load-append-return in one call (tests and one-off tools; the app
     /// keeps history in memory and appends through ClusterCacheWriter).
     @discardableResult
-    func recordHistory(from snapshot: ClusterSnapshot, capacity: Int = SnapshotCache.historyCapacity) throws -> [TrendPoint] {
-        let log = loadHistoryLog(capacity: capacity)
-        var history = log.points
+    func recordHistory(from snapshot: ClusterSnapshot) throws -> [TrendPoint] {
+        let log = loadHistoryLog()
         let point = TrendPoint(snapshot: snapshot)
-        guard !history.contains(where: { $0.collectedAt == point.collectedAt }) else {
-            return history
+        guard !log.points.contains(where: { $0.collectedAt == point.collectedAt }) else {
+            return log.points
         }
-        history.append(point)
-        if history.count > capacity {
-            history = Array(history.suffix(capacity))
-        }
-        if log.needsCompaction || log.lineCount + 1 > capacity + Self.historyCompactionSlack {
+        let history = HistoryRetention.retained(log.points + [point])
+        if log.needsCompaction || log.lineCount + 1 > history.count + Self.historyCompactionSlack {
             try rewriteHistory(history)
         } else {
             try appendHistory(point)
@@ -300,6 +292,158 @@ struct SnapshotCache: Sendable {
             to: collectorURL,
             pretty: true
         )
+    }
+}
+
+// MARK: - History retention
+
+/// Which trend points a cluster's history keeps: every point from the
+/// newest hour, then the first point of each clock minute back to 24 h
+/// (whole minutes), and nothing older. That fills the Trends tab's 24 h
+/// window with about
+/// 1,740 points (360 + 1,380 at the 10 s cadence), where keeping every
+/// point would take 8,640. Ages count back from the newest point, never
+/// from the clock, so history read after a week offline still has its
+/// full last hour. Memory and the compacted log hold the same points.
+enum HistoryRetention {
+    /// Points this close to the newest keep full resolution.
+    static let fullResolutionSpan: TimeInterval = 3600
+    /// Older points keep one per clock minute.
+    static let thinnedSpacing: TimeInterval = 60
+    /// The longest trend window; older points are dropped.
+    static let maximumAge: TimeInterval = 24 * 3600
+    /// Hard cap for refreshes far faster than every 10 s: the oldest
+    /// points go first.
+    static let capacity = 2_000
+    /// New points a running session collects between retention passes
+    /// (each parses every timestamp): one pass a minute at 10 s.
+    static let passInterval = 6
+
+    /// `points` (oldest first) after retention. Idempotent, and stable as
+    /// history grows: a thinned minute keeps the same point until the whole
+    /// minute ages out, so thinning in batches keeps what thinning on every
+    /// append would. Points without a readable time are dropped: no chart
+    /// can place them.
+    static func retained(_ points: [TrendPoint]) -> [TrendPoint] {
+        let dates = points.map(\.collectionDate)
+        guard let newest = dates.compactMap({ $0 }).max() else {
+            return []
+        }
+        let thinnedBefore = newest.addingTimeInterval(-fullResolutionSpan)
+        let oldestMinute = minute(of: newest.addingTimeInterval(-maximumAge))
+        var keptMinutes = Set<Int>()
+        var kept: [TrendPoint] = []
+        kept.reserveCapacity(min(points.count, capacity))
+        for (point, date) in zip(points, dates) {
+            guard let date else {
+                continue
+            }
+            if date < thinnedBefore {
+                let bucket = minute(of: date)
+                guard bucket >= oldestMinute, keptMinutes.insert(bucket).inserted else {
+                    continue
+                }
+            }
+            kept.append(point)
+        }
+        return kept.count > capacity ? Array(kept.suffix(capacity)) : kept
+    }
+
+    private static func minute(of date: Date) -> Int {
+        Int((date.timeIntervalSince1970 / thinnedSpacing).rounded(.down))
+    }
+}
+
+extension TrendPoint {
+    /// When the point was collected. Retention passes and chart timelines
+    /// read every point's time, and ISO8601DateFormatter takes ~50 µs a
+    /// stamp (~85 ms for a day of history), so the collector's own form is
+    /// read by hand; anything else goes to SlurmTimestamp.parse.
+    var collectionDate: Date? {
+        CollectorTimestamp.parse(collectedAt) ?? SlurmTimestamp.parse(collectedAt)
+    }
+}
+
+/// A strict reader for "2026-10-13T11:49:45.636173+00:00": a fraction is
+/// optional, the zone ("Z" or ±HH:MM) is not. nil for anything else,
+/// out-of-range fields included, so the general parser decides those.
+enum CollectorTimestamp {
+    static func parse(_ text: String) -> Date? {
+        var text = text
+        return text.withUTF8(parse(bytes:))
+    }
+
+    private static func parse(bytes: UnsafeBufferPointer<UInt8>) -> Date? {
+        func number(_ start: Int, _ count: Int) -> Int? {
+            guard start + count <= bytes.count else {
+                return nil
+            }
+            var value = 0
+            for byte in bytes[start..<start + count] {
+                guard (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) else {
+                    return nil
+                }
+                value = value * 10 + Int(byte - UInt8(ascii: "0"))
+            }
+            return value
+        }
+        guard bytes.count >= 20,
+              bytes[4] == UInt8(ascii: "-"), bytes[7] == UInt8(ascii: "-"), bytes[10] == UInt8(ascii: "T"),
+              bytes[13] == UInt8(ascii: ":"), bytes[16] == UInt8(ascii: ":"),
+              let year = number(0, 4), let month = number(5, 2), let day = number(8, 2),
+              let hour = number(11, 2), let minute = number(14, 2), let second = number(17, 2),
+              (1...12).contains(month), (1...daysIn(month: month, year: year)).contains(day),
+              hour < 24, minute < 60, second < 60 else {
+            return nil
+        }
+        var index = 19
+        var fraction = 0.0
+        if bytes[index] == UInt8(ascii: ".") {
+            index += 1
+            var scale = 1.0
+            while index < bytes.count, (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(bytes[index]) {
+                scale /= 10
+                fraction += Double(bytes[index] - UInt8(ascii: "0")) * scale
+                index += 1
+            }
+            guard scale < 1 else {
+                return nil
+            }
+        }
+        let offset: Int
+        if index + 1 == bytes.count, bytes[index] == UInt8(ascii: "Z") {
+            offset = 0
+        } else if index + 6 == bytes.count,
+                  bytes[index] == UInt8(ascii: "+") || bytes[index] == UInt8(ascii: "-"),
+                  bytes[index + 3] == UInt8(ascii: ":"),
+                  let hours = number(index + 1, 2), let minutes = number(index + 4, 2),
+                  hours < 24, minutes < 60 {
+            offset = (hours * 3600 + minutes * 60) * (bytes[index] == UInt8(ascii: "-") ? -1 : 1)
+        } else {
+            return nil
+        }
+        let seconds = daysSince1970(year: year, month: month, day: day) * 86_400
+            + hour * 3600 + minute * 60 + second - offset
+        return Date(timeIntervalSince1970: Double(seconds) + fraction)
+    }
+
+    private static func daysIn(month: Int, year: Int) -> Int {
+        switch month {
+        case 2: return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) ? 29 : 28
+        case 4, 6, 9, 11: return 30
+        default: return 31
+        }
+    }
+
+    /// Days from 1970-01-01 to a proleptic Gregorian date (Howard
+    /// Hinnant's days_from_civil, for years 0 and later).
+    private static func daysSince1970(year: Int, month: Int, day: Int) -> Int {
+        let year = month <= 2 ? year - 1 : year
+        let era = (year >= 0 ? year : year - 399) / 400
+        let yearOfEra = year - era * 400
+        let dayOfYear = (153 * ((month + 9) % 12) + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        return era * 146_097 + dayOfEra - 719_468
     }
 }
 
