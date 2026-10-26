@@ -175,7 +175,7 @@ macOS may ask whether Leeds HPC Monitor may use your confidential information af
 | macOS Keychain (`AIREMonitor.AIREPassword`, account `leeds:<username>`) | The university password | Yes. This is the only persistent credential store. |
 | App defaults (domain `local.aire.monitor`) | Project root, a per-username "saved password was rejected" flag, view preferences | No |
 | `.runtime/preferences.json` | Username, route, jump host, Duo option, the Remember in Keychain choice, per-cluster enabled flag and hostname, sidebar selection | Password-free by design |
-| `.runtime/clusters/<id>/latest_snapshot.json`, `snapshot_history.jsonl`, `job_state.json` | Latest snapshot, trend history (up to 1440 points) and the job-state baseline for notifications, with usernames, job names, node names, filesystem paths, quota numbers and Lustre project ids | No passwords, but private cluster details |
+| `.runtime/clusters/<id>/latest_snapshot.json`, `snapshot_history.jsonl`, `job_state.json` | Latest snapshot, trend history (24 hours, about 1,740 points) and the job-state baseline for notifications, with usernames, job names, node names, filesystem paths, quota numbers and Lustre project ids | No passwords, but private cluster details |
 | `.runtime/clusters/<id>/app_state.json` | Whether the app is feeding the cluster (enabled, paused, live, refresh interval, time), read by the widget | No |
 | `.runtime/clusters/<id>/collector.json` | The exact collector argument list (username, hostnames, socket paths, storage spec) for the widget fallback | Password-free by design |
 | `.runtime/clusters/<id>/login_debug.log` | Helper event log plus the stdout/stderr transcript of each sign-in, including hostnames, usernames and timings | No passwords |
