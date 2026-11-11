@@ -239,7 +239,14 @@ The sidebar offers exactly two routes, which apply to every cluster. **Both are 
 
 ### Login sequence
 
-`MonitorService.login(settings:password:forceReplace:renewJumpHost:onStatus:)` signs in to one cluster:
+`MonitorService.login(settings:password:forceReplace:renewJumpHost:onStatus:)` signs in to one cluster. Both helpers below run as one-shot launchd jobs in the user's GUI domain (`DetachedHelper`, through `runLoginHelper`), not as the app's children:
+- **Why.** Every process the app starts stays in the app's coalition, even after it daemonizes, and Force Quit (Activity Monitor, the Dock) ends the whole coalition. On 2026-11-11 a force quit during an update ended every SSH session within 3 ms. Started by launchd, a helper and the masters it starts belong to the job's coalition and are their own responsible process.
+- **Plumbing.** It matches a child process. The job's files sit in a 0700 folder under `$TMPDIR/aire-monitor-helpers`. The password goes in through a 0600 FIFO on stdin, and stdout and stderr come back through FIFOs, streamed by line. A wrapper shell records the pid (the job's process group) and the exit status.
+- **Stopping.** A cancel sends TERM to the job's process group at once, so a sign-in cancelled as the app quits cannot finish from a late Duo approval. A sign-in cancelled before its job started never starts it. The watchdog sends TERM, then KILLs whatever of the group is left 2 s later, and still reports 124.
+- **Leftovers.** A helper that finished is never signalled, because on the rash route its process group still holds the new master's ProxyCommand. `AbandonProcessGroup` keeps launchd from killing that process when the helper exits, and booting the job out afterwards leaves it alone. Each run also boots out helper jobs an interrupted run left loaded and removes their old folders.
+- **Fallback.** The helper runs as a child, as before, in three cases: launchd refuses the job; the job never starts (no pid and no open FIFO within 5 s); or the checkout is in a privacy-protected folder (`DetachedHelper.canRunOutsideApp`: Documents, Desktop, Downloads, iCloud Drive, `Library/CloudStorage`, `/Volumes`). A job there could not read the scripts, because the app's Files & Folders permission does not extend to it. The log says the master will then end on a force quit.
+
+The sequence:
 
 1. **Jump leg (rash route only).** `scripts/hpc_ssh_login.expect` runs with the password on stdin and `HPC_SKIP_TARGET=1`, so it only makes sure the shared jump master is up (see the [shared jump master policy](#shared-jump-master-policy)) and exits. It reads stdin first and falls back to `HPC_PASSWORD` only when stdin is empty. The app attributes this leg's failures to "rash.leeds.ac.uk (jump host)", not to the cluster: exit 13 means rash rejected the password, exit 15 that the rash Duo push was not approved. On the direct route this step is skipped.
 2. **Target leg (both routes).** `scripts/hpc_start_target_master.zsh` runs, again with the password as the first stdin line (read with `IFS= read -rs`; `HPC_PASSWORD` only when stdin is empty, and every password variable, including the pre-rename `AIRE_*` names, is scrubbed at once).
@@ -646,6 +653,7 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `AppModel.swift` | coordinator: sign-in chain, Keychain, preferences, project root, lease heartbeat, widget launcher |
 | `ClusterSession.swift`, `FoundationRefreshRules.swift`, `ClusterPresentation.swift` | one cluster's lifecycle; refresh classification and merges; the shared phase and wording |
 | `ClusterBackend.swift`, `MonitorService.swift`, `SSHMuxOptions.swift` | the process boundary: helpers, collector, remote commands, scp, stop and adopt; client options for anything riding a master |
+| `DetachedHelper.swift` | runs the login helpers as one-shot launchd jobs, so the SSH masters they start survive a quit or Force Quit of the app |
 | `ClusterCacheWriter.swift`, `SnapshotCache.swift` | runtime files: background writer, snapshot, history, job baseline, lease, preferences, migration |
 | `ClusterProfile.swift`, `KeychainPasswordStore.swift`, `Logging.swift` | profiles and catalog; the Keychain item; unified-log categories |
 | `JobStateDiff.swift`, `JobNotifications.swift` | job events, notifications, GPU-free alert, session-dropped alert |

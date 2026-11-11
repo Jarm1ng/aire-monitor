@@ -111,7 +111,7 @@ enum MonitorError: LocalizedError {
 
 /// Accumulates raw pipe output and optionally emits each complete stdout line
 /// as it arrives. Reader threads append concurrently, so all state is guarded.
-private final class PipeCollector: @unchecked Sendable {
+final class PipeCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var pendingLine = Data()
@@ -443,13 +443,12 @@ struct MonitorService: Sendable {
             // The expect helper only owns the jump leg; the target master is
             // started by the zsh starter below for both routes.
             jumpEnvironment["HPC_SKIP_TARGET"] = "1"
-            let helperResult = try await runProcess(
+            let helperResult = try await runLoginHelper(
                 executable: "/usr/bin/expect",
                 arguments: [helper],
-                currentDirectory: settings.projectRoot,
+                settings: settings,
                 environment: jumpEnvironment,
                 stdin: password + "\n",
-                timeout: HPCDefaults.loginWatchdog,
                 onOutputLine: statusLineHandler
             )
             transcript = helperResult
@@ -474,13 +473,12 @@ struct MonitorService: Sendable {
         // The password is handed to the starter as the first line of stdin
         // (read via `read -rs`); it must never appear in any child environment
         // or argv.
-        let targetResult = try await runProcess(
+        let targetResult = try await runLoginHelper(
             executable: "/bin/zsh",
             arguments: [targetStarter],
-            currentDirectory: settings.projectRoot,
+            settings: settings,
             environment: environment,
             stdin: password + "\n",
-            timeout: HPCDefaults.loginWatchdog,
             onOutputLine: statusLineHandler
         )
         let combinedResult = ProcessResult(
@@ -1085,6 +1083,47 @@ struct MonitorService: Sendable {
             || lower.contains("administratively prohibited")
             || lower.contains("session request failed")
             || (lower.contains("channel") && lower.contains("open failed"))
+    }
+
+    /// Runs a login helper, the one kind of process that starts SSH masters,
+    /// as a launchd job, so the masters outlive the app even when it is
+    /// force-quit (see `DetachedHelper`). A checkout in a privacy-protected
+    /// folder, or a job launchd will not take or start, runs the helper as
+    /// a child as before: the sign-in still works, but its master then
+    /// shares the app's fate, which the log says.
+    private func runLoginHelper(
+        executable: String,
+        arguments: [String],
+        settings: ConnectionSettings,
+        environment: [String: String],
+        stdin: String,
+        onOutputLine: (@Sendable (String) -> Void)?
+    ) async throws -> ProcessResult {
+        if DetachedHelper.canRunOutsideApp(projectRoot: settings.projectRoot) {
+            if let result = await DetachedHelper.run(
+                executable: executable,
+                arguments: arguments,
+                currentDirectory: settings.projectRoot,
+                environment: environment,
+                stdin: stdin,
+                timeout: HPCDefaults.loginWatchdog,
+                onOutputLine: onOutputLine
+            ) {
+                return result
+            }
+            Log.login.error("launchd did not run the sign-in helper; running it from the app, so its SSH master ends if the app is force-quit")
+        } else {
+            Log.login.notice("the checkout is in a privacy-protected folder; running the sign-in helper from the app, so its SSH master ends if the app is force-quit")
+        }
+        return try await runProcess(
+            executable: executable,
+            arguments: arguments,
+            currentDirectory: settings.projectRoot,
+            environment: environment,
+            stdin: stdin,
+            timeout: HPCDefaults.loginWatchdog,
+            onOutputLine: onOutputLine
+        )
     }
 
     private func runProcess(
