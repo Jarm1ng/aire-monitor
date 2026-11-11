@@ -140,6 +140,48 @@ struct RefreshBudgetTests {
         #expect(cache.loadHistory().count == 3)
     }
 
+    @Test("A long-running session keeps 24 h of history in bounded memory, and the log keeps the same points")
+    func dayOfHistory() async throws {
+        let harness = try SessionHarness()
+        let formatter = ISO8601DateFormatter()
+        // The first refresh collects at 12:00:00; the 25 hours before it
+        // are in the log at the 10 s cadence, every point a line.
+        let firstRefresh = try #require(formatter.date(from: "2026-10-13T12:00:00Z"))
+        func stamp(_ offset: TimeInterval) -> String {
+            formatter.string(from: firstRefresh.addingTimeInterval(offset))
+        }
+        try harness.cache.rewriteHistory((1...9_000).reversed().map {
+            TrendPoint(snapshot: makeSnapshot(collectedAt: stamp(-Double($0) * 10)))
+        })
+
+        try await harness.startAndSettle()
+        harness.session.flushCacheWrites()
+        // Thinned on load, and the log compacted to match before the
+        // refresh's point was appended.
+        #expect(harness.session.history.count == 1_743)
+        #expect(harness.cache.loadHistoryLog().lineCount == 1_743)
+
+        for tick in 1...HistoryRetention.passInterval {
+            harness.backend.setFallback(.success(makeSnapshot(collectedAt: stamp(Double(tick) * 10))))
+            try await harness.tick()
+        }
+        let history = harness.session.history
+        #expect(history.count < 1_743 + HistoryRetention.passInterval, "a retention pass ran")
+        let timeline = TrendTimeline(history: history)
+        let now = firstRefresh.addingTimeInterval(65)
+        #expect(timeline.slice(.day, now: now).coveredSpan > 24 * 3600 - 60)
+        #expect(timeline.slice(.day, now: now).gapCount == 0)
+        #expect(timeline.slice(.sixHours, now: now).coveredSpan > 6 * 3600 - 60)
+
+        harness.session.flushCacheWrites()
+        #expect(harness.cache.loadHistoryLog().points == HistoryRetention.retained(history))
+        // Quitting compacts the log to exactly the points retention keeps.
+        harness.session.prepareForTermination()
+        let log = harness.cache.loadHistoryLog()
+        #expect(log.points == HistoryRetention.retained(history))
+        #expect(log.lineCount == log.points.count)
+    }
+
     private func fileInode(_ url: URL) -> UInt64? {
         var info = stat()
         guard stat(url.path, &info) == 0 else {
