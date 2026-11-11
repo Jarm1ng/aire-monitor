@@ -15,10 +15,11 @@ import Foundation
 /// - Calder's H200 nodes report AllocMem=0 and CurrentWatts=0 even when busy,
 ///   and most are `mix-` (planned by backfill).
 /// - Calder also hosts one drained, not-responding L40 node from AIRE
-///   (`gpu028`, partition `aire-gpu-lovelace`): a second GPU model, so its
+///   (`gpu028`, partition `gpu_lovelace`): a second GPU model, so its
 ///   pools are "H200 + L40", never one summed figure.
-/// - Calder's `aire-cpu-genoa` partition is entirely drained (`drain$`,
-///   `drain*`, `drain`) although sinfo reports it "up".
+/// - Calder's `cpu_genoa` partition is entirely drained (`drain$`,
+///   `drain*`, `drain`) although sinfo reports it "up", and, as on the live
+///   cluster since 2026-11-11, it is Slurm's default partition.
 enum CoreFixtures {
     static let collectedAt = "2026-10-13T11:49:45.636173+00:00"
 
@@ -231,7 +232,7 @@ enum CoreFixtures {
         let usable = NodeStateInfo(state).isAvailable
         return NodeSummary(
             node: name,
-            partitions: ["calder-gpu-hopper"],
+            partitions: ["gpu_hopper"],
             state: state,
             cpuAllocated: usable ? cpuAllocated : 0,
             cpuIdle: usable ? 128 - cpuAllocated : 0,
@@ -252,7 +253,7 @@ enum CoreFixtures {
         )
     }
 
-    static func calderCPUNode(_ name: String, partition: String = "calder-cpu-turin", state: String, cpuAllocated: Int, cpuTotal: Int = 128, reason: String = "none") -> NodeSummary {
+    static func calderCPUNode(_ name: String, partition: String = "cpu_turin", state: String, cpuAllocated: Int, cpuTotal: Int = 128, reason: String = "none") -> NodeSummary {
         let usable = NodeStateInfo(state).isAvailable
         return NodeSummary(
             node: name,
@@ -289,7 +290,7 @@ enum CoreFixtures {
         calderH200Node("calder-h200-07", state: "mix", cpuAllocated: 16, gpuAllocated: 1),
         NodeSummary(
             node: "gpu028",
-            partitions: ["aire-gpu-lovelace"],
+            partitions: ["gpu_lovelace"],
             state: "drain*",
             cpuAllocated: 0, cpuIdle: 0, cpuOther: 24, cpuTotal: 24,
             memoryMB: 256859,
@@ -304,34 +305,34 @@ enum CoreFixtures {
         calderCPUNode("calder-cpu021", state: "idle", cpuAllocated: 0),
         calderCPUNode("calder-cpu091", state: "down*", cpuAllocated: 0, reason: "Not responding"),
         calderCPUNode("calder-cpu098", state: "down$", cpuAllocated: 0, reason: "Not responding"),
-        calderCPUNode("node056", partition: "aire-cpu-genoa", state: "drain$", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_hw_ib: Version mismatch between kernel OFED drivers and userspace OFED libraries."),
-        calderCPUNode("node057", partition: "aire-cpu-genoa", state: "drain*", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_cmd_output: kernel version failed to match \"uname -r\" output."),
-        calderCPUNode("node058", partition: "aire-cpu-genoa", state: "drain", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_cmd_output: kernel version failed to match \"uname -r\" output.")
+        calderCPUNode("node056", partition: "cpu_genoa", state: "drain$", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_hw_ib: Version mismatch between kernel OFED drivers and userspace OFED libraries."),
+        calderCPUNode("node057", partition: "cpu_genoa", state: "drain*", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_cmd_output: kernel version failed to match \"uname -r\" output."),
+        calderCPUNode("node058", partition: "cpu_genoa", state: "drain", cpuAllocated: 0, cpuTotal: 168, reason: "NHC: check_cmd_output: kernel version failed to match \"uname -r\" output.")
     ]
 
     static let calderPartitions: [PartitionSummary] = [
-        PartitionSummary(partition: "aire-cpu-genoa", nodeCount: 1, state: "drain$", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "aire-cpu-genoa", nodeCount: 2, state: "drain*", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "aire-cpu-genoa", nodeCount: 5, state: "drain", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-cpu-turin", nodeCount: 1, state: "down$", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-cpu-turin", nodeCount: 1, state: "down*", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-cpu-turin", nodeCount: 36, state: "mix", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-cpu-turin", nodeCount: 2, state: "alloc", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-cpu-turin", nodeCount: 58, state: "idle", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "aire-gpu-lovelace", nodeCount: 1, state: "drain*", gres: "gpu:nvidia_l40:3", cpusPerNode: 24, memoryMBPerNode: 256859, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-gpu-hopper", nodeCount: 4, state: "mix-", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-gpu-hopper", nodeCount: 1, state: "drain", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00"),
-        PartitionSummary(partition: "calder-gpu-hopper", nodeCount: 2, state: "mix", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00")
+        PartitionSummary(partition: "cpu_genoa", nodeCount: 1, state: "drain$", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00", isDefault: true),
+        PartitionSummary(partition: "cpu_genoa", nodeCount: 2, state: "drain*", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00", isDefault: true),
+        PartitionSummary(partition: "cpu_genoa", nodeCount: 5, state: "drain", cpusPerNode: 168, memoryMBPerNode: 734374, timeLimit: "2-00:00:00", isDefault: true),
+        PartitionSummary(partition: "cpu_turin", nodeCount: 1, state: "down$", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "cpu_turin", nodeCount: 1, state: "down*", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "cpu_turin", nodeCount: 36, state: "mix", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "cpu_turin", nodeCount: 2, state: "alloc", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "cpu_turin", nodeCount: 58, state: "idle", cpusPerNode: 128, memoryMBPerNode: 772480, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "gpu_lovelace", nodeCount: 1, state: "drain*", gres: "gpu:nvidia_l40:3", cpusPerNode: 24, memoryMBPerNode: 256859, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "gpu_hopper", nodeCount: 4, state: "mix-", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "gpu_hopper", nodeCount: 1, state: "drain", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00"),
+        PartitionSummary(partition: "gpu_hopper", nodeCount: 2, state: "mix", gres: "gpu:nvidia_h200:8", cpusPerNode: 128, memoryMBPerNode: 1546664, timeLimit: "2-00:00:00")
     ]
 
     static let calderJobs: [Job] = [
-        gpuJob("9863", state: "PENDING", reason: "(JobHeldUser)", timeLimit: "3:00:00", name: "finetune-llm", partition: "calder-gpu-hopper"),
-        cpuJob("9926", state: "RUNNING", reason: "", timeLimit: "12:00:00", cpus: 1, nodeList: "calder-cpu001", partition: "calder-cpu-turin", name: "monitor-loop"),
-        gpuJob("35796_1", state: "RUNNING", reason: "", elapsed: "2:25:04", timeLimit: "3:00:00", name: "finetune-llm", partition: "calder-gpu-hopper", nodeList: "calder-h200-06", arrayJobID: 35796),
-        gpuJob("38961_2", state: "RUNNING", reason: "", elapsed: "1:29:33", timeLimit: "3:00:00", name: "finetune-llm", partition: "calder-gpu-hopper", nodeList: "calder-h200-03", arrayJobID: 38961),
-        cpuJob("48081", state: "RUNNING", reason: "", timeLimit: "3:00:00", cpus: 64, nodeList: "calder-cpu008", partition: "calder-cpu-turin"),
+        gpuJob("9863", state: "PENDING", reason: "(JobHeldUser)", timeLimit: "3:00:00", name: "finetune-llm", partition: "gpu_hopper"),
+        cpuJob("9926", state: "RUNNING", reason: "", timeLimit: "12:00:00", cpus: 1, nodeList: "calder-cpu001", partition: "cpu_turin", name: "monitor-loop"),
+        gpuJob("35796_1", state: "RUNNING", reason: "", elapsed: "2:25:04", timeLimit: "3:00:00", name: "finetune-llm", partition: "gpu_hopper", nodeList: "calder-h200-06", arrayJobID: 35796),
+        gpuJob("38961_2", state: "RUNNING", reason: "", elapsed: "1:29:33", timeLimit: "3:00:00", name: "finetune-llm", partition: "gpu_hopper", nodeList: "calder-h200-03", arrayJobID: 38961),
+        cpuJob("48081", state: "RUNNING", reason: "", timeLimit: "3:00:00", cpus: 64, nodeList: "calder-cpu008", partition: "cpu_turin"),
         gpuJob(
-            "64375", state: "PENDING", reason: "(Resources)", timeLimit: "3:00:00", name: "finetune-llm", partition: "calder-gpu-hopper",
+            "64375", state: "PENDING", reason: "(Resources)", timeLimit: "3:00:00", name: "finetune-llm", partition: "gpu_hopper",
             arrayJobID: 64375, arrayPendingTasks: "4-20", pendingTaskCount: 17
         )
     ]

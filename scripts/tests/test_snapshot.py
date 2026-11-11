@@ -107,7 +107,7 @@ def _job_record(**overrides):
         "name": "",
         "node_count": _num(1),
         "nodes": "",
-        "partition": "calder-gpu-hopper",
+        "partition": "gpu_hopper",
         "standard_error": "",
         "standard_output": "",
         "start_time": _num(0),
@@ -207,16 +207,16 @@ CANNED_JOBS_JSON = "\n".join(line.lstrip() for line in CANNED_JOBS_JSON_PRETTY.s
 # The same queue as the pipe-format fallback prints it (squeue %i shows the
 # remainder as '35796_[3-58%4]'), and the scontrol records it joins.
 CANNED_JOBS_PIPE = "\n".join([
-    f"40188|calder-gpu-hopper|train-h200|{USER}|RUNNING|3:25:10|2-00:00:00|1|calder-h200-01",
-    f"35796_1|calder-gpu-hopper|sweep|{USER}|RUNNING|30:00|1-00:00:00|1|calder-h200-03",
-    f"35796_2|calder-gpu-hopper|sweep|{USER}|RUNNING|10:00|1-00:00:00|1|calder-h200-03",
-    f"35796_[3-58%4]|calder-gpu-hopper|sweep|{USER}|PENDING|0:00|1-00:00:00|1|(JobArrayTaskLimit)",
-    f"9918|calder-gpu-hopper|c3-c09-dump|{USER}|PENDING|0:00|12:00:00|1|(JobHeldUser)",
+    f"40188|gpu_hopper|train-h200|{USER}|RUNNING|3:25:10|2-00:00:00|1|calder-h200-01",
+    f"35796_1|gpu_hopper|sweep|{USER}|RUNNING|30:00|1-00:00:00|1|calder-h200-03",
+    f"35796_2|gpu_hopper|sweep|{USER}|RUNNING|10:00|1-00:00:00|1|calder-h200-03",
+    f"35796_[3-58%4]|gpu_hopper|sweep|{USER}|PENDING|0:00|1-00:00:00|1|(JobArrayTaskLimit)",
+    f"9918|gpu_hopper|c3-c09-dump|{USER}|PENDING|0:00|12:00:00|1|(JobHeldUser)",
 ])
 CANNED_JOB_DETAILS = "\n".join([
     f"JobId=40188 JobName=train-h200 UserId={USER}(1234) JobState=RUNNING Reason=None "
     "SubmitTime=2026-10-12T08:00:00 StartTime=2026-10-12T08:34:50 EndTime=2026-10-13T12:00:00 "
-    "Partition=calder-gpu-hopper NodeList=calder-h200-01 BatchHost=calder-h200-01 NumNodes=1 NumCPUs=12 "
+    "Partition=gpu_hopper NodeList=calder-h200-01 BatchHost=calder-h200-01 NumNodes=1 NumCPUs=12 "
     "NumTasks=1 ReqTRES=cpu=12,mem=180G,node=1,billing=12,gres/gpu=1 "
     "AllocTRES=cpu=12,mem=180G,node=1,billing=12,gres/gpu=1,gres/gpu:nvidia_h200=1 "
     f"Command=/users/{USER}/runs/train.sh --lr=0.1 WorkDir=/users/{USER}/runs "
@@ -237,31 +237,31 @@ CANNED_JOB_DETAILS = "\n".join([
 ])
 
 CANNED_PARTITIONS = "\n".join([
-    "calder-cpu-turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00",
-    "calder-gpu-hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00",
+    "cpu_turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00",
+    "gpu_hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00",
     "calder-gpu-lovelace|up|2|mix|gpu:l40s:4(S:0,2),mps:400|64|512000|(null)|1-00:00:00",
 ])
 NHC_REASON = "NHC: check_cmd_output: 'nvidia-smi -L | wc -l' returned 7"
 CANNED_NODES = "\n".join([
-    "calder-h200-01|calder-gpu-hopper|mix|64/64/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
-    "calder-h200-02|calder-gpu-hopper|idle|0/128/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
-    f"calder-h200-05|calder-gpu-hopper|drain|0/0/128/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|{NHC_REASON}",
+    "calder-h200-01|gpu_hopper|mix|64/64/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
+    "calder-h200-02|gpu_hopper|idle|0/128/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
+    f"calder-h200-05|gpu_hopper|drain|0/0/128/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|{NHC_REASON}",
     "calder-l40-01|calder-gpu-lovelace|mix|16/48/0/64|512000|gpu:l40s:4(S:0,2),mps:400|(null)|none",
-    "calder-cpu001|calder-cpu-turin|mix|100/28/0/128|772480|(null)|(null)|none",
+    "calder-cpu001|cpu_turin|mix|100/28/0/128|772480|(null)|(null)|none",
     "calder-cpu001|nodes|mix|100/28/0/128|772480|(null)|(null)|none",
 ])
 CANNED_NODE_DETAILS = "\n".join([
     "NodeName=calder-h200-01 Arch=x86_64 CPUAlloc=64 CPUTot=128 CPULoad=63.20 RealMemory=1546664 "
-    "AllocMem=983040 FreeMem=401234 State=MIXED Partitions=calder-gpu-hopper "
+    "AllocMem=983040 FreeMem=401234 State=MIXED Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 "
     "AllocTRES=cpu=64,mem=960G,gres/gpu=5,gres/gpu:nvidia_h200=5 CurrentWatts=2310 AveWatts=1980",
     # Idle: AllocTRES lists nothing at all, which means 0 GPUs in use.
     "NodeName=calder-h200-02 Arch=x86_64 CPUAlloc=0 CPUTot=128 CPULoad=0.04 RealMemory=1546664 "
-    "AllocMem=0 FreeMem=1501000 State=IDLE Partitions=calder-gpu-hopper "
+    "AllocMem=0 FreeMem=1501000 State=IDLE Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 AllocTRES= "
     "CurrentWatts=640 AveWatts=655",
     "NodeName=calder-h200-05 Arch=x86_64 CPUAlloc=0 CPUTot=128 CPULoad=0.01 RealMemory=1546664 "
-    "AllocMem=0 FreeMem=1500000 State=IDLE+DRAIN Partitions=calder-gpu-hopper "
+    "AllocMem=0 FreeMem=1500000 State=IDLE+DRAIN Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 AllocTRES= "
     f"CurrentWatts=0 AveWatts=0 Reason={NHC_REASON} [root@2026-10-11T22:14:03]",
     # GPUs not accounted as TRES on this node: allocation is unknowable.
@@ -269,7 +269,7 @@ CANNED_NODE_DETAILS = "\n".join([
     "AllocMem=131072 FreeMem=350000 State=MIXED Partitions=calder-gpu-lovelace "
     "CfgTRES=cpu=64,mem=512000M,billing=64 AllocTRES=cpu=16,mem=128G CurrentWatts=0 AveWatts=0",
     "NodeName=calder-cpu001 Arch=x86_64 CPUAlloc=100 CPUTot=128 CPULoad=99.12 RealMemory=772480 "
-    "AllocMem=614400 FreeMem=120000 State=MIXED Partitions=calder-cpu-turin,nodes "
+    "AllocMem=614400 FreeMem=120000 State=MIXED Partitions=cpu_turin,nodes "
     "CfgTRES=cpu=128,mem=772480M,billing=128 AllocTRES=cpu=100,mem=600G CurrentWatts=0 AveWatts=0",
 ])
 CANNED_STORAGE = "\n".join([
@@ -568,19 +568,32 @@ class RemoteInfoTests(unittest.TestCase):
 class PartitionAndNodeTests(unittest.TestCase):
     def test_partitions(self):
         partitions = hs.parse_partitions(
-            "calder-cpu-turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00\n"
-            "calder-gpu-hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00\n"
+            "cpu_turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00\n"
+            "gpu_hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00\n"
             "nodes|up|52|mix|(null)|168|768000|(null)|infinite\n"
             "legacy|up|1|idle|(null)|8|1000|none\n"
         )
         self.assertEqual(len(partitions), 4)
         cpu, gpu, aire_nodes, legacy = partitions
-        self.assertEqual(cpu.partition, "calder-cpu-turin")
+        self.assertEqual(cpu.partition, "cpu_turin")
+        # sinfo's '*' leaves the name and becomes the default mark.
+        self.assertEqual([p.is_default for p in partitions], [True, False, False, False])
         self.assertEqual((cpu.time_limit, gpu.time_limit), ("2-00:00:00", "2-00:00:00"))
         self.assertEqual(aire_nodes.time_limit, "infinite")
         self.assertEqual((hs.parse_gres_gpu_total(gpu.gres), gpu.memory_mb_per_node), (8, 1546664))
         self.assertIsNone(legacy.time_limit)
         self.assertEqual(legacy.features, "none")
+
+    def test_default_partition_marks_every_row(self):
+        # Calder since 2026-11-11: the drained AIRE-generation partition is
+        # the default, and sinfo stars each of its state rows.
+        partitions = hs.parse_partitions(
+            "cpu_genoa*|up|1|drain$|(null)|168|734374|nodegroup_cpu_genoa|2-00:00:00\n"
+            "cpu_genoa*|up|6|drain|(null)|168|734374|nodegroup_cpu_genoa|2-00:00:00\n"
+            "cpu_turin|up|83|idle|(null)|128|733895|nodegroup_cpu_turin|2-00:00:00\n"
+        )
+        self.assertEqual([(p.partition, p.is_default) for p in partitions],
+                         [("cpu_genoa", True), ("cpu_genoa", True), ("cpu_turin", False)])
 
     def test_unreadable_lines_are_reported(self):
         rejects = []
@@ -593,7 +606,7 @@ class PartitionAndNodeTests(unittest.TestCase):
         self.assertEqual((nodes[0].gpu_total, nodes[0].gpu_allocated, nodes[0].gpu_idle), (3, None, None))
 
     def test_h200_reason(self):
-        nodes = hs.parse_nodes("calder-h200-05|calder-gpu-hopper|idle+drain|0/128/0/128|1546664|"
+        nodes = hs.parse_nodes("calder-h200-05|gpu_hopper|idle+drain|0/128/0/128|1546664|"
                                "gpu:nvidia_h200:8(S:0-1)|(null)|Kill task failed")
         self.assertEqual((nodes[0].gpu_total, nodes[0].reason), (8, "Kill task failed"))
 
@@ -613,7 +626,7 @@ class PartitionAndNodeTests(unittest.TestCase):
         self.assertEqual((idle.gpu_total, idle.gpu_allocated, idle.gpu_idle), (8, 0, 8))
         self.assertEqual((drained.gpu_allocated, drained.reason), (0, NHC_REASON))
         self.assertEqual((l40.gpu_total, l40.gpu_allocated, l40.gpu_idle), (4, None, None))
-        self.assertEqual(nodes["calder-cpu001"].partitions, ["calder-cpu-turin", "nodes"])
+        self.assertEqual(nodes["calder-cpu001"].partitions, ["cpu_turin", "nodes"])
         self.assertEqual((busy.memory_free_mb, busy.cpu_load, busy.current_watts), (401234, 63.2, 2310))
 
 
@@ -1651,7 +1664,7 @@ class CollectorStubSSHTests(unittest.TestCase):
 
     def test_non_utf8_bytes(self):
         output = round_trip_output(jobs_json_status=1, pipe_jobs=(
-            f"777|calder-cpu-turin|caf@E9@-run|{USER}|RUNNING|0:10|2-00:00:00|1|calder-c001"))
+            f"777|cpu_turin|caf@E9@-run|{USER}|RUNNING|0:10|2-00:00:00|1|calder-c001"))
         stub = self.make_stub("ssh-latin1", output.encode("utf-8").replace(b"@E9@", b"\xe9"))
         snapshot = hs.collect_snapshot(self.config(stub, 10), CALDER, calder_volumes())
         self.assertEqual(snapshot.errors, [])

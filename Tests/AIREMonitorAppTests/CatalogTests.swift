@@ -108,8 +108,10 @@ struct ClusterCatalogTests {
 
     @Test("Partition roles resolve per cluster")
     func partitionRoles() {
-        #expect(ClusterProfile.calder.role(forPartition: "calder-gpu-hopper") == .gpu)
-        #expect(ClusterProfile.calder.role(forPartition: "calder-cpu-turin") == .cpu)
+        #expect(ClusterProfile.calder.role(forPartition: "gpu_hopper") == .gpu)
+        #expect(ClusterProfile.calder.role(forPartition: "cpu_turin") == .cpu)
+        #expect(ClusterProfile.calder.role(forPartition: "gpu_lovelace") == .gpu)
+        #expect(ClusterProfile.calder.role(forPartition: "cpu_genoa") == .cpu)
         #expect(ClusterProfile.aire.role(forPartition: "gpu") == .gpu)
         #expect(ClusterProfile.aire.role(forPartition: "nodes") == .cpu)
         #expect(ClusterProfile.aire.role(forPartition: "himem") == .highMemory)
@@ -119,7 +121,7 @@ struct ClusterCatalogTests {
         #expect(ClusterProfile.calder.role(forPartition: "") == nil)
         // Partition names are only meaningful within their own cluster.
         #expect(ClusterProfile.calder.role(forPartition: "gpu") == nil)
-        #expect(ClusterProfile.aire.role(forPartition: "calder-gpu-hopper") == nil)
+        #expect(ClusterProfile.aire.role(forPartition: "gpu_hopper") == nil)
     }
 
     @Test("Each profile's GPU partition is one of its GPU partition hints", arguments: catalogIDs)

@@ -4,9 +4,10 @@ import SwiftUI
 /// The Partitions tab for one cluster. Icons, accents, order and card
 /// subtitles come from the cluster profile's `PartitionHint`s, never from
 /// hard-coded partition names, so AIRE's `gpu`/`nodes`/`himem`/
-/// `teachingnodes` and Calder's `calder-gpu-hopper`/`calder-cpu-turin` share
-/// one code path, and a partition the profile does not know yet still gets
-/// sensible styling derived from its data.
+/// `teachingnodes` and Calder's `gpu_hopper`/`cpu_turin` share one code
+/// path, and a partition the profile does not know yet (a scheduler can
+/// rename them, as Calder's did on 2026-11-11) still gets sensible styling
+/// derived from its data.
 struct PartitionsDashboard: View {
     let profile: ClusterProfile
     let partitions: [PartitionSummary]
@@ -195,7 +196,11 @@ struct PartitionsTable: View {
 
     var body: some View {
         Table(partitions) {
-            TableColumn("Partition", value: \.partition)
+            // sinfo's own mark for the default partition.
+            TableColumn("Partition") { item in
+                Text(item.isDefault == true ? "\(item.partition)*" : item.partition)
+                    .help(item.isDefault == true ? "Slurm's default partition" : "")
+            }
             TableColumn("Availability", value: \.availability)
             TableColumn("State", value: \.state)
             TableColumn("Nodes") { item in
@@ -253,6 +258,31 @@ struct PartitionGroup: Identifiable {
 
     /// State rows in display order: busy, idle, then unavailable flavours.
     let sortedRows: [PartitionSummary]
+
+    /// Slurm's default partition, where a job submitted without
+    /// `--partition` goes. False when unknown (a cache from before the
+    /// collector kept sinfo's `*`).
+    var isDefault: Bool {
+        rows.contains { $0.isDefault == true }
+    }
+
+    /// A default partition that cannot start anything is a trap, not a
+    /// detail: a job submitted without `--partition` waits there. Calder's
+    /// default became the drained cpu_genoa on 2026-11-11.
+    var isDefaultWithoutUsableNodes: Bool {
+        isDefault && !health.acceptsWork
+    }
+
+    var defaultHelp: String {
+        guard isDefaultWithoutUsableNodes else {
+            return "Slurm's default partition: a job submitted without --partition goes here."
+        }
+        if case .down(let state) = health {
+            // Drained or inactive partitions refuse new jobs outright.
+            return "Slurm's default partition, but Slurm reports it as \(state): a job submitted without --partition does not start. Name a partition with --partition."
+        }
+        return "Slurm's default partition, but none of its nodes accepts work: a job submitted without --partition waits here. Name a partition with --partition."
+    }
 
     /// Nodes in this partition. Rows of ONE partition never overlap, so the
     /// sum is exact here (unlike a sum across partitions).
@@ -518,15 +548,19 @@ struct PartitionPortfolioRow: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    // One line, never "calder-\ngpu-hopper": the name has
-                    // first claim on the row, and the node count and walltime
-                    // (both repeated on the partition's card) give way
-                    // before it would wrap.
+                    // One line, never wrapped mid-name (a hyphenated name
+                    // such as Calder's old "calder-gpu-hopper" would break at
+                    // the hyphen): the name has first claim on the row, and
+                    // the node count and walltime (both repeated on the
+                    // partition's card) give way before it would wrap.
                     Text(group.name)
                         .font(.callout.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
+                    if group.isDefault {
+                        DefaultPartitionMark(group: group)
+                    }
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 8) {
                             nodeCountText
@@ -584,6 +618,9 @@ struct PartitionPortfolioRow: View {
 
     private var accessibilityValue: String {
         var parts = [pluralized(group.totalNodes, "node"), group.health.label]
+        if group.isDefault {
+            parts.append(group.defaultHelp)
+        }
         if let walltime {
             parts.append("maximum walltime \(walltime)")
         }
@@ -608,8 +645,13 @@ struct PartitionCard: View {
                 .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(group.name)
-                        .font(.headline)
+                    HStack(spacing: 6) {
+                        Text(group.name)
+                            .font(.headline)
+                        if group.isDefault {
+                            DefaultPartitionMark(group: group)
+                        }
+                    }
                     Text(group.summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -696,6 +738,21 @@ struct PartitionCard: View {
         if let shape = group.gpuShapeText {
             InfoChip(label: "Per node", value: shape, systemImage: PartitionRole.gpu.systemImage, color: AppTheme.gpu)
         }
+    }
+}
+
+/// "DEFAULT" beside a partition's name: Slurm's default partition, drawn as
+/// a warning when none of its nodes accepts work.
+struct DefaultPartitionMark: View {
+    let group: PartitionGroup
+
+    var body: some View {
+        StatusCapsule(
+            text: "Default",
+            color: group.isDefaultWithoutUsableNodes ? StatusTone.warning.color : .secondary,
+            help: group.defaultHelp
+        )
+        .accessibilityLabel("Default partition")
     }
 }
 

@@ -1342,7 +1342,7 @@ extension Job {
     /// (older caches, or a job squeue reported without details) the cluster
     /// profile's partition roles decide, and only partitions the profile does
     /// not know fall back to the historical "name contains gpu" heuristic —
-    /// which still catches AIRE's `gpu` and Calder's `calder-gpu-hopper`.
+    /// which still catches AIRE's `gpu` and Calder's `gpu_hopper`.
     func isGPUJob(on profile: ClusterProfile) -> Bool {
         isGPUJob(on: profile, gpuRequest: gpuRequest)
     }

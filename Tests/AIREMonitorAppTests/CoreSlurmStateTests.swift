@@ -297,21 +297,21 @@ struct CoreNodeStateTests {
 
     @Test("An \"up\" partition whose every sinfo row is drained offers no capacity")
     func allDrainedPartition() {
-        // Calder's aire-cpu-genoa: sinfo says "up", but its rows are drain$,
+        // Calder's cpu_genoa: sinfo says "up", but its rows are drain$,
         // drain* and drain. Partition health must come from the row states,
         // never from the availability column alone.
-        let rows = CoreFixtures.calderPartitions.filter { $0.partition == "aire-cpu-genoa" }
+        let rows = CoreFixtures.calderPartitions.filter { $0.partition == "cpu_genoa" }
         #expect(rows.count == 3)
         #expect(rows.allSatisfy { $0.availability == "up" })
         #expect(rows.allSatisfy { !NodeStateInfo($0.state).isAvailable })
         #expect(rows.reduce(0) { $0 + ($1.nodeCount ?? 0) } == 8)
 
-        let nodes = CoreFixtures.calderNodes.filter { $0.partitions.contains("aire-cpu-genoa") }
+        let nodes = CoreFixtures.calderNodes.filter { $0.partitions.contains("cpu_genoa") }
         #expect(!nodes.isEmpty)
         #expect(nodes.allSatisfy { !$0.stateInfo.isAvailable })
 
         // A partition with some usable rows does offer capacity.
-        let turin = CoreFixtures.calderPartitions.filter { $0.partition == "calder-cpu-turin" }
+        let turin = CoreFixtures.calderPartitions.filter { $0.partition == "cpu_turin" }
         let usable = turin.filter { NodeStateInfo($0.state).isAvailable }.reduce(0) { $0 + ($1.nodeCount ?? 0) }
         #expect(usable == 96)
     }

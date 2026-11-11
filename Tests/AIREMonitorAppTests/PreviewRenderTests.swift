@@ -368,9 +368,9 @@ struct PreviewRenderTests {
             isSharing: true
         )
         let jobs = [
-            Job(jobId: "489997", partition: "calder-gpu-hopper", name: "train-llm", state: "RUNNING", elapsed: "3:12:09", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:4"),
-            Job(jobId: "490008", partition: "calder-cpu-turin", name: "preprocess", state: "RUNNING", elapsed: "0:42:10", nodes: "1"),
-            Job(jobId: "490032", partition: "calder-gpu-hopper", name: "eval", state: "PENDING", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:1")
+            Job(jobId: "489997", partition: "gpu_hopper", name: "train-llm", state: "RUNNING", elapsed: "3:12:09", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:4"),
+            Job(jobId: "490008", partition: "cpu_turin", name: "preprocess", state: "RUNNING", elapsed: "0:42:10", nodes: "1"),
+            Job(jobId: "490032", partition: "gpu_hopper", name: "eval", state: "PENDING", nodes: "1", tresPerNode: "gres/gpu:nvidia_h200:1")
         ]
         func gpu(_ index: Int, _ utilization: Double, _ memory: Double) -> GPUUsage {
             GPUUsage(index: index, name: "NVIDIA H200", utilizationPercent: utilization, memoryUsedMB: memory, memoryTotalMB: 143_771, powerWatts: 120 + utilization * 5.5, temperatureC: 38 + utilization / 3)

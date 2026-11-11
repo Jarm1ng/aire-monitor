@@ -36,7 +36,7 @@ private let dependencyJob = Job(
     elapsed: "0:00", timeLimit: "8:00:00", nodes: "1", reasonOrNodeList: "(Dependency)"
 )
 private let heldH200Job = Job(
-    jobId: "9863", partition: "calder-gpu-hopper", name: "c3-d1-dump", state: "PENDING",
+    jobId: "9863", partition: "gpu_hopper", name: "c3-d1-dump", state: "PENDING",
     elapsed: "0:00", timeLimit: "3:00:00", nodes: "1", reasonOrNodeList: "(JobHeldUser)",
     reqTres: "cpu=16,gres/gpu=2,gres/gpu:nvidia_h200=2"
 )
@@ -54,7 +54,7 @@ private let gpu018 = NodeSummary(
 
 private func h200Node(_ name: String, state: String, allocated: Int?, cpuIdle: Int = 64) -> NodeSummary {
     NodeSummary(
-        node: name, partitions: ["calder-gpu-hopper"], state: state,
+        node: name, partitions: ["gpu_hopper"], state: state,
         cpuAllocated: 128 - cpuIdle, cpuIdle: cpuIdle, cpuTotal: 128, memoryMB: 1_547_000,
         gres: "gpu:nvidia_h200:8(S:0-1)", gpuTotal: 8, gpuAllocated: allocated,
         gpuIdle: allocated.map { 8 - $0 }, memoryAllocatedMB: 0, memoryFreeMB: 1_400_000,
@@ -63,7 +63,7 @@ private func h200Node(_ name: String, state: String, allocated: Int?, cpuIdle: I
 }
 
 private let lovelaceDrained = NodeSummary(
-    node: "gpu028", partitions: ["aire-gpu-lovelace"], state: "drain*",
+    node: "gpu028", partitions: ["gpu_lovelace"], state: "drain*",
     cpuAllocated: 0, cpuIdle: 24, cpuTotal: 24, gres: "gpu:nvidia_l40:3", gpuTotal: 3
 )
 
@@ -115,9 +115,9 @@ struct JobsDashboardLogicTests {
     /// sidebar and menu bar (HPCCore `JobQueueCounts`), never 12.
     @Test("Pending never includes held jobs: the Jobs tile agrees with JobQueueCounts")
     func pendingExcludesHeld() {
-        let running = (0..<9).map { Job(jobId: "6669\($0)", partition: "calder-gpu-hopper", state: "RUNNING", reasonOrNodeList: "calder-h200-01") }
-        let held = (0..<11).map { Job(jobId: "6675\($0)", partition: "calder-gpu-hopper", state: "PENDING", reasonOrNodeList: "(JobHeldUser)") }
-        let later = Job(jobId: "66927", partition: "calder-gpu-hopper", state: "PENDING", reasonOrNodeList: "(BeginTime)")
+        let running = (0..<9).map { Job(jobId: "6669\($0)", partition: "gpu_hopper", state: "RUNNING", reasonOrNodeList: "calder-h200-01") }
+        let held = (0..<11).map { Job(jobId: "6675\($0)", partition: "gpu_hopper", state: "PENDING", reasonOrNodeList: "(JobHeldUser)") }
+        let later = Job(jobId: "66927", partition: "gpu_hopper", state: "PENDING", reasonOrNodeList: "(BeginTime)")
         let jobs = running + held + [later]
         let summary = JobQueueSummary(rows: JobRow.rows(for: jobs, profile: calder))
         let counts = JobQueueCounts(jobs: jobs)
@@ -253,7 +253,7 @@ struct PartitionHealthTests {
 
     @Test("Every node drained: up in sinfo, but no usable nodes")
     func allDrained() {
-        let rows = [row("aire-cpu-genoa", "drain$", 1), row("aire-cpu-genoa", "drain*", 1), row("aire-cpu-genoa", "drain", 6)]
+        let rows = [row("cpu_genoa", "drain$", 1), row("cpu_genoa", "drain*", 1), row("cpu_genoa", "drain", 6)]
         let health = PartitionHealth(rows: rows)
         #expect(health == .noUsableNodes(total: 8))
         #expect(!health.acceptsWork)
@@ -262,7 +262,7 @@ struct PartitionHealthTests {
 
     @Test("Some nodes out: degraded with the usable share")
     func degraded() {
-        let rows = [row("calder-gpu-hopper", "mix-", 4), row("calder-gpu-hopper", "drain", 1), row("calder-gpu-hopper", "mix", 2)]
+        let rows = [row("gpu_hopper", "mix-", 4), row("gpu_hopper", "drain", 1), row("gpu_hopper", "mix", 2)]
         let health = PartitionHealth(rows: rows)
         #expect(health == .degraded(usable: 6, total: 7))
         #expect(health.acceptsWork)
@@ -278,6 +278,47 @@ struct PartitionHealthTests {
         #expect(PartitionHealth.down("inactive").tone == .critical)
         #expect(PartitionHealth.degraded(usable: 26, total: 28).tone == .warning)
         #expect(PartitionHealth.up.tone == .normal)
+    }
+
+    /// Calder since 2026-11-11: the default partition is cpu_genoa, every
+    /// node of it drained, so a job submitted without --partition waits.
+    @Test("A default partition without usable nodes is flagged; a healthy default is not")
+    func defaultPartition() {
+        func rows(_ partition: String, _ states: [(String, Int)], isDefault: Bool?) -> [PartitionSummary] {
+            states.map { PartitionSummary(partition: partition, nodeCount: $0.1, state: $0.0, isDefault: isDefault) }
+        }
+        let genoa = PartitionGroup(
+            name: "cpu_genoa",
+            rows: rows("cpu_genoa", [("drain$", 1), ("drain*", 2), ("drain", 5)], isDefault: true),
+            profile: .calder
+        )
+        #expect(genoa.isDefault)
+        #expect(genoa.isDefaultWithoutUsableNodes)
+        #expect(genoa.defaultHelp.contains("waits here"))
+
+        let turin = PartitionGroup(name: "cpu_turin", rows: rows("cpu_turin", [("idle", 83), ("drain", 11)], isDefault: true), profile: .calder)
+        #expect(turin.isDefault)
+        #expect(!turin.isDefaultWithoutUsableNodes)
+        #expect(turin.defaultHelp.contains("goes here"))
+
+        // A default partition Slurm itself reports inactive: no job starts
+        // there, and "waits" would be wrong (Slurm refuses it).
+        let inactive = PartitionGroup(
+            name: "cpu_old",
+            rows: [PartitionSummary(partition: "cpu_old", availability: "inact", nodeCount: 4, state: "idle", isDefault: true)],
+            profile: .calder
+        )
+        #expect(inactive.isDefaultWithoutUsableNodes)
+        #expect(inactive.defaultHelp.contains("reports it as inactive"))
+        #expect(!inactive.defaultHelp.contains("waits"))
+
+        // Not the default, or unknown (a cache from before the collector
+        // kept sinfo's *): no mark, however drained.
+        for isDefault in [false, nil] as [Bool?] {
+            let group = PartitionGroup(name: "cpu_genoa", rows: rows("cpu_genoa", [("drain", 8)], isDefault: isDefault), profile: .calder)
+            #expect(!group.isDefault)
+            #expect(!group.isDefaultWithoutUsableNodes)
+        }
     }
 
     @Test("Administratively down and fully healthy")

@@ -78,7 +78,7 @@ Every job also has a live `tail -F` of its output, a shortcut to its working dir
 
 **Trends** charts idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window. The app keeps the newest 1,440 points, about the last 4 hours at the 10-second cadence, so the longer windows show at most that.
 
-Also per cluster: **Partitions** (capacity and walltime limits), **Storage** (home, scratch and flash against your quotas, file counts included), **Files** (preview, upload, download, rename, folder sizes, and delete to a Trash you can restore from) and **Terminal**.
+Also per cluster: **Partitions** (capacity, walltime limits, and which partition is Slurm's default, flagged when it cannot start jobs), **Storage** (home, scratch and flash against your quotas, file counts included), **Files** (preview, upload, download, rename, folder sizes, and delete to a Trash you can restore from) and **Terminal**.
 
 ### Sessions that keep up with a laptop
 
@@ -127,7 +127,7 @@ The **desktop widget** is a compact always-on-desktop panel with one row per clu
 | **Status strip** | Why a cluster is not updating, worded by what fixes it: a setup problem on this Mac, Slurm trouble over a live session, or no connection. **Details** shows the raw output and how many refreshes in a row failed |
 | **Jobs** | Your queue with details per job, **Resource use** for running jobs, a live `tail -F`, the working directory, and a confirmed **Cancel job** |
 | **Sessions** | Each session's age, **Renew all**, what happened when a session dropped, sharing and automatic sign-in |
-| **Partitions / Nodes** | Partition capacity and walltime limits, the GPU fleet and heatmap, node health (down, drained, not responding) |
+| **Partitions / Nodes** | Partition capacity and walltime limits, Slurm's default partition (a warning when none of its nodes accepts work, so a job without `--partition` would wait), the GPU fleet and heatmap, node health (down, drained, not responding) |
 | **Trends** | Idle GPUs, GPU allocation, queue pressure, unavailable GPU nodes and storage in a 1, 6 or 24-hour window (about the last 4 hours are kept) |
 | **Storage** | Home, scratch and flash against your quota, including file-count limits |
 | **Files** | Remote file browser: preview, upload, download, rename, folder size, delete to a restorable Trash |
@@ -146,11 +146,11 @@ GPUs whose allocation a snapshot does not report are shown as unknown (`?`), nev
 |---|---|---|
 | Login host | `aire.leeds.ac.uk` | `calder.leeds.ac.uk` |
 | GPUs | NVIDIA L40S | NVIDIA H200 (plus a few AIRE-generation L40) |
-| Partitions | `nodes`, `gpu`, `himem`, `teachingnodes` | `calder-cpu-turin`, `calder-gpu-hopper`, plus the AIRE-generation `aire-gpu-lovelace` and `aire-cpu-genoa` |
+| Partitions | `nodes` (default), `gpu`, `himem`, `teachingnodes` | `cpu_turin`, `gpu_hopper`, plus the AIRE-generation `gpu_lovelace` and `cpu_genoa`, which is now Slurm's default and fully drained: always pass `--partition`. Renamed on 11 November 2026 from `calder-cpu-turin`, `calder-gpu-hopper`, `aire-gpu-lovelace` and `aire-cpu-genoa` |
 | Home | `/users/<username>` (shared by both clusters) | same |
 | Scratch / flash | `/mnt/scratch/<username>`, Lustre user quota | `/scratch-calder/users/<username>`, `/flash-calder/users/<username>`, Lustre project quotas |
 
-Partitions the app has no hint for are still classified from Slurm's own data: one with GPU gres gets the GPU role, any other the CPU role. Either cluster can be switched off under **Advanced**. To add a cluster:
+Partitions the app has no hint for are still classified from Slurm's own data: one with GPU gres gets the GPU role, any other the CPU role. So when a scheduler renames its partitions, as Calder's did, nothing disappears, and the terminal's **GPU nodes** command follows the cluster's current partition list. A few things wait for an app update: the one-line descriptions, the display order, and the high-memory or teaching role (until then such a partition shows as plain CPU). The [Calder guide](CALDER_SERVER_GUIDE_EN.md) ([中文](CALDER_SERVER_GUIDE.md)) has the details. Either cluster can be switched off under **Advanced**. To add a cluster:
 - add its identity (name, monogram, colour) to `ClusterIdentity.known` in [`Catalog.swift`](Sources/HPCCore/Catalog.swift);
 - add one profile (hosts, storage paths, partition roles) to [`ClusterProfile.swift`](Sources/AIREMonitorApp/ClusterProfile.swift) and append it to `ClusterCatalog.all`;
 - add it to `KNOWN_CLUSTER_NAMES` and `KNOWN_CLUSTER_HOSTNAMES` in [`scripts/hpc_snapshot.py`](scripts/hpc_snapshot.py) and regenerate the fixtures with `python3 scripts/tests/test_snapshot.py --write-fixture` ([details](MACOS_APP.md#cluster-profiles-and-the-catalog)).

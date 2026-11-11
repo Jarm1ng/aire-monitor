@@ -115,7 +115,7 @@ enum SnapshotFixtures {
       "jobs": [],
       "partitions": [
         {
-          "partition": "calder-gpu-hopper",
+          "partition": "gpu_hopper",
           "availability": "up",
           "node_count": 7,
           "state": "idle",
@@ -126,7 +126,7 @@ enum SnapshotFixtures {
           "time_limit": "2-00:00:00"
         },
         {
-          "partition": "calder-cpu-turin",
+          "partition": "cpu_turin",
           "availability": "up",
           "node_count": 98,
           "state": "idle",
@@ -134,13 +134,14 @@ enum SnapshotFixtures {
           "cpus_per_node": 128,
           "memory_mb_per_node": 772000,
           "features": "(null)",
-          "time_limit": "2-00:00:00"
+          "time_limit": "2-00:00:00",
+          "is_default": true
         }
       ],
       "nodes": [
         {
           "node": "calder-h200-01",
-          "partitions": ["calder-gpu-hopper"],
+          "partitions": ["gpu_hopper"],
           "state": "idle",
           "cpu_allocated": 0,
           "cpu_idle": 128,
@@ -259,6 +260,8 @@ struct SnapshotDecodingTests {
         let partition = try #require(snapshot.partitions.first)
         #expect(partition.partition == "gpu")
         #expect(partition.timeLimit == nil)
+        // Unknown, not "not the default": older collectors dropped sinfo's *.
+        #expect(partition.isDefault == nil)
 
         let storage = try #require(snapshot.storage)
         #expect(storage.count == 2)
@@ -303,6 +306,8 @@ struct SnapshotDecodingTests {
         #expect(snapshot.warnings.count == 1)
         #expect(snapshot.errors.isEmpty)
         #expect(snapshot.partitions.map(\.timeLimit) == ["2-00:00:00", "2-00:00:00"])
+        // A row without the key is unknown; the collector writes false.
+        #expect(snapshot.partitions.map(\.isDefault) == [nil, true])
 
         let node = try #require(snapshot.nodes.first)
         #expect(slurmGPUModel(from: node.gres).map(gpuModelDisplayName) == "H200")
@@ -363,6 +368,7 @@ struct SnapshotDecodingTests {
         #expect(decoded.cluster == original.cluster)
         #expect(decoded.warnings == original.warnings)
         #expect(decoded.partitions.map(\.timeLimit) == original.partitions.map(\.timeLimit))
+        #expect(decoded.partitions.map(\.isDefault) == original.partitions.map(\.isDefault))
         #expect(decoded.sortedStorage.map(\.projectID) == original.sortedStorage.map(\.projectID))
         #expect(decoded.sortedStorage.map(\.quotaType) == original.sortedStorage.map(\.quotaType))
     }

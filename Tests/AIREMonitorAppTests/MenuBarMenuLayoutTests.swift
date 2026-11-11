@@ -29,7 +29,7 @@ private let l40sNode = NodeSummary(
 )
 
 private let drainedL40Node = NodeSummary(
-    node: "gpu028", partitions: ["aire-gpu-lovelace"], state: "drain*",
+    node: "gpu028", partitions: ["gpu_lovelace"], state: "drain*",
     cpuAllocated: 0, cpuIdle: 24, cpuTotal: 24,
     gres: "gpu:nvidia_l40:3(S:0-1)", gpuTotal: 3, gpuAllocated: 0, gpuIdle: 3
 )

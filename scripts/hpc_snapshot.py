@@ -222,6 +222,9 @@ class PartitionSummary:
     # sinfo %l, e.g. "2-00:00:00" or "infinite"; None when the remote output
     # predates the %l column.
     time_limit: str | None = None
+    # Slurm's default partition (sinfo's '*' suffix on %P): where a job
+    # submitted without --partition goes.
+    is_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -1334,6 +1337,8 @@ def parse_partitions(output: str, rejects: list[str] | None = None) -> list[Part
 
     %l (time limit) is the LAST column so the older 8-column layout is a
     strict prefix: both are accepted, the older one yields time_limit=None.
+    sinfo marks the default partition with a trailing '*' on every one of its
+    rows; the name is kept without it and the mark becomes is_default.
     """
     partitions: list[PartitionSummary] = []
     for line in nonempty_lines(output):
@@ -1346,6 +1351,7 @@ def parse_partitions(output: str, rejects: list[str] | None = None) -> list[Part
         partitions.append(
             PartitionSummary(
                 partition=fields[0].rstrip("*"),
+                is_default=fields[0].endswith("*"),
                 availability=fields[1],
                 node_count=parse_int(fields[2]),
                 state=fields[3],

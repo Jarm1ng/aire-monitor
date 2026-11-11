@@ -68,21 +68,21 @@ private let mixedL40SNode = NodeSummary(
     gres: "gpu:l40s:3(S:0-1)", gpuTotal: 3, gpuAllocated: 1, gpuIdle: 2
 )
 
-/// Calder's shape: H200s in calder-gpu-hopper, one L40 node elsewhere.
+/// Calder's shape: H200s in gpu_hopper, one L40 node elsewhere.
 private func calderNodes(l40State: String = "drain*") -> [NodeSummary] {
     [
         NodeSummary(
-            node: "calder-h200-01", partitions: ["calder-gpu-hopper"], state: "mix",
+            node: "calder-h200-01", partitions: ["gpu_hopper"], state: "mix",
             cpuAllocated: 100, cpuIdle: 28, cpuTotal: 128,
             gres: "gpu:nvidia_h200:8(S:0-1)", gpuTotal: 8, gpuAllocated: 7, gpuIdle: 1
         ),
         NodeSummary(
-            node: "calder-h200-02", partitions: ["calder-gpu-hopper"], state: "mix",
+            node: "calder-h200-02", partitions: ["gpu_hopper"], state: "mix",
             cpuAllocated: 64, cpuIdle: 64, cpuTotal: 128,
             gres: "gpu:nvidia_h200:8(S:0-1)", gpuTotal: 8, gpuAllocated: 8, gpuIdle: 0
         ),
         NodeSummary(
-            node: "calder-l40-01", partitions: ["aire-gpu-lovelace"], state: l40State,
+            node: "calder-l40-01", partitions: ["gpu_lovelace"], state: l40State,
             cpuAllocated: 0, cpuIdle: 64, cpuTotal: 64,
             gres: "gpu:nvidia_l40:3", gpuTotal: 3, gpuAllocated: 0, gpuIdle: 3
         )
@@ -104,7 +104,7 @@ private func unknownL40SNodes(_ count: Int) -> [NodeSummary] {
 /// Calder's H200 node with its allocation missing.
 private func unknownH200Node(_ name: String) -> NodeSummary {
     NodeSummary(
-        node: name, partitions: ["calder-gpu-hopper"], state: "mix",
+        node: name, partitions: ["gpu_hopper"], state: "mix",
         cpuAllocated: 64, cpuIdle: 64, cpuTotal: 128,
         gres: "gpu:nvidia_h200:8(S:0-1)", gpuTotal: 8, gpuAllocated: nil, gpuIdle: nil
     )
@@ -390,7 +390,7 @@ struct MenuBarGPUPoolTests {
         // between them (unavailable). 34 of 56 allocated, none idle.
         func h200(_ index: Int, state: String, cpuIdle: Int, allocated: Int) -> NodeSummary {
             NodeSummary(
-                node: "calder-h200-0\(index)", partitions: ["calder-gpu-hopper"], state: state,
+                node: "calder-h200-0\(index)", partitions: ["gpu_hopper"], state: state,
                 cpuAllocated: 128 - cpuIdle, cpuIdle: cpuIdle, cpuTotal: 128,
                 gres: "gpu:nvidia_h200:8(S:0-1)", gpuTotal: 8, gpuAllocated: allocated, gpuIdle: 8 - allocated
             )

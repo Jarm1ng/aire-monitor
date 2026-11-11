@@ -208,6 +208,9 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
     public let features: String
     /// sinfo %l, e.g. "2-00:00:00" or "infinite". Absent in older caches.
     public let timeLimit: String?
+    /// Slurm's default partition (sinfo's `*`): where a job submitted without
+    /// `--partition` goes. nil in caches from before the collector kept it.
+    public let isDefault: Bool?
 
     // sinfo summary output can emit multiple rows sharing partition/state/gres
     // (differing only in features or node count); include those so SwiftUI
@@ -224,6 +227,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         case memoryMBPerNode = "memory_mb_per_node"
         case features
         case timeLimit = "time_limit"
+        case isDefault = "is_default"
     }
 
     public init(
@@ -235,7 +239,8 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         cpusPerNode: Int? = nil,
         memoryMBPerNode: Int? = nil,
         features: String = "(null)",
-        timeLimit: String? = nil
+        timeLimit: String? = nil,
+        isDefault: Bool? = nil
     ) {
         self.partition = partition
         self.availability = availability
@@ -246,6 +251,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         self.memoryMBPerNode = memoryMBPerNode
         self.features = features
         self.timeLimit = timeLimit
+        self.isDefault = isDefault
     }
 
     public init(from decoder: Decoder) throws {
@@ -259,6 +265,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         memoryMBPerNode = container.lenientOptional(Int.self, .memoryMBPerNode)
         features = container.lenientString(.features)
         timeLimit = container.lenientOptional(String.self, .timeLimit)
+        isDefault = container.lenientOptional(Bool.self, .isDefault)
     }
 }
 

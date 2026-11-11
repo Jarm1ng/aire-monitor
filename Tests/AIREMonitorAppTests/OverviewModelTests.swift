@@ -75,13 +75,13 @@ private func cpuNode(_ name: String, state: String, idle: Int, total: Int = 168)
     NodeSummary(node: name, partitions: ["nodes"], state: state, cpuAllocated: total - idle, cpuIdle: idle, cpuOther: 0, cpuTotal: total)
 }
 
-/// Calder as observed live: H200s in calder-gpu-hopper, one drained L40
-/// node in aire-gpu-lovelace.
+/// Calder as observed live: H200s in gpu_hopper, one drained L40
+/// node in gpu_lovelace.
 private let calderNodes: [NodeSummary] = [
-    gpuNode("calder-h200-01", state: "mix-", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 7, partition: "calder-gpu-hopper"),
-    gpuNode("calder-h200-02", state: "alloc", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 8, partition: "calder-gpu-hopper"),
-    gpuNode("calder-h200-03", state: "drain", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 0, partition: "calder-gpu-hopper"),
-    gpuNode("aire-l40-01", state: "drain*", gres: "gpu:nvidia_l40:3", total: 3, allocated: 0, partition: "aire-gpu-lovelace")
+    gpuNode("calder-h200-01", state: "mix-", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 7, partition: "gpu_hopper"),
+    gpuNode("calder-h200-02", state: "alloc", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 8, partition: "gpu_hopper"),
+    gpuNode("calder-h200-03", state: "drain", gres: "gpu:nvidia_h200:8(S:0-1)", total: 8, allocated: 0, partition: "gpu_hopper"),
+    gpuNode("aire-l40-01", state: "drain*", gres: "gpu:nvidia_l40:3", total: 3, allocated: 0, partition: "gpu_lovelace")
 ]
 
 private func snapshot(
@@ -151,8 +151,8 @@ struct JobQueueCountsTests {
             + (1...9).map { job("669\($0 + 10)", state: "RUNNING") }
             + [job("66927", state: "PENDING", reason: "(BeginTime)")]
         let fleet = GPUFleet(nodes: [
-            gpuNode("calder-h200-01", state: "alloc", gres: "gpu:nvidia_h200:8", total: 8, allocated: 8, partition: "calder-gpu-hopper"),
-            gpuNode("gpu028", state: "drain*", gres: "gpu:nvidia_l40:3", total: 3, allocated: 0, partition: "aire-gpu-lovelace")
+            gpuNode("calder-h200-01", state: "alloc", gres: "gpu:nvidia_h200:8", total: 8, allocated: 8, partition: "gpu_hopper"),
+            gpuNode("gpu028", state: "drain*", gres: "gpu:nvidia_l40:3", total: 3, allocated: 0, partition: "gpu_lovelace")
         ])
         let summary = ClusterSidebarSummary(jobs: jobs, fleet: fleet)
         #expect(summary.lines == ["9 running · 1 pending · 11 held", "0 of 8 H200 idle · +1 more model"])

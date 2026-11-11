@@ -200,7 +200,7 @@ struct ReadmeScreenshotTests {
         let endTime: String = slurmTime.string(from: started.addingTimeInterval(2 * 86_400))
         let job = Job(
             jobId: bigJobID,
-            partition: "calder-gpu-hopper",
+            partition: "gpu_hopper",
             name: "train-llm-70b",
             user: "abcd1234",
             state: "RUNNING",

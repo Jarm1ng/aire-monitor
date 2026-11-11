@@ -217,16 +217,18 @@ extension ClusterProfile {
                 optional: true
             )
         ],
+        // Renamed on 2026-11-11 (they were calder-gpu-hopper, calder-cpu-turin,
+        // aire-gpu-lovelace and aire-cpu-genoa). The scheduler also carries
+        // AIRE-generation nodes (L40 GPUs, Genoa CPUs), drained since they
+        // appeared — presumably the Aire 2.0 move onto the new controller —
+        // and cpu_genoa is now Slurm's default partition.
         partitions: [
-            PartitionHint(name: "calder-gpu-hopper", role: .gpu, summary: "H200 GPU partition", sortRank: 0),
-            PartitionHint(name: "calder-cpu-turin", role: .cpu, summary: "standard CPU partition", sortRank: 1),
-            // Observed live on 2026-10-12: Calder's scheduler also carries
-            // AIRE-generation nodes (L40 GPUs, Genoa CPUs), drained at the
-            // time — presumably the Aire 2.0 move onto the new controller.
-            PartitionHint(name: "aire-gpu-lovelace", role: .gpu, summary: "AIRE-generation L40 nodes on the Calder scheduler", sortRank: 2),
-            PartitionHint(name: "aire-cpu-genoa", role: .cpu, summary: "AIRE-generation CPU nodes on the Calder scheduler", sortRank: 3)
+            PartitionHint(name: "gpu_hopper", role: .gpu, summary: "H200 GPU partition", sortRank: 0),
+            PartitionHint(name: "cpu_turin", role: .cpu, summary: "standard CPU partition", sortRank: 1),
+            PartitionHint(name: "gpu_lovelace", role: .gpu, summary: "AIRE-generation L40 nodes on the Calder scheduler", sortRank: 2),
+            PartitionHint(name: "cpu_genoa", role: .cpu, summary: "AIRE-generation CPU nodes on the Calder scheduler", sortRank: 3)
         ],
-        gpuPartition: "calder-gpu-hopper",
+        gpuPartition: "gpu_hopper",
         // Calder scratch/flash use Lustre project quotas keyed by the
         // directory's project id, not per-user quotas.
         documentationURL: URL(string: "https://arcdocs.leeds.ac.uk/calder/welcome.html")!
