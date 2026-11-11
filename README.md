@@ -278,7 +278,7 @@ scripts/render_previews.sh                   # offscreen PNGs of every screen, i
 scripts/render_readme_images.sh              # the screenshots above, from demo data, into docs/images
 ```
 
-None of the tests use the network, your Keychain or `~/.ssh`. On a Mac with only the Command Line Tools, plain `swift test` cannot find swift-testing, so use the wrapper script. [CI](.github/workflows/tests.yml) runs `scripts/test_all.sh` on every pull request and every push to `main`. Architecture, the login protocol and the runtime layout are in [MACOS_APP.md](MACOS_APP.md).
+None of the tests use the network, your Keychain or `~/.ssh`. On a Mac with only the Command Line Tools, plain `swift test` cannot find swift-testing, and since the macOS 27.2 tools (Swift 6.4) it also fails on SwiftTerm's Metal shader, so use the wrapper script. It adds the swift-testing paths and picks SwiftPM's native build system. When the SDK's SwiftUI needs a macro plugin the Command Line Tools lack, it also builds against an older bundled SDK (26.5), as the build scripts do. [CI](.github/workflows/tests.yml) runs `scripts/test_all.sh` on every pull request and every push to `main`. Architecture, the login protocol and the runtime layout are in [MACOS_APP.md](MACOS_APP.md).
 
 ## Upgrading from AIRE Monitor
 

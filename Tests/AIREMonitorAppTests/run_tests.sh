@@ -9,7 +9,8 @@
 # compiles its swift-testing entry point out (`#if canImport(Testing)`), so a
 # run would "pass" with zero tests. Target settings in Package.swift cannot
 # reach that generated runner, so -F is passed here for every module. With
-# Xcode selected SwiftPM already does this and the wrapper adds nothing.
+# Xcode selected SwiftPM already does this; the wrapper then only asks for
+# the native build system, as the build scripts do (swiftpm_toolchain.sh).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,6 +22,15 @@ USER_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime
 SCRATCH_DIR="${HPC_TEST_BUILD_DIR:-${USER_TMP%/}/hpc-monitor-tests-build}"
 
 ARGS=(--disable-sandbox --scratch-path "$SCRATCH_DIR")
+
+# The native build system and, with Command Line Tools that lack the SwiftUI
+# macro plugin, an SDK that does not need it (see the script).
+# shellcheck source=../../scripts/swiftpm_toolchain.sh
+source "$ROOT_DIR/scripts/swiftpm_toolchain.sh"
+if hpc_swiftpm_offers_native_build_system; then
+    ARGS+=(--build-system native)
+fi
+hpc_swiftpm_select_sdk
 
 CLT_DIR="/Library/Developer/CommandLineTools"
 CLT_FRAMEWORKS="$CLT_DIR/Library/Developer/Frameworks"

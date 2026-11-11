@@ -1733,7 +1733,8 @@ struct BuildBundleInstallSourceTests {
             stubs = try LaunchServicesStubs(base: base)
             let manager = FileManager.default
             try makeCheckout(at: checkout)
-            for name in ["build_bundle.sh", "install_app.sh"] {
+            // build_bundle.sh sources swiftpm_toolchain.sh.
+            for name in ["build_bundle.sh", "install_app.sh", "swiftpm_toolchain.sh"] {
                 try manager.copyItem(
                     atPath: repositoryRoot.appendingPathComponent("scripts/\(name)").path,
                     toPath: checkout + "/scripts/\(name)"
