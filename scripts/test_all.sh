@@ -91,9 +91,16 @@ run_swift() {
     # Command Line Tools flags that would otherwise force full rebuilds.
     banner "Desktop widget build"
     local user_tmp scratch
+    local build_args=(--disable-sandbox --product AIREDesktopWidget)
     user_tmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "$ROOT_DIR/.runtime/")"
     scratch="${HPC_TEST_BUILD_DIR:-${user_tmp%/}/hpc-monitor-tests-build}-widget"
-    run_limited 1200 swift build --disable-sandbox --scratch-path "$scratch" --product AIREDesktopWidget
+    # shellcheck source=swiftpm_toolchain.sh
+    source "$ROOT_DIR/scripts/swiftpm_toolchain.sh"
+    if hpc_swiftpm_offers_native_build_system; then
+        build_args+=(--build-system native)
+    fi
+    # A subshell, so a chosen SDKROOT never reaches the Python suites below.
+    (hpc_swiftpm_select_sdk && run_limited 1200 swift build --scratch-path "$scratch" "${build_args[@]}")
     record swift "swift build --product AIREDesktopWidget" $?
 }
 

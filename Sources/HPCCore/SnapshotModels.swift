@@ -208,6 +208,9 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
     public let features: String
     /// sinfo %l, e.g. "2-00:00:00" or "infinite". Absent in older caches.
     public let timeLimit: String?
+    /// Slurm's default partition (sinfo's `*`): where a job submitted without
+    /// `--partition` goes. nil in caches from before the collector kept it.
+    public let isDefault: Bool?
 
     // sinfo summary output can emit multiple rows sharing partition/state/gres
     // (differing only in features or node count); include those so SwiftUI
@@ -224,6 +227,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         case memoryMBPerNode = "memory_mb_per_node"
         case features
         case timeLimit = "time_limit"
+        case isDefault = "is_default"
     }
 
     public init(
@@ -235,7 +239,8 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         cpusPerNode: Int? = nil,
         memoryMBPerNode: Int? = nil,
         features: String = "(null)",
-        timeLimit: String? = nil
+        timeLimit: String? = nil,
+        isDefault: Bool? = nil
     ) {
         self.partition = partition
         self.availability = availability
@@ -246,6 +251,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         self.memoryMBPerNode = memoryMBPerNode
         self.features = features
         self.timeLimit = timeLimit
+        self.isDefault = isDefault
     }
 
     public init(from decoder: Decoder) throws {
@@ -259,6 +265,7 @@ public struct PartitionSummary: Codable, Identifiable, Equatable, Sendable {
         memoryMBPerNode = container.lenientOptional(Int.self, .memoryMBPerNode)
         features = container.lenientString(.features)
         timeLimit = container.lenientOptional(String.self, .timeLimit)
+        isDefault = container.lenientOptional(Bool.self, .isDefault)
     }
 }
 
@@ -549,6 +556,9 @@ public struct ClusterSnapshot: Codable, Equatable, Sendable {
     /// elements skipped while decoding. Never a reason to treat a refresh as
     /// failed.
     public let warnings: [String]
+    /// What running jobs use on their nodes (`--job-usage` runs only). nil
+    /// when not sampled this time: the previous figures stay valid.
+    public let jobUsage: [JobNodeUsage]?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -565,6 +575,7 @@ public struct ClusterSnapshot: Codable, Equatable, Sendable {
         case storage
         case errors
         case warnings
+        case jobUsage = "job_usage"
     }
 
     public init(
@@ -581,9 +592,11 @@ public struct ClusterSnapshot: Codable, Equatable, Sendable {
         nodes: [NodeSummary] = [],
         storage: [StorageSummary]? = nil,
         errors: [String] = [],
-        warnings: [String] = []
+        warnings: [String] = [],
+        jobUsage: [JobNodeUsage]? = nil
     ) {
         self.schemaVersion = schemaVersion
+        self.jobUsage = jobUsage
         self.collectedAt = collectedAt
         self.startedAt = startedAt
         self.durationMs = durationMs
@@ -618,6 +631,7 @@ public struct ClusterSnapshot: Codable, Equatable, Sendable {
         nodes = container.lossyArray(NodeSummary.self, .nodes, noun: "node", notes: &notes) ?? []
         storage = container.lossyArray(StorageSummary.self, .storage, noun: "storage row", notes: &notes)
         errors = container.lenientOptional([String].self, .errors) ?? []
+        jobUsage = container.lossyArray(JobNodeUsage.self, .jobUsage, noun: "job usage row", notes: &notes)
         if let version = schemaVersion, version > Self.supportedSchemaVersion {
             notes.append("Snapshot schema \(version) is newer than this app understands (\(Self.supportedSchemaVersion)); some details may be missing — update the app")
         }

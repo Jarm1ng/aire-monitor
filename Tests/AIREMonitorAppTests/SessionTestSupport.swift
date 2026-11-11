@@ -84,12 +84,13 @@ final class FakeBackend: ClusterBackend, @unchecked Sendable {
     private var collectGates: [TestGate] = []
     private var _collectCalls: [ConnectionSettings] = []
     private var _skipStorageFlags: [Bool] = []
+    private var _jobUsageFlags: [Bool] = []
     private var _completedCollections = 0
 
     private var loginResults: [Result<LoginResult, Error>] = []
     private var holdLogins = false
     private var loginGates: [TestGate] = []
-    private var _loginCalls: [(settings: ConnectionSettings, password: String, forceReplace: Bool)] = []
+    private var _loginCalls: [(settings: ConnectionSettings, password: String, forceReplace: Bool, renewJumpHost: Bool)] = []
     private var _stopMasterCalls: [(settings: ConnectionSettings, stopJumpIfUnused: Bool)] = []
     private var stopMasterResult: Result<StopMasterReport, Error> = .success(StopMasterReport(statusLines: ["stopped the session"]))
     private var _adoptCalls: [ConnectionSettings] = []
@@ -114,8 +115,9 @@ final class FakeBackend: ClusterBackend, @unchecked Sendable {
     var collectCalls: [ConnectionSettings] { locked { _collectCalls } }
     /// `skipStorage` of every collector run, in order.
     var skipStorageFlags: [Bool] { locked { _skipStorageFlags } }
+    var jobUsageFlags: [Bool] { locked { _jobUsageFlags } }
     var completedCollections: Int { locked { _completedCollections } }
-    var loginCalls: [(settings: ConnectionSettings, password: String, forceReplace: Bool)] { locked { _loginCalls } }
+    var loginCalls: [(settings: ConnectionSettings, password: String, forceReplace: Bool, renewJumpHost: Bool)] { locked { _loginCalls } }
     var stopMasterCalls: [ConnectionSettings] { locked { _stopMasterCalls.map(\.settings) } }
     var stopJumpFlags: [Bool] { locked { _stopMasterCalls.map(\.stopJumpIfUnused) } }
     var adoptCalls: [ConnectionSettings] { locked { _adoptCalls } }
@@ -181,10 +183,11 @@ final class FakeBackend: ClusterBackend, @unchecked Sendable {
         gates.forEach { $0.finish(.success(())) }
     }
 
-    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool) async throws -> ClusterSnapshot {
+    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool, jobUsage: Bool) async throws -> ClusterSnapshot {
         let gate = locked { () -> TestGate? in
             _collectCalls.append(settings)
             _skipStorageFlags.append(skipStorage)
+            _jobUsageFlags.append(jobUsage)
             guard holdCollections else {
                 return nil
             }
@@ -206,10 +209,11 @@ final class FakeBackend: ClusterBackend, @unchecked Sendable {
         settings: ConnectionSettings,
         password: String,
         forceReplace: Bool,
+        renewJumpHost: Bool,
         onStatus: (@Sendable (String) -> Void)?
     ) async throws -> LoginResult {
         let gate = locked { () -> TestGate? in
-            _loginCalls.append((settings, password, forceReplace))
+            _loginCalls.append((settings, password, forceReplace, renewJumpHost))
             guard holdLogins else {
                 return nil
             }
@@ -303,6 +307,7 @@ final class RecordingNotifier: ClusterEventNotifying {
 final class FakeHost: ClusterSessionHost {
     var signInConfiguration: SignInConfiguration
     var notifyWhenGPUFrees = false
+    var sampleJobUsage = false
     let notifier = RecordingNotifier()
     var persistenceProblems: [String?] = []
 

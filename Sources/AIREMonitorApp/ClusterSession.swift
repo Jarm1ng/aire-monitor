@@ -21,6 +21,9 @@ struct SignInConfiguration: Sendable, Equatable {
 protocol ClusterSessionHost: AnyObject {
     var signInConfiguration: SignInConfiguration { get }
     var notifyWhenGPUFrees: Bool { get }
+    /// Sample what running jobs use on their compute nodes (GPU, CPU,
+    /// memory) about once a minute.
+    var sampleJobUsage: Bool { get }
     /// Where job and GPU alerts go; nil disables them.
     var eventNotifier: ClusterEventNotifying? { get }
     /// A cache write kind keeps failing for this session (nil: it recovered).
@@ -218,6 +221,11 @@ final class ClusterSession: ObservableObject, Identifiable {
     /// so the rows can be older than the snapshot. nil before any rows.
     @Published private(set) var storageCollectedAt: String?
     @Published private(set) var history: [TrendPoint] = []
+    /// What each running job used at the last sample, keyed by `Job.jobId`
+    /// (see `wantsJobUsage`). Jobs that stopped running drop out.
+    @Published private(set) var jobUsage: [String: JobUsageSummary] = [:]
+    /// Recent samples per running job, for the trend in its details.
+    @Published private(set) var jobUsageHistory = JobUsageHistory()
     /// True while the background refresh timer is suspended by the user.
     /// Login always clears it; resume triggers an immediate refresh.
     @Published private(set) var isPaused = false {
@@ -234,6 +242,17 @@ final class ClusterSession: ObservableObject, Identifiable {
     /// typing in the sign-in form or a host field never re-targets a live
     /// session; edits apply at the next sign-in. Nil while not signed in.
     @Published private(set) var activeConnection: ConnectionSettings?
+    /// When a live session was lost without the user asking — the master
+    /// vanished or stopped answering (sleep, a network change, the VPN
+    /// ending) — as opposed to a Disconnect. The coordinator uses it to
+    /// report the drop and, if allowed, sign in again. Cleared once the
+    /// session is live again, signed out, or re-targeted.
+    @Published private(set) var droppedAt: Date?
+    /// The last sign-in failed (wrong password, Duo declined, timed out…)
+    /// and nothing has replaced it since: no new sign-in, no session found,
+    /// no sign-out. Unlike `errorMessage`, a failed refresh never sets it,
+    /// so the menu bar only badges a real sign-in failure.
+    @Published private(set) var signInFailed = false
 
     let dashboard = ClusterDashboardState()
     let terminals: TerminalManager
@@ -338,6 +357,11 @@ final class ClusterSession: ObservableObject, Identifiable {
     /// failing shows as unreadable instead of as stale figures.
     static let storageCarryLimit: TimeInterval = 600
     private var storageDue = true
+    /// When the last refresh that asked for job usage started.
+    private var lastJobUsageRequest: Date?
+    /// Job usage costs an ssh to each node running one of the user's jobs,
+    /// so it is sampled about once a minute, not on every 10 s refresh.
+    static let jobUsageInterval: TimeInterval = 60
     private var lastStorageCollection: Date?
     private var lastStorageMiss: Date?
     /// Labels that have had a row with real figures: an optional volume
@@ -480,6 +504,13 @@ final class ClusterSession: ObservableObject, Identifiable {
     }
 
     #if DEBUG
+    /// Preview hook: shows these job usage figures and trends (the Jobs
+    /// tab's Resource use, the job sheet) without sampling anything.
+    func installPreviewJobUsage(_ usage: [String: JobUsageSummary], history: JobUsageHistory) {
+        jobUsage = usage
+        jobUsageHistory = history
+    }
+
     /// Preview/test hook: shows the given state without touching SSH, the
     /// cache directory or timers. The state counts as settled (the first
     /// probe has completed), so presentations do not read "Checking".
@@ -671,6 +702,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         set(\.isRefreshing, false)
         set(\.isLoginQueued, false)
         set(\.isLoggedIn, false)
+        set(\.signInFailed, false)
         set(\.errorMessage, nil)
         set(\.schedulerIssue, nil)
         set(\.lastRefreshFailure, nil)
@@ -779,11 +811,13 @@ final class ClusterSession: ObservableObject, Identifiable {
     /// edited while earlier clusters wait for Duo.
     ///
     /// A plain sign-in reuses a healthy ControlMaster (no teardown, no Duo
-    /// push); `forceReplace` — only the confirmed Reconnect — replaces it.
+    /// push); `forceReplace` — only the confirmed Reconnect and Renew all —
+    /// replaces it, and `renewJumpHost` the shared rash master as well.
     func performLogin(
         password: String,
         configuration: SignInConfiguration,
-        forceReplace: Bool = false
+        forceReplace: Bool = false,
+        renewJumpHost: Bool = false
     ) async -> LoginOutcome {
         guard isLoginQueued, isEnabled, !isLoggingIn else {
             set(\.isLoginQueued, false)
@@ -792,8 +826,10 @@ final class ClusterSession: ObservableObject, Identifiable {
         }
         isLoginQueued = false
         loginCancelRequested = false
+        set(\.signInFailed, false)
         let loginSettings = settings(using: configuration)
         guard !loginSettings.username.isEmpty else {
+            set(\.signInFailed, true)
             errorMessage = "Username is required."
             startBackgroundRefresh()
             return .failed
@@ -853,7 +889,12 @@ final class ClusterSession: ObservableObject, Identifiable {
 
         let backend = self.backend
         let loginTask = Task<LoginResult, Error> {
-            try await backend.login(settings: loginSettings, password: password, forceReplace: forceReplace) { [weak self] status in
+            try await backend.login(
+                settings: loginSettings,
+                password: password,
+                forceReplace: forceReplace,
+                renewJumpHost: renewJumpHost
+            ) { [weak self] status in
                 Task { @MainActor in
                     guard let self, self.isLoggingIn, !self.loginCancelRequested else {
                         return
@@ -877,6 +918,7 @@ final class ClusterSession: ObservableObject, Identifiable {
             updateRefreshInterval(to: backgroundRefreshInterval)
             lastFailureWasMissingMaster = false
             set(\.isLoggedIn, true)
+            set(\.droppedAt, nil)
             set(\.activeConnection, loginSettings)
             lastActiveConnection = loginSettings
             // The starter itself just cleaned up anything older releases
@@ -904,6 +946,7 @@ final class ClusterSession: ObservableObject, Identifiable {
                 return finishCancelledLogin()
             }
             set(\.isLoggedIn, false)
+            set(\.signInFailed, true)
             isLoggingIn = false
             set(\.loginProgress, nil)
             set(\.hasCompletedFirstProbe, true)
@@ -941,6 +984,7 @@ final class ClusterSession: ObservableObject, Identifiable {
 
     private func finishCancelledLogin() -> LoginOutcome {
         loginCancelRequested = false
+        set(\.signInFailed, false)
         isLoggingIn = false
         set(\.loginProgress, nil)
         set(\.errorMessage, nil)
@@ -1042,6 +1086,8 @@ final class ClusterSession: ObservableObject, Identifiable {
         }
         let previous = activeConnection ?? lastActiveConnection
         set(\.isLoggedIn, false)
+        set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         lastActiveConnection = nil
         // A new route is a fresh question ("is a master there?"), probed
         // and then watched like any other.
@@ -1102,6 +1148,8 @@ final class ClusterSession: ObservableObject, Identifiable {
         adoptionTask?.cancel()
         adoptionTask = nil
         set(\.isLoggedIn, false)
+        set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         lastActiveConnection = nil
         set(\.schedulerIssue, nil)
         set(\.errorMessage, nil)
@@ -1303,6 +1351,10 @@ final class ClusterSession: ObservableObject, Identifiable {
         }
         let requestSettings = settings
         let collectStorage = wantsStorage(for: reason)
+        let collectJobUsage = wantsJobUsage(for: reason)
+        if collectJobUsage {
+            lastJobUsageRequest = now()
+        }
         refreshGeneration += 1
         let generation = refreshGeneration
         let startedAt = now()
@@ -1310,7 +1362,11 @@ final class ClusterSession: ObservableObject, Identifiable {
         refreshTask = Task { [weak self] in
             let result: Result<ClusterSnapshot, Error>
             do {
-                result = .success(try await backend.collectSnapshot(settings: requestSettings, skipStorage: !collectStorage))
+                result = .success(try await backend.collectSnapshot(
+                    settings: requestSettings,
+                    skipStorage: !collectStorage,
+                    jobUsage: collectJobUsage
+                ))
             } catch {
                 result = .failure(error)
             }
@@ -1323,6 +1379,55 @@ final class ClusterSession: ObservableObject, Identifiable {
                 startedAt: startedAt
             )
         }
+    }
+
+    /// Whether this refresh should also sample job usage: only while one
+    /// of the user's jobs runs, at most once a `jobUsageInterval` (a manual
+    /// refresh always), and only when the user has it on.
+    private func wantsJobUsage(for reason: RefreshReason) -> Bool {
+        guard host?.sampleJobUsage == true,
+              snapshot?.jobs.contains(where: { $0.jobState.occupiesNodes }) == true else {
+            return false
+        }
+        if reason == .manual {
+            return true
+        }
+        guard let lastJobUsageRequest else {
+            return true
+        }
+        return now().timeIntervalSince(lastJobUsageRequest) >= Self.jobUsageInterval
+    }
+
+    /// The "Sample" switch moved: on samples at the next refresh (started
+    /// now); off forgets the figures, which would only go stale.
+    func jobUsageSamplingChanged(isOn: Bool) {
+        objectWillChange.send()
+        if isOn {
+            lastJobUsageRequest = nil
+            refreshQuietly()
+        } else {
+            set(\.jobUsage, [:])
+            set(\.jobUsageHistory, JobUsageHistory())
+        }
+    }
+
+    /// Takes a new job usage sample, if the refresh brought one, and drops
+    /// jobs that are no longer running either way.
+    private func applyJobUsage(from incoming: ClusterSnapshot, jobs: [Job]) {
+        let running = Set(jobs.filter { $0.jobState.occupiesNodes }.map(\.jobId))
+        var usage = jobUsage.filter { running.contains($0.key) }
+        if let rows = incoming.jobUsage {
+            let sampledAt = SlurmTimestamp.parse(incoming.collectedAt) ?? now()
+            usage = JobUsageSummary.summaries(from: rows, sampledAt: sampledAt).filter { running.contains($0.key) }
+            var history = jobUsageHistory
+            history.record(usage, running: running)
+            set(\.jobUsageHistory, history)
+        } else if jobUsageHistory.points.keys.contains(where: { !running.contains($0) }) {
+            var history = jobUsageHistory
+            history.record([:], running: running)
+            set(\.jobUsageHistory, history)
+        }
+        set(\.jobUsage, usage)
     }
 
     /// Whether this refresh should collect storage (see
@@ -1508,6 +1613,7 @@ final class ClusterSession: ObservableObject, Identifiable {
         )
         let nextSnapshot = Self.withStorage(storage, in: incoming)
         applySnapshot(nextSnapshot)
+        applyJobUsage(from: incoming, jobs: nextSnapshot.jobs)
         set(\.hasCachedSnapshot, true)
         lastFailureWasMissingMaster = false
         markLive(using: requestSettings)
@@ -1643,6 +1749,10 @@ final class ClusterSession: ObservableObject, Identifiable {
         // expect timeout); keep the session shown as connected-but-stale
         // until failures persist — unless the master is known to be gone.
         if masterMissing || transportFailuresTowardLogout >= Self.consecutiveFailuresBeforeLogout {
+            if isLoggedIn {
+                set(\.droppedAt, now())
+                Log.sharing.info("\(self.id.rawValue, privacy: .public): session dropped (\(masterMissing ? "master gone" : "not answering", privacy: .public))")
+            }
             set(\.isLoggedIn, false)
         }
         if showsErrors {
@@ -1694,6 +1804,8 @@ final class ClusterSession: ObservableObject, Identifiable {
         // say): the session is simply live again.
         signedOutStatusLine = nil
         set(\.isLoggedIn, true)
+        set(\.droppedAt, nil)
+        set(\.signInFailed, false)
         if activeConnection == nil {
             // Live without a sign-in in this run: a master from before (the
             // previous run, the command line, an older release).

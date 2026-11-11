@@ -11,16 +11,21 @@ protocol ClusterBackend: Sendable {
     /// One collector run over the cluster's ControlMaster. `skipStorage`
     /// leaves out the storage section (df, quota, lfs); the snapshot then
     /// has `storage == nil` and the session keeps its previous rows.
-    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool) async throws -> ClusterSnapshot
+    /// `jobUsage` adds the per-job sample on the compute nodes
+    /// (`--job-usage`).
+    func collectSnapshot(settings: ConnectionSettings, skipStorage: Bool, jobUsage: Bool) async throws -> ClusterSnapshot
 
     /// Interactive sign-in (password on the helpers' stdin, Duo). Reuses a
     /// healthy master unless `forceReplace` (the confirmed Reconnect), and
-    /// says whether the password was actually checked on the way. Must stop
-    /// its helper processes promptly when the calling task is cancelled.
+    /// says whether the password was actually checked on the way.
+    /// `renewJumpHost` replaces the shared rash master too (the first
+    /// cluster of a confirmed "Renew all"). Must stop its helper processes
+    /// promptly when the calling task is cancelled.
     func login(
         settings: ConnectionSettings,
         password: String,
         forceReplace: Bool,
+        renewJumpHost: Bool,
         onStatus: (@Sendable (String) -> Void)?
     ) async throws -> LoginResult
 

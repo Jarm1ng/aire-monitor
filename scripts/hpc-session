@@ -1,0 +1,225 @@
+#!/usr/bin/env zsh
+# hpc-session — run commands over Leeds HPC Monitor's SSH sessions from any
+# shell: Terminal, scripts, Claude sessions. It never asks for a password or
+# Duo, never starts a session of its own, and can wait for a down session to
+# come back before running a command (`wait`, `run --wait S`). A session that
+# drops while a command runs ends it with exit 75.
+#
+#   hpc-session status                      every shared session: up/down, age
+#   hpc-session check <name>                exit 0 if <name>'s session answers, 75 if not
+#   hpc-session wait <name> [--timeout S]   wait until <name>'s session is up
+#                                           (default 3600 s; 0 waits for ever)
+#   hpc-session run <name> [--wait S] -- <command...>
+#                                           run <command> on <name>'s login node.
+#                                           A down session is waited for up to S
+#                                           seconds first (default 0)
+#   hpc-session shell <name>                interactive login shell over the session
+#
+# <name> is a session the app shares: aire, calder, or rash (on the rash
+# route). Each is the app's stable link ~/.ssh/ctl/<name>.sock, kept by the
+# app while "Share with Terminal and Claude sessions" is on.
+#
+# Exit status: run passes the remote command's status through; 75
+# (EX_TEMPFAIL) means the session is down or dropped — sign in again from
+# Leeds HPC Monitor (Connect, one Duo approval) and retry; 64 is a usage
+# error; 255 is an ssh failure with the session still up.
+emulate -L zsh
+setopt no_unset pipe_fail
+
+readonly EX_USAGE=64
+readonly EX_TEMPFAIL=75
+LINK_DIR="${HPC_SESSION_DIR:-$HOME/.ssh/ctl}"
+MANIFEST="$LINK_DIR/shared-sessions.json"
+PROGRAM="${0:t}"
+
+usage() {
+  print -u2 "usage: $PROGRAM status | check <name> | wait <name> [--timeout S] | run <name> [--wait S] -- <command...> | shell <name>"
+  exit $EX_USAGE
+}
+
+# Exits (from the main shell, never a command substitution) on a name
+# that could not be one of the app's links.
+require_name() {
+  if [[ ! "$1" =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+    print -u2 "$PROGRAM: not a session name: $1"
+    exit $EX_USAGE
+  fi
+}
+
+socket_for() {
+  print -r -- "$LINK_DIR/$1.sock"
+}
+
+# Client options for riding a master. -F /dev/null: no ~/.ssh/config, so no
+# alias can add a ProxyJump, an IdentityFile or a ControlMaster. If the
+# master vanished between our check and the connect, ssh would fall back to
+# dialling directly; ProxyCommand=false makes that fallback fail at once
+# instead of prompting or hanging.
+ssh_options() {
+  print -rl -- \
+    -F /dev/null \
+    -S "$1" \
+    -o ControlMaster=no \
+    -o BatchMode=yes \
+    -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no \
+    -o PubkeyAuthentication=no \
+    -o ProxyCommand=false \
+    -o ConnectTimeout=5 \
+    -o LogLevel=ERROR
+}
+
+is_up() {
+  local sock="$1"
+  [[ -S "$sock" ]] || return 1
+  ssh ${(f)"$(ssh_options "$sock")"} -O check "hpc-session" >/dev/null 2>&1
+}
+
+age_text() {
+  local seconds=$1 minutes hours
+  (( minutes = seconds / 60, hours = minutes / 60 ))
+  if (( minutes < 1 )); then
+    print -r -- "under a minute"
+  elif (( hours == 0 )); then
+    print -r -- "${minutes} min"
+  elif (( minutes % 60 == 0 )); then
+    print -r -- "${hours} h"
+  else
+    print -r -- "${hours} h $(( minutes % 60 )) min"
+  fi
+}
+
+# Seconds since the master started (its socket's birth time).
+session_age() {
+  local born
+  born="$(stat -L -f %B "$1" 2>/dev/null)" || return 1
+  [[ "$born" == <-> ]] || return 1
+  print -r -- $(( EPOCHSECONDS - born ))
+}
+
+zmodload zsh/datetime
+
+down_message() {
+  print -u2 "$PROGRAM: the $1 session is not up. Sign in from Leeds HPC Monitor (Connect; one Duo approval), then retry — or use '$PROGRAM wait $1'."
+}
+
+wait_for() {
+  local name="$1" timeout="$2" sock started last_note
+  sock="$(socket_for "$name")"
+  started=$EPOCHSECONDS
+  last_note=0
+  until is_up "$sock"; do
+    if (( timeout > 0 && EPOCHSECONDS - started >= timeout )); then
+      print -u2 "$PROGRAM: gave up after $(age_text $timeout) waiting for the $name session."
+      return $EX_TEMPFAIL
+    fi
+    if (( EPOCHSECONDS - last_note >= 60 )); then
+      print -u2 "$PROGRAM: waiting for the $name session (it comes back when Leeds HPC Monitor signs in again; approve the Duo push)…"
+      last_note=$EPOCHSECONDS
+    fi
+    sleep 5
+  done
+  return 0
+}
+
+cmd_status() {
+  local -a names
+  local sock name age state
+  names=(aire calder rash)
+  for sock in "$LINK_DIR"/*.sock(N@); do
+    names+=("${${sock:t}%.sock}")
+  done
+  for name in ${(u)names}; do
+    sock="$LINK_DIR/$name.sock"
+    if is_up "$sock"; then
+      age="$(session_age "$sock")" && state="up $(age_text $age)" || state="up"
+      printf '%-8s %-22s %s\n' "$name" "$state" "${sock/#$HOME/~}"
+    elif [[ "$name" == (aire|calder|rash) ]]; then
+      printf '%-8s %s\n' "$name" "down"
+    fi
+  done
+  if [[ -r "$MANIFEST" && -x /usr/bin/python3 ]]; then
+    /usr/bin/python3 -I - "$MANIFEST" <<'PY' 2>/dev/null || true
+import json, sys
+data = json.load(open(sys.argv[1]))
+linked = [a["alias"] for a in data.get("aliases", []) if a.get("state") == "linked"]
+held = [a["alias"] for a in data.get("aliases", []) if a.get("state") == "held-by-other-session"]
+if linked:
+    print("ssh aliases riding these sessions: " + ", ".join(linked))
+if held:
+    print("aliases on your own sessions (left alone): " + ", ".join(held))
+if not data.get("sharing", True):
+    print("sharing is off in Leeds HPC Monitor")
+PY
+  fi
+}
+
+[[ $# -ge 1 ]] || usage
+command="$1"
+shift
+if [[ "$command" == (check|wait|run|shell) && $# -ge 1 ]]; then
+  require_name "$1"
+fi
+case "$command" in
+  status)
+    cmd_status
+    ;;
+  check)
+    [[ $# -eq 1 ]] || usage
+    is_up "$(socket_for "$1")" || exit $EX_TEMPFAIL
+    ;;
+  wait)
+    [[ $# -ge 1 ]] || usage
+    name="$1"
+    shift
+    timeout=3600
+    if [[ "${1:-}" == "--timeout" ]]; then
+      [[ "${2:-}" == <-> ]] || usage
+      timeout="$2"
+    fi
+    wait_for "$name" "$timeout"
+    ;;
+  run)
+    [[ $# -ge 1 ]] || usage
+    name="$1"
+    shift
+    wait_seconds=0
+    if [[ "${1:-}" == "--wait" ]]; then
+      [[ "${2:-}" == <-> ]] || usage
+      wait_seconds="$2"
+      shift 2
+    fi
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -ge 1 ]] || usage
+    sock="$(socket_for "$name")"
+    if ! is_up "$sock"; then
+      if (( wait_seconds > 0 )); then
+        wait_for "$name" "$wait_seconds" || exit $EX_TEMPFAIL
+      else
+        down_message "$name"
+        exit $EX_TEMPFAIL
+      fi
+    fi
+    ssh ${(f)"$(ssh_options "$sock")"} "hpc-session" "$@"
+    rc=$?
+    if (( rc == 255 )) && ! is_up "$sock"; then
+      print -u2 "$PROGRAM: the $name session dropped while the command ran; its output may be incomplete."
+      down_message "$name"
+      exit $EX_TEMPFAIL
+    fi
+    exit $rc
+    ;;
+  shell)
+    [[ $# -eq 1 ]] || usage
+    sock="$(socket_for "$1")"
+    is_up "$sock" || { down_message "$1"; exit $EX_TEMPFAIL; }
+    exec ssh -t ${(f)"$(ssh_options "$sock")"} "hpc-session"
+    ;;
+  -h|--help|help)
+    # The header comment, whatever its length.
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    ;;
+  *)
+    usage
+    ;;
+esac

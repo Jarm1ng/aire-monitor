@@ -17,6 +17,11 @@
 #   HPC_FORCE_RELOGIN      handed to the target starter: "1" replaces this
 #                          cluster's TARGET master even if it still works; it
 #                          never forces the shared jump master
+#   HPC_RENEW_JUMP_HOST    "1" replaces the shared jump master even if it is
+#                          healthy (the app's confirmed "Renew all"). Every
+#                          cluster tunnelled through the old one loses its
+#                          connection, so only a caller that signs every
+#                          cluster in again afterwards may set it
 #   HPC_SKIP_TARGET        "1" authenticates only the jump leg (what the app does)
 #   HPC_LOGIN_DEBUG_LOG    optional event log (0600)
 #   HPC_DUO_OPTION         Duo menu answer (default 1 = push)
@@ -90,6 +95,7 @@ set jump_hostname [env_or_default "HPC_JUMP_HOSTNAME" "rash.leeds.ac.uk"]
 set control_path [env_or_default "HPC_CONTROL_PATH" ""]
 set jump_control_path [env_or_default "HPC_JUMP_CONTROL_PATH" ""]
 set skip_target [env_or_default "HPC_SKIP_TARGET" "0"]
+set renew_jump [env_or_default "HPC_RENEW_JUMP_HOST" "0"]
 set debug_log [resolve_path [env_or_default "HPC_LOGIN_DEBUG_LOG" ""]]
 set duo_option [env_or_default "HPC_DUO_OPTION" "1"]
 set timeout [env_or_default "HPC_TIMEOUT" "120"]
@@ -559,7 +565,8 @@ proc verify_ssh {verify_args {quiet 0}} {
 # tunnel. So the jump master is never torn down merely because
 # HPC_FORCE_RELOGIN=1 (forcing applies to this cluster's TARGET master only).
 # It is reused whenever it is healthy, and re-authenticated only when it is
-# missing or demonstrably unusable.
+# missing or demonstrably unusable — or when HPC_RENEW_JUMP_HOST=1 (the
+# app's confirmed "Renew all", which signs every cluster in again anyway).
 #
 # Healthy means:
 #   1. `ssh -O check` succeeds (instant local socket probe: the master
@@ -735,14 +742,20 @@ proc jump_master_is_healthy {check_args} {
 }
 
 proc ensure_jump_master {check_args interactive_args close_args} {
-    global jump_control_path
-    if {[jump_master_is_healthy $check_args]} {
+    global jump_control_path renew_jump
+    if {$renew_jump eq "1"} {
+        # "Renew all": a fresh jump session even though the old one works,
+        # so its age starts over. The caller signs every cluster in again.
+        log_event "Renewing the shared jump master by request"
+        status_line "replacing the shared jump-host session"
+    } elseif {[jump_master_is_healthy $check_args]} {
         status_line "reusing the shared jump-host session"
         status_line [connected_message "jump host"]
         return 0
     }
-    # Missing or unusable: clear whatever is left of it (any tunnel through a
-    # master in this state is already dead) and authenticate a fresh one.
+    # Missing, unusable or being renewed: clear whatever is left of it (any
+    # tunnel through a master in this state is already dead, or is about to
+    # be signed in again) and authenticate a fresh one.
     close_master $close_args "jump host" $jump_control_path
     set auth_exit [run_interactive_ssh $interactive_args "" "jump host"]
     if {$auth_exit != 0} {
@@ -818,7 +831,7 @@ if {$use_jump_host eq "1"} {
     lappend close_jump_args -o User=$username $jump_hostname
 
     # HPC_FORCE_RELOGIN deliberately plays no part here; see "Shared jump
-    # master policy" above.
+    # master policy" above. Only HPC_RENEW_JUMP_HOST=1 replaces a healthy one.
     set jump_exit [ensure_jump_master $check_jump_args $jump_args $close_jump_args]
     if {$jump_exit != 0} {
         exit $jump_exit

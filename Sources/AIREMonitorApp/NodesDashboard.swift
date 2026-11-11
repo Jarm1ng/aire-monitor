@@ -5,8 +5,8 @@ import SwiftUI
 /// are for — GPU, CPU, high-memory, teaching, other — using the cluster
 /// profile's `PartitionHint`s rather than hard-coded partition names, so
 /// AIRE (`gpu`, `nodes`, `himem`, `teachingnodes`) and Calder
-/// (`calder-gpu-hopper`, `calder-cpu-turin`) share one code path and a
-/// partition added later still lands in a sensible group.
+/// (`gpu_hopper`, `cpu_turin`) share one code path and a partition added or
+/// renamed later still lands in a sensible group.
 ///
 /// The caller passes ONE cluster's nodes and jobs. Node names are only
 /// unique within a cluster, and an L40S fleet and an H200 fleet are
@@ -133,10 +133,9 @@ struct NodesDashboard: View {
     }
 
     /// Where the group's nodes live and what each one offers, e.g.
-    /// "calder-gpu-hopper, aire-gpu-lovelace · 8 × H200, 3 × L40 per node ·
-    /// 17 idle H200 · 0 idle L40" or "calder-cpu-turin · 128 cores, 754 GiB
-    /// per node · 1,689 of 12,288 cores allocated · +1,600 on unavailable
-    /// nodes".
+    /// "gpu_hopper, gpu_lovelace · 8 × H200, 3 × L40 per node · 17 idle
+    /// H200 · 0 idle L40" or "cpu_turin · 128 cores, 754 GiB per node ·
+    /// 1,689 of 12,288 cores allocated · +1,600 on unavailable nodes".
     private func sectionSubtitle(for role: PartitionRole, grouping: NodeGrouping, fleet: GPUFleet) -> String {
         let members = grouping.nodes(in: role)
         let partitions = grouping.partitionNames(in: role)

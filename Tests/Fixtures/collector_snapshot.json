@@ -15,7 +15,7 @@
   "jobs": [
     {
       "job_id": "40188",
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "name": "train-h200",
       "user": "abcd1234",
       "state": "RUNNING",
@@ -44,7 +44,7 @@
     },
     {
       "job_id": "35796_1",
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "name": "sweep",
       "user": "abcd1234",
       "state": "RUNNING",
@@ -73,7 +73,7 @@
     },
     {
       "job_id": "35796_2",
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "name": "sweep",
       "user": "abcd1234",
       "state": "RUNNING",
@@ -102,7 +102,7 @@
     },
     {
       "job_id": "35796",
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "name": "sweep",
       "user": "abcd1234",
       "state": "PENDING",
@@ -131,7 +131,7 @@
     },
     {
       "job_id": "9918",
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "name": "c3-c09-dump",
       "user": "abcd1234",
       "state": "PENDING",
@@ -161,7 +161,7 @@
   ],
   "partitions": [
     {
-      "partition": "calder-cpu-turin",
+      "partition": "cpu_turin",
       "availability": "up",
       "node_count": 98,
       "state": "mix",
@@ -169,10 +169,11 @@
       "cpus_per_node": 128,
       "memory_mb_per_node": 772480,
       "features": "(null)",
-      "time_limit": "2-00:00:00"
+      "time_limit": "2-00:00:00",
+      "is_default": true
     },
     {
-      "partition": "calder-gpu-hopper",
+      "partition": "gpu_hopper",
       "availability": "up",
       "node_count": 7,
       "state": "mix",
@@ -180,7 +181,8 @@
       "cpus_per_node": 128,
       "memory_mb_per_node": 1546664,
       "features": "(null)",
-      "time_limit": "2-00:00:00"
+      "time_limit": "2-00:00:00",
+      "is_default": false
     },
     {
       "partition": "calder-gpu-lovelace",
@@ -191,14 +193,15 @@
       "cpus_per_node": 64,
       "memory_mb_per_node": 512000,
       "features": "(null)",
-      "time_limit": "1-00:00:00"
+      "time_limit": "1-00:00:00",
+      "is_default": false
     }
   ],
   "nodes": [
     {
       "node": "calder-h200-01",
       "partitions": [
-        "calder-gpu-hopper"
+        "gpu_hopper"
       ],
       "state": "mix",
       "cpu_allocated": 64,
@@ -221,7 +224,7 @@
     {
       "node": "calder-h200-02",
       "partitions": [
-        "calder-gpu-hopper"
+        "gpu_hopper"
       ],
       "state": "idle",
       "cpu_allocated": 0,
@@ -244,7 +247,7 @@
     {
       "node": "calder-h200-05",
       "partitions": [
-        "calder-gpu-hopper"
+        "gpu_hopper"
       ],
       "state": "drain",
       "cpu_allocated": 0,
@@ -290,7 +293,7 @@
     {
       "node": "calder-cpu001",
       "partitions": [
-        "calder-cpu-turin",
+        "cpu_turin",
         "nodes"
       ],
       "state": "mix",
@@ -369,5 +372,6 @@
     "jobs_json": 357,
     "node_details": 120,
     "storage": 450
-  }
+  },
+  "job_usage": null
 }

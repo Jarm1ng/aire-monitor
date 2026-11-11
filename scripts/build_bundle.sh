@@ -52,7 +52,9 @@
 #   HPC_BUILD_LOG          Build log path (default .runtime/swift-build.log, or
 #                          .runtime/swift-widget-build.log for the widget alone).
 #   SDKROOT                Respected when exported; otherwise SwiftPM uses the
-#                          SDK that `xcrun --show-sdk-path` reports.
+#                          SDK that `xcrun --show-sdk-path` reports. Either is
+#                          replaced only when it needs the SwiftUI macro plugin
+#                          the Command Line Tools lack (swiftpm_toolchain.sh).
 #   HPC_LSREGISTER         The lsregister tool to call (default: the system's).
 #
 # Exit status: swift build's status when the build fails, 75 when another
@@ -64,6 +66,11 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/.runtime"
+# The native build system and, with Command Line Tools that lack the SwiftUI
+# macro plugin, an SDK that does not need it (see the script and
+# hpc_swiftpm_select_sdk below).
+# shellcheck source=swiftpm_toolchain.sh
+source "$ROOT_DIR/scripts/swiftpm_toolchain.sh"
 
 # Marketing version (CFBundleShortVersionString) until the repository carries
 # a vX.Y.Z tag; from then on the newest such tag wins. It stays numeric
@@ -328,6 +335,14 @@ executable_is_current() {
 run_swift_build() {
     local status=0 product
     local args=(build --disable-sandbox --scratch-path "$BUILD_DIR" -c "$CONFIGURATION")
+    # BIN_DIR is the native build system's layout. A SwiftPM that builds
+    # with Swift Build and no longer offers native would leave a stale
+    # binary there to be packaged, so it stops the build instead.
+    if hpc_swiftpm_offers_native_build_system; then
+        args+=(--build-system native)
+    elif hpc_swiftpm_defaults_to_swift_build; then
+        die "this SwiftPM builds with Swift Build and no longer offers the native build system, whose layout ($BIN_DIR) this script reads; update scripts/build_bundle.sh."
+    fi
     if [[ -n "${HPC_BUILD_JOBS:-}" ]]; then
         [[ "$HPC_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "HPC_BUILD_JOBS must be a positive integer, not '$HPC_BUILD_JOBS'."
         args+=(--jobs "$HPC_BUILD_JOBS")
@@ -591,6 +606,9 @@ elif [[ "${PRODUCTS[*]}" == "AIREDesktopWidget" ]]; then
 else
     BUILD_LOG="$RUNTIME_DIR/swift-build.log"
 fi
+# After the options and the lock, so --help, a usage error and the locked
+# re-exec never print its note; before the log, whose header names the SDK.
+hpc_swiftpm_select_sdk
 start_build_log
 
 cd "$ROOT_DIR"

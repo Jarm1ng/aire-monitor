@@ -22,7 +22,7 @@ enum SSHTerminalCommand {
     /// Like `shellQuote`, but leaves a plain ASCII word (letters, digits and
     /// `-_./:=@+,`) bare. Used for profile-supplied tokens such as partition
     /// names, so a command typed into the user's shell (and shown as a
-    /// tooltip) reads `sinfo -N -p calder-gpu-hopper`, not a quoted string —
+    /// tooltip) reads `sinfo -N -p gpu_hopper`, not a quoted string —
     /// while anything unexpected is still quoted safely.
     static func shellWord(_ value: String) -> String {
         let isPlainWord = !value.isEmpty && value.unicodeScalars.allSatisfy { scalar in

@@ -168,10 +168,11 @@ struct TerminalDashboard: View {
 
     // MARK: Quick commands
 
-    /// Rebuilt from the profile on every render: cheap (five tiny values)
-    /// and it can never go stale against the cluster this view shows.
+    /// Rebuilt from the profile and the latest partition list on every
+    /// render: cheap (five tiny values) and it can never go stale against
+    /// the cluster this view shows.
     private var quickCommandItems: [TerminalQuickCommand] {
-        TerminalQuickCommand.items(for: session.profile)
+        TerminalQuickCommand.items(for: session.profile, partitions: session.snapshot?.partitions)
     }
 
     private var quickCommandRow: some View {

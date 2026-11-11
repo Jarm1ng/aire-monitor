@@ -1,26 +1,24 @@
 import HPCCore
 import AppKit
 import Combine
-import SwiftUI
 
-/// Owns the menu-bar status item. Its title summarises every live cluster at
-/// once ("C · train 1h 23m", "3 jobs", "A 6 · C 27"), its icon tint shows
-/// combined connection health, and its menu hosts MenuBarMonitorView.
+/// Owns the menu-bar status item: a monochrome rack glyph (dimmed when
+/// nothing is live, badged when something needs a look), a short title
+/// ("7 running", or idle GPUs, or nothing — the user's choice), and a
+/// native menu built by `StatusMenuBuilder` from the same digest.
 @MainActor
 final class StatusBarMonitorController: NSObject {
     static let shared = StatusBarMonitorController()
 
     private var model: AppModel?
     private var statusItem: NSStatusItem?
-    private var menu: NSMenu?
-    private var menuHostingView: NSHostingView<StatusMenuRootView>?
-    /// Feeds the open dropdown the digest built for the status item.
-    private var digestStore: MenuBarDigestStore?
+    private let builder = StatusMenuBuilder()
     private var cancellables = Set<AnyCancellable>()
     private var lastSignature = ""
     private var isUpdateScheduled = false
     private var isMenuOpen = false
-    private var isMenuContentAttached = false
+    /// The digest the open menu was last built from.
+    private var menuDigest: MenuBarDigest?
 
     private override init() {
         super.init()
@@ -29,90 +27,68 @@ final class StatusBarMonitorController: NSObject {
     func configure(model: AppModel) {
         self.model = model
         installStatusItemIfNeeded()
-        installMenuIfNeeded()
+        wireBuilder()
         bindModel(model)
         lastSignature = ""
         updateStatusItem()
     }
 
-    /// Dismisses the status-bar menu, so actions that activate other windows
-    /// (Open dashboard, Widget, Quit) do not fight an in-progress menu
-    /// tracking session.
-    func closeMenu() {
-        menu?.cancelTracking()
-    }
-
     private func installStatusItemIfNeeded() {
         guard statusItem == nil else { return }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
+        item.menu = builder.menu
 
         guard let button = item.button else { return }
-        // The button renders the title and template image itself, so AppKit
-        // handles menu-bar appearance (light/dark), vibrancy, and the
-        // standard click highlight.
-        button.title = "HPC"
+        // The button draws the template glyph and the title itself, so
+        // AppKit handles light and dark menu bars, vibrancy, the open
+        // highlight and Increase Contrast.
         button.font = StatusItemLayout.font
+        button.image = StatusItemGlyph.image(attention: false)
         button.imagePosition = .imageLeading
-        button.imageHugsTitle = true
+        button.title = ""
         button.toolTip = "Leeds HPC Monitor"
-        // StatusBarSummary already fits the title to the item; should that
-        // ever fall short, cut the job name's middle, not the elapsed time.
-        (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingMiddle
+        (button.cell as? NSButtonCell)?.lineBreakMode = .byClipping
     }
 
-    private func installMenuIfNeeded() {
-        guard menuHostingView == nil else {
-            // Re-entrant configure: the next open builds the content
-            // against the new model.
-            detachMenuContent()
-            return
+    private func wireBuilder() {
+        builder.onNeedsUpdate = { [weak self] in
+            self?.rebuildMenu()
         }
-
-        let hostingView = NSHostingView(rootView: StatusMenuRootView(content: nil))
-        hostingView.sizingOptions = [.preferredContentSize]
-        hostingView.setFrameSize(hostingView.fittingSize)
-
-        let panelItem = NSMenuItem()
-        panelItem.view = hostingView
-
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.delegate = self
-        menu.addItem(panelItem)
-
-        statusItem?.menu = menu
-        self.menu = menu
-        menuHostingView = hostingView
-    }
-
-    /// Builds the dropdown just before it is shown. While the menu is
-    /// closed the hosting view holds an empty placeholder, so nothing in it
-    /// observes or re-renders on the many model changes nobody would see.
-    private func attachMenuContent() {
-        guard let model, let menuHostingView, !isMenuContentAttached else {
-            return
+        builder.onWillOpen = { [weak self] in
+            guard let self else { return }
+            isMenuOpen = true
+            // Each session's refresh self-guards (pause, sign-in, never
+            // connected), so opening the menu shows data at most a few
+            // seconds old without ever starting a sign-in or painting an
+            // error on a cluster the user is not using.
+            model?.refreshAllQuietly()
         }
-        let digest = MenuBarDigest(model: model)
-        let store = digestStore ?? MenuBarDigestStore(digest: digest)
-        store.update(digest)
-        digestStore = store
-        menuHostingView.rootView = StatusMenuRootView(
-            content: MenuBarMonitorView(model: model, store: store) { [weak self] in
-                self?.closeMenu()
+        builder.onDidClose = { [weak self] in
+            self?.isMenuOpen = false
+        }
+        builder.submenuEntries = { [weak self] kind in
+            guard let self, let model else { return [] }
+            switch kind {
+            case .jobs(let id):
+                return MenuBarMenuLayout.submenu(for: id, digest: menuDigest ?? MenuBarDigest(model: model))
+            case .titleMode:
+                return MenuBarMenuLayout.titleModeSubmenu(current: model.menuBarTitleMode)
             }
-        )
-        isMenuContentAttached = true
-        fitMenuPanel()
+        }
+        builder.onCommand = { [weak self] command in
+            self?.perform(command)
+        }
     }
 
-    private func detachMenuContent() {
-        guard isMenuContentAttached else {
-            return
-        }
-        menuHostingView?.rootView = StatusMenuRootView(content: nil)
-        isMenuContentAttached = false
+    /// Builds the menu from the latest digest just before it is laid out,
+    /// so its first frame already has the final size.
+    private func rebuildMenu() {
+        guard let model else { return }
+        let digest = MenuBarDigest(model: model)
+        menuDigest = digest
+        builder.apply(MenuBarMenuLayout.build(digest: digest))
     }
 
     /// Listens to the coordinator AND to every session directly: the
@@ -150,99 +126,65 @@ final class StatusBarMonitorController: NSObject {
         }
     }
 
-    /// Rebuilds the digest once and hands the same value to the status item
-    /// and, while it is open, the dropdown.
+    /// Rebuilds the digest once and hands it to the status item and, while
+    /// it is open, the menu (updated in place).
     private func updateStatusItem() {
         guard let model, let button = statusItem?.button else { return }
 
         let digest = MenuBarDigest(model: model)
-        if isMenuOpen {
-            digestStore?.update(digest)
-            fitMenuPanel()
-            // SwiftUI applies the store change on its next pass; fit again
-            // once it has, so a section that grew is not clipped.
-            DispatchQueue.main.async { [weak self] in
-                MainActor.assumeIsolated {
-                    self?.fitMenuPanel()
-                }
-            }
+        if isMenuOpen, digest != menuDigest {
+            menuDigest = digest
+            builder.apply(MenuBarMenuLayout.build(digest: digest))
         }
 
-        let summary = StatusBarSummary(digest: digest)
+        let summary = StatusBarSummary(digest: digest, mode: model.menuBarTitleMode)
         // Only touch the button when something visible changed: AppKit
         // re-lays out the whole status bar on every title/image change.
         let signature = summary.signature
         guard signature != lastSignature else { return }
         lastSignature = signature
 
-        let image = summary.image
-        button.image = image
-        button.title = summary.title
+        button.image = StatusItemGlyph.image(attention: summary.hasAttention)
+        button.title = summary.displayTitle
+        button.appearsDisabled = summary.isDimmed
         button.toolTip = summary.tooltip
         button.setAccessibilityLabel(summary.accessibilityLabel)
-        statusItem?.length = summary.reservedLength(hasIcon: image != nil)
+        statusItem?.length = summary.reservedLength()
     }
 
-    /// Resizes the hosted dropdown to its content. A cluster connecting or
-    /// gaining jobs changes the panel's height, and the menu item keeps
-    /// whatever frame its view had unless told otherwise.
-    private func fitMenuPanel() {
-        guard let menuHostingView else { return }
-        let size = menuHostingView.fittingSize
-        guard size != menuHostingView.frame.size else { return }
-        menuHostingView.setFrameSize(size)
-    }
-}
-
-extension StatusBarMonitorController: NSMenuDelegate {
-    nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
-        // Called before the menu is laid out for display: the earliest point
-        // to attach the real content, so the first frame has its full size.
-        MainActor.assumeIsolated {
-            attachMenuContent()
-        }
-    }
-
-    nonisolated func menuWillOpen(_ menu: NSMenu) {
-        // NSMenu delegate callbacks always arrive on the main thread.
-        MainActor.assumeIsolated {
-            isMenuOpen = true
-            attachMenuContent()
-            fitMenuPanel()
-            // Each session's refresh self-guards (pause, sign-in, never
-            // connected), so opening the menu shows data at most a few
-            // seconds old without ever starting a sign-in or painting an
-            // error on a cluster the user is not using.
-            model?.refreshAllQuietly()
-        }
-    }
-
-    nonisolated func menuDidClose(_ menu: NSMenu) {
-        MainActor.assumeIsolated {
-            isMenuOpen = false
-            // Deferred: a footer action that closed the menu may still be
-            // unwinding inside the hosted SwiftUI view.
-            DispatchQueue.main.async { [weak self] in
-                MainActor.assumeIsolated {
-                    guard let self, !self.isMenuOpen else { return }
-                    self.detachMenuContent()
-                }
+    /// Runs a chosen menu item. NSMenu calls this after the menu has closed,
+    /// so activating the app, showing the dashboard or an alert is safe.
+    private func perform(_ command: MenuCommand) {
+        guard let model else { return }
+        switch command {
+        case .openJob(let id, let jobId):
+            model.showJob(jobId, on: id)
+        case .openCluster(let id):
+            model.showCluster(id, tab: .jobs)
+        case .connect(let id):
+            // A plain sign-in: reuses an open session, so no dialog.
+            model.connect(id)
+        case .cancelSignIn(let id):
+            model.session(for: id)?.cancelLogin()
+        case .resume(let id):
+            model.session(for: id)?.togglePause()
+        case .turnOn(let id):
+            model.session(for: id)?.isEnabled = true
+        case .renewAll:
+            guard let confirmation = model.renewConfirmation() else { return }
+            SessionActionAlert.run(confirmation, model: model)
+        case .openDashboard:
+            DashboardWindowPresenter.shared.show()
+        case .openWidget:
+            model.openDesktopWidget()
+        case .setTitleMode(let mode):
+            model.menuBarTitleMode = mode
+        case .quit:
+            // The quit itself goes through the app delegate, which can still
+            // ask about running terminals.
+            DispatchQueue.main.async {
+                NSApp.terminate(nil)
             }
-        }
-    }
-}
-
-/// The menu item's root view: the dropdown while the menu is open, an
-/// inert placeholder of the same width while it is closed.
-private struct StatusMenuRootView: View {
-    let content: MenuBarMonitorView?
-
-    var body: some View {
-        if let content {
-            content
-        } else {
-            Color.clear
-                .frame(width: MenuBarMonitorView.panelWidth, height: 1)
         }
     }
 }

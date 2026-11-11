@@ -356,6 +356,43 @@ final class JobNotificationService: NSObject, UNUserNotificationCenterDelegate, 
         return true
     }
 
+    /// "AIRE session dropped": a live session was lost without the user
+    /// asking (sleep, a network change, the VPN ending).
+    func notifySessionDropped(cluster: ClusterProfile, lasted: TimeInterval?, signingInAgain: Bool) {
+        guard let poster else {
+            return
+        }
+        Task {
+            guard await postingAllowed(poster) else {
+                return
+            }
+            poster.post(Self.sessionDroppedNotification(
+                cluster: cluster,
+                lasted: lasted,
+                signingInAgain: signingInAgain,
+                timestamp: Self.iso8601.string(from: now())
+            ))
+        }
+    }
+
+    nonisolated static func sessionDroppedNotification(
+        cluster: ClusterProfile,
+        lasted: TimeInterval?,
+        signingInAgain: Bool,
+        timestamp: String
+    ) -> LocalNotification {
+        let lastedText = lasted.map { " after \(SessionAge.text($0))" } ?? ""
+        return LocalNotification(
+            title: "\(cluster.displayName) session dropped",
+            subtitle: "The SSH session ended\(lastedText)",
+            body: signingInAgain
+                ? "Signing in again — approve the Duo push on your phone."
+                : "Commands over it stop until you sign in again (Connect in Leeds HPC Monitor).",
+            identifier: "\(cluster.id.rawValue)-session-dropped-\(timestamp)",
+            thread: "\(cluster.id.rawValue)-session"
+        )
+    }
+
     // MARK: - Content
 
     /// The notifications one set of changes produces. Pure, for tests.

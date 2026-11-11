@@ -1,3 +1,4 @@
+import AppKit
 import HPCCore
 import SwiftUI
 
@@ -118,6 +119,9 @@ struct SessionWork: Equatable {
 struct SessionActionConfirmation: Identifiable {
     enum Kind: Equatable {
         case reconnect
+        /// "Renew all": every cluster, and on the rash route the shared
+        /// jump master first, signed in again from scratch.
+        case renew
         case disconnect
         /// Switch the connection route to this one.
         case changeRoute(ConnectionRoute)
@@ -148,6 +152,7 @@ struct SessionActionConfirmation: Identifiable {
     var title: String {
         switch kind {
         case .reconnect: return "Reconnect \(nameList)?"
+        case .renew: return "Renew every session?"
         case .disconnect: return "Disconnect \(nameList)?"
         case .changeRoute(let route): return "Switch to the \(route.shortTitle) route?"
         }
@@ -156,6 +161,7 @@ struct SessionActionConfirmation: Identifiable {
     var confirmTitle: String {
         switch kind {
         case .reconnect: return clusterNames.count > 1 ? "Reconnect \(clusterNames.count) clusters" : "Reconnect"
+        case .renew: return "Renew"
         case .disconnect: return "Disconnect"
         case .changeRoute: return "Switch route"
         }
@@ -186,6 +192,17 @@ struct SessionActionConfirmation: Identifiable {
                     : " The old session closes first: if the push is missed or declined, \(nameList) stays signed out."
             }
             lines.append(duo)
+        case .renew:
+            let legs = (usesJumpHost ? ["the rash jump host"] : []) + clusterNames
+            lines.append(
+                "Renewing signs in to \(Self.join(legs)) again from scratch, so every session starts a fresh clock: "
+                    + "\(legs.count) Duo push\(legs.count == 1 ? "" : "es"), sent one at a time\(usesJumpHost ? ", rash first" : "")."
+            )
+            lines.append(
+                "Each old session closes first, and with it everything riding on it — terminals here, and `ssh` commands "
+                    + "that Terminal or Claude sessions run over the shared sessions (they can simply run again afterwards). "
+                    + "A cluster whose push is missed or declined stays signed out."
+            )
         case .disconnect:
             if closesJumpHost {
                 lines.append(
@@ -305,6 +322,23 @@ extension AppModel {
         )
     }
 
+    /// The confirmation for "Renew all": every enabled cluster (live or
+    /// not) is signed in again from scratch. nil while sign-ins run.
+    func renewConfirmation() -> SessionActionConfirmation? {
+        guard !isAnyLoginActive else {
+            return nil
+        }
+        let targets = Self.signInTargets(enabledSessions)
+        guard !targets.isEmpty else {
+            return nil
+        }
+        return SessionActionConfirmation(
+            kind: .renew,
+            work: sessionWork(on: targets.map(\.id)),
+            usesJumpHost: connectionRoute == .rashJump
+        )
+    }
+
     /// Enabled clusters with no sign-in already running or queued.
     private static func signInTargets(_ sessions: [ClusterSession]) -> [ClusterSession] {
         sessions.filter { $0.isEnabled && !$0.isLoggingIn && !$0.isLoginQueued }
@@ -368,6 +402,8 @@ extension AppModel {
         switch confirmation.kind {
         case .reconnect:
             reconnect(confirmation.clusterIDs)
+        case .renew:
+            renew(confirmation.clusterIDs)
         case .disconnect:
             for id in confirmation.clusterIDs {
                 disconnect(id)
@@ -462,5 +498,75 @@ struct ClusterSessionMenu: View {
         .fixedSize()
         .help("More \(name) session actions: pause, reconnect, disconnect")
         .accessibilityLabel("\(name) session actions")
+    }
+}
+
+// MARK: - Opening things from outside the dashboard
+
+@MainActor
+extension AppModel {
+    /// Selects `jobId` on `id`'s Jobs tab, with its sheet open while the job
+    /// is still in the queue (otherwise just the tab).
+    func selectJob(_ jobId: String, on id: ClusterID) {
+        guard let session = session(for: id) else {
+            return
+        }
+        session.dashboard.selectedTab = .jobs
+        session.dashboard.selectedJob = session.snapshot?.jobs.first { $0.jobId == jobId }
+        selection = .cluster(id)
+    }
+
+    /// Selects `id`, on `tab` when given.
+    func selectCluster(_ id: ClusterID, tab: DashboardTab? = nil) {
+        if let tab, let session = session(for: id) {
+            session.dashboard.selectedTab = tab
+        }
+        selection = .cluster(id)
+    }
+
+    /// `selectJob` and bring the dashboard forward (the menu bar's job rows).
+    func showJob(_ jobId: String, on id: ClusterID) {
+        selectJob(jobId, on: id)
+        DashboardWindowPresenter.shared.show()
+    }
+
+    func showCluster(_ id: ClusterID, tab: DashboardTab? = nil) {
+        selectCluster(id, tab: tab)
+        DashboardWindowPresenter.shared.show()
+    }
+}
+
+/// A `SessionActionConfirmation` asked with an NSAlert, for places that
+/// cannot host SwiftUI's confirmationDialog (the menu bar's menu). Return
+/// never confirms: the action ends live sessions and costs Duo pushes.
+enum SessionActionAlert {
+    @MainActor
+    static func run(_ confirmation: SessionActionConfirmation, model: AppModel) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = confirmation.title
+        alert.informativeText = confirmation.message
+        let confirm = alert.addButton(withTitle: confirmation.confirmTitle)
+        confirm.keyEquivalent = ""
+        confirm.hasDestructiveAction = true
+        let cancel = alert.addButton(withTitle: "Cancel")
+        cancel.keyEquivalent = "\u{1b}"
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+        // A sign-in may have started while the alert was open; ask the
+        // model again rather than acting on the stale confirmation.
+        guard !model.isAnyLoginActive else {
+            return
+        }
+        switch confirmation.kind {
+        case .renew:
+            if let fresh = model.renewConfirmation() {
+                model.perform(fresh)
+            }
+        default:
+            model.perform(confirmation)
+        }
     }
 }

@@ -180,7 +180,7 @@ struct CoreGPUFleetTests {
         #expect(fleet.modelLabel == "H200 + L40")
 
         let h200 = try #require(fleet.pools.first)
-        #expect(h200.partitions == ["calder-gpu-hopper"])
+        #expect(h200.partitions == ["gpu_hopper"])
         #expect(h200.nodeCount == 7)
         #expect(h200.total == 56)
         #expect(h200.allocated == 32)
@@ -192,7 +192,7 @@ struct CoreGPUFleetTests {
         #expect(h200.unavailableNodes == 1)
 
         let l40 = try #require(fleet.pools.last)
-        #expect(l40.partitions == ["aire-gpu-lovelace"])
+        #expect(l40.partitions == ["gpu_lovelace"])
         #expect(l40.nodeCount == 1)
         #expect(l40.total == 3)
         #expect(l40.idle == 0)
@@ -369,7 +369,7 @@ struct CoreGPUPoolToneTests {
             node("calder-h200-04", state: "alloc", cpuIdle: 0, allocated: 1),
             node("calder-h200-05", state: "drain", allocated: 0),
             NodeSummary(
-                node: "gpu028", partitions: ["aire-gpu-lovelace"], state: "drain*",
+                node: "gpu028", partitions: ["gpu_lovelace"], state: "drain*",
                 cpuAllocated: 0, cpuIdle: 64, cpuTotal: 64,
                 gres: "gpu:nvidia_l40:3", gpuTotal: 3, gpuAllocated: 0, gpuIdle: 3
             )
@@ -404,7 +404,7 @@ struct CoreGPUPoolToneTests {
     @Test("The largest pool's phrase says 'more model', never a bare '+1' after 'idle'")
     func primaryIdleText() {
         let l40 = NodeSummary(
-            node: "gpu028", partitions: ["aire-gpu-lovelace"], state: "drain*",
+            node: "gpu028", partitions: ["gpu_lovelace"], state: "drain*",
             cpuAllocated: 0, cpuIdle: 64, cpuTotal: 64,
             gres: "gpu:nvidia_l40:3", gpuTotal: 3, gpuAllocated: 0, gpuIdle: 3
         )

@@ -17,8 +17,35 @@ struct TerminalQuickCommand: Identifiable, Equatable {
 
     var id: String { title }
 
-    static func items(for profile: ClusterProfile) -> [TerminalQuickCommand] {
-        items(storage: profile.storage, gpuPartition: profile.gpuPartition)
+    /// `partitions` is the latest snapshot's, nil before the first one.
+    static func items(for profile: ClusterProfile, partitions: [PartitionSummary]? = nil) -> [TerminalQuickCommand] {
+        items(storage: profile.storage, gpuPartition: gpuPartition(for: profile, partitions: partitions))
+    }
+
+    /// The partition the "GPU nodes" chip lists: the profile's while the
+    /// cluster still has it (or before anything is known), otherwise the
+    /// snapshot's GPU partition with the most GPUs. A scheduler can rename
+    /// its partitions under the app — Calder did on 2026-11-11 — and the
+    /// chip must not keep running `sinfo -p` on a name Slurm now rejects.
+    /// nil when the snapshot lists no GPU partition at all.
+    static func gpuPartition(for profile: ClusterProfile, partitions: [PartitionSummary]?) -> String? {
+        guard let partitions, !partitions.isEmpty else {
+            return profile.gpuPartition
+        }
+        if let configured = profile.gpuPartition, partitions.contains(where: { $0.partition == configured }) {
+            return configured
+        }
+        var gpuCounts: [String: Int] = [:]
+        for row in partitions {
+            let perNode = slurmGPUTotal(from: row.gres)
+            if perNode > 0 {
+                gpuCounts[row.partition, default: 0] += perNode * max(row.nodeCount ?? 1, 1)
+            }
+        }
+        // Most GPUs first; equal counts by name, so the choice is stable.
+        return gpuCounts.max { lhs, rhs in
+            lhs.value != rhs.value ? lhs.value < rhs.value : lhs.key > rhs.key
+        }?.key
     }
 
     static func items(storage: [StorageVolumeSpec], gpuPartition: String?) -> [TerminalQuickCommand] {

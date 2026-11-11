@@ -35,8 +35,11 @@ The bundle identifiers predate the rename and are kept on purpose: the Keychain 
 Build system notes:
 
 - **Configuration.** Release by default. `--debug` builds the debug configuration, which is several times slower on the main thread and carries the DEBUG-only preview hooks.
-- **SDK.** An exported `SDKROOT` is respected; otherwise SwiftPM uses the SDK that `xcrun --show-sdk-path` reports. No SDK is pinned.
+- **SDK.** An exported `SDKROOT` is respected; otherwise SwiftPM uses the SDK that `xcrun --show-sdk-path` reports. No SDK is pinned. The one exception is an SDK whose SwiftUI the Command Line Tools cannot compile (see **Build system and SDK on the Command Line Tools** below).
 - **Parallelism.** SwiftPM's default. `HPC_BUILD_JOBS=<n>` passes `--jobs <n>`.
+- **Build system and SDK on the Command Line Tools.** `scripts/swiftpm_toolchain.sh`, which `run_tests.sh` and `test_all.sh` share, works around two problems with the Command Line Tools for macOS 27.2 (Swift 6.4):
+  - The build passes `--build-system native` whenever SwiftPM offers it. SwiftPM 6.4 defaults to the Swift Build engine, which compiles SwiftTerm's Metal shader. That needs a Metal toolchain the Command Line Tools lack ("unable to spawn process 'metal'"), and the engine puts products under `out/Products/` instead of `<scratch>/<configuration>/`. The app never turns on SwiftTerm's Metal renderer. A future SwiftPM that builds with Swift Build and no longer offers the native system stops `build_bundle.sh` with an error, rather than letting it package a stale binary from the native layout.
+  - The macOS 27.2 SDK makes SwiftUI's `@State` a macro whose `SwiftUIMacros` plugin ships only with Xcode ("plugin for module 'SwiftUIMacros' not found"). So when the Command Line Tools are active, they have no such plugin, and the SDK in use needs it, the scripts export `SDKROOT` as the newest bundled SDK that does not (26.5 with this release) and say so on stderr. The SDK in use is an exported `SDKROOT`, often the generic `MacOSX.sdk`, now a link to 27.2, or else SwiftPM's default. Xcode, an `SDKROOT` that builds, and a later Command Line Tools release that ships the plugin are left alone. The deployment target stays macOS 13.
 - **Build directory.** SwiftPM builds into the per-user Darwin temp directory (`$(getconf DARWIN_USER_TEMP_DIR)aire-monitor-build`, mode 700) rather than the project volume, because backup and sync tools that watch the project break llbuild's SQLite database mid-build. The name predates the rename and was kept so incremental state is reused. `HPC_SWIFTPM_BUILD_DIR` (or the older `AIRE_SWIFTPM_BUILD_DIR`) overrides it.
 - **Build-error tolerance.** Some toolchain and macOS combinations fail the final `build.db` write-back ("disk I/O error") after a successful compile. Such a build is accepted only when SwiftPM reported completion **and** every executable is current: linked during this build, or none of its inputs changed since it was linked.
 - **Logs.** `.runtime/swift-build.log` (`run_macos_app.sh`) or `.runtime/swift-widget-build.log` (widget alone); `HPC_BUILD_LOG` overrides. Each run truncates its log. A failed build ends the log with the deduplicated compiler errors and a final `build_bundle.sh: error: ...` line.
@@ -53,11 +56,12 @@ The script finds the certificate by name, so it also applies when the app or the
 
 **Info.plist provenance.** `HPCSourceRevision` (`git describe --tags --always --dirty`), `HPCBuildConfiguration` and `HPCBuildStamp` (per bundle, so not comparable between the app and the widget); read them with `defaults read <bundle>/Contents/Info HPCSourceRevision`. `CFBundleShortVersionString` is the newest `vX.Y.Z` tag, or `0.2.0`; `CFBundleVersion` is the commit count. Commit-only changes do not repackage a bundle, so these fields describe the build that last changed it. `LSEnvironment.HPC_PROJECT_ROOT` and `HPCProjectRoot` record the checkout, so a bundle installed or moved out of `.runtime/` still finds it. LaunchServices applies `LSEnvironment` only to launches it performs. `HPCProjectRoot` is read from the bundle itself, so it also works when the executable is started directly.
 
-The raw SwiftPM commands are useful for debugging. Pass a scratch path outside the project, because the default `.build/` on the project volume can hit the `build.db` error above:
+The raw SwiftPM commands are useful for debugging. Pass a scratch path outside the project, because the default `.build/` on the project volume can hit the `build.db` error above. Keep `--build-system native` (see above), and drop it only on a SwiftPM whose `swift build --help` does not list it. With the Command Line Tools for macOS 27.2, also point `SDKROOT` at the 26.5 SDK, as the scripts do:
 
 ```bash
-swift build --disable-sandbox -c release --scratch-path "$(getconf DARWIN_USER_TEMP_DIR)aire-monitor-build" --product AIREMonitorApp
-swift build --disable-sandbox -c release --scratch-path "$(getconf DARWIN_USER_TEMP_DIR)aire-monitor-build" --product AIREDesktopWidget
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk   # Command Line Tools for macOS 27.2 only
+swift build --disable-sandbox -c release --build-system native --scratch-path "$(getconf DARWIN_USER_TEMP_DIR)aire-monitor-build" --product AIREMonitorApp
+swift build --disable-sandbox -c release --build-system native --scratch-path "$(getconf DARWIN_USER_TEMP_DIR)aire-monitor-build" --product AIREDesktopWidget
 ```
 
 Running the bare binary (`swift run`) works, but local notifications are disabled outside an app bundle, because `UNUserNotificationCenter` requires a bundle identifier.
@@ -94,7 +98,7 @@ AppModel (coordinator, one per app: AppEnvironment.model)
 └── rash route only: ~/.ssh/ctl/jump-<hash>.sock, shared by every cluster's tunnel
 
 Views: ContentView (sidebar + Overview or one ClusterDashboardView)
-       StatusBarMonitorController + MenuBarMonitorView (menu bar)
+       StatusBarMonitorController + StatusMenuBuilder (menu bar)
 Separate process: AIREDesktopWidget (reads .runtime/clusters/*/ and the enabled flags in .runtime/preferences.json)
 ```
 
@@ -123,8 +127,8 @@ One implementation of every rule the surfaces must agree on, so the app, the men
 |---|---|---|
 | `identity` (HPCCore `ClusterIdentity`: id, display name, monogram, accent) | `aire` / AIRE / A / green | `calder` / Calder / C / violet |
 | `defaultHostname` | `aire.leeds.ac.uk` | `calder.leeds.ac.uk` |
-| `partitions` (`PartitionHint`: name, role, summary, sort rank) | `gpu`, `nodes`, `himem`, `teachingnodes` | `calder-gpu-hopper`, `calder-cpu-turin`, plus the AIRE-generation `aire-gpu-lovelace` and `aire-cpu-genoa` on Calder's scheduler |
-| `gpuPartition` (terminal "GPU nodes" chip) | `gpu` | `calder-gpu-hopper` |
+| `partitions` (`PartitionHint`: name, role, summary, sort rank) | `gpu`, `nodes`, `himem`, `teachingnodes` | `gpu_hopper`, `cpu_turin`, plus the AIRE-generation `gpu_lovelace` and `cpu_genoa` on Calder's scheduler (renamed on 2026-11-11 from `calder-gpu-hopper`, `calder-cpu-turin`, `aire-gpu-lovelace` and `aire-cpu-genoa`) |
+| `gpuPartition` (terminal "GPU nodes" chip) | `gpu` | `gpu_hopper` |
 | `storage` (`StorageVolumeSpec`, see the collector contract) | Home `$HOME` (nfs); Scratch `/scratch-aire/users/$USER`, `/mnt/scratch/$USER`, … (lustre); Flash `/flash-aire/users/$USER`, … (lustre, optional) | Home `$HOME` (nfs); Scratch `/scratch-calder/users/$USER`, … (lustre); Flash `/flash-calder/users/$USER`, … (lustre, optional) |
 | `tagline`, `documentationURL` | header text, arcdocs AIRE pages | header text, arcdocs Calder pages |
 
@@ -235,7 +239,14 @@ The sidebar offers exactly two routes, which apply to every cluster. **Both are 
 
 ### Login sequence
 
-`MonitorService.login(settings:password:forceReplace:onStatus:)` signs in to one cluster:
+`MonitorService.login(settings:password:forceReplace:renewJumpHost:onStatus:)` signs in to one cluster. Both helpers below run as one-shot launchd jobs in the user's GUI domain (`DetachedHelper`, through `runLoginHelper`), not as the app's children:
+- **Why.** Every process the app starts stays in the app's coalition, even after it daemonizes, and Force Quit (Activity Monitor, the Dock) ends the whole coalition. On 2026-11-11 a force quit during an update ended every SSH session within 3 ms. Started by launchd, a helper and the masters it starts belong to the job's coalition and are their own responsible process.
+- **Plumbing.** It matches a child process. The job's files sit in a 0700 folder under `$TMPDIR/aire-monitor-helpers`. The password goes in through a 0600 FIFO on stdin, and stdout and stderr come back through FIFOs, streamed by line. A wrapper shell records the pid (the job's process group) and the exit status.
+- **Stopping.** A cancel sends TERM to the job's process group at once, so a sign-in cancelled as the app quits cannot finish from a late Duo approval. A sign-in cancelled before its job started never starts it. The watchdog sends TERM, then KILLs whatever of the group is left 2 s later, and still reports 124.
+- **Leftovers.** A helper that finished is never signalled, because on the rash route its process group still holds the new master's ProxyCommand. `AbandonProcessGroup` keeps launchd from killing that process when the helper exits, and booting the job out afterwards leaves it alone. Each run also boots out helper jobs an interrupted run left loaded and removes their old folders.
+- **Fallback.** The helper runs as a child, as before, in three cases: launchd refuses the job; the job never starts (no pid and no open FIFO within 5 s); or the checkout is in a privacy-protected folder (`DetachedHelper.canRunOutsideApp`: Documents, Desktop, Downloads, iCloud Drive, `Library/CloudStorage`, `/Volumes`). A job there could not read the scripts, because the app's Files & Folders permission does not extend to it. The log says the master will then end on a force quit.
+
+The sequence:
 
 1. **Jump leg (rash route only).** `scripts/hpc_ssh_login.expect` runs with the password on stdin and `HPC_SKIP_TARGET=1`, so it only makes sure the shared jump master is up (see the [shared jump master policy](#shared-jump-master-policy)) and exits. It reads stdin first and falls back to `HPC_PASSWORD` only when stdin is empty. The app attributes this leg's failures to "rash.leeds.ac.uk (jump host)", not to the cluster: exit 13 means rash rejected the password, exit 15 that the rash Duo push was not approved. On the direct route this step is skipped.
 2. **Target leg (both routes).** `scripts/hpc_start_target_master.zsh` runs, again with the password as the first stdin line (read with `IFS= read -rs`; `HPC_PASSWORD` only when stdin is empty, and every password variable, including the pre-rename `AIRE_*` names, is scrubbed at once).
@@ -264,7 +275,8 @@ Set by `MonitorService` for both legs and for adoption:
 | `HPC_JUMP_HOSTNAME`, `HPC_JUMP_CONTROL_PATH` | jump host and shared jump socket (socket set on the rash route only) |
 | `HPC_CONTROL_PATH` | this cluster's socket |
 | `HPC_DUO_OPTION` | Duo menu answer (default `1` = push) |
-| `HPC_FORCE_RELOGIN` | `1` only for the confirmed Reconnect, otherwise `0`; applies to the **target** master only |
+| `HPC_FORCE_RELOGIN` | `1` only for the confirmed Reconnect and Renew all, otherwise `0`; applies to the **target** master only |
+| `HPC_RENEW_JUMP_HOST` | `1` only for the first cluster of a confirmed Renew all on the rash route: the jump leg replaces even a healthy jump master; otherwise `0` |
 | `HPC_REUSE_ONLY` | `1` only for adoption, otherwise `0`: adopt a healthy master or exit 4, with no password, teardown or Duo |
 | `HPC_LOGIN_DEBUG_LOG` | `.runtime/clusters/<id>/login_debug.log` |
 | `HPC_TIMEOUT` | `180`: the starter's deadline for connect, password and Duo (its default is 150), and the expect helper's per-prompt limit (its default is 120) |
@@ -342,6 +354,32 @@ Other failures are matched against common ssh output by `MonitorService.explainS
 
 A collector killed by its watchdog and a `scancel` that times out get their own messages, never the login-timeout wording. Every message includes the raw ssh output.
 
+## Sessions: Sharing, Renewal and Drops
+
+### Sharing with Terminal and Claude sessions
+
+`SessionSharing.swift` lets every other program ride the app's sign-in. Another program might be `ssh`, `scp` or `rsync` in Terminal, or a Claude session running commands on a cluster. With **Share with Terminal and Claude sessions** on (the Sessions card; default on), `AppModel` runs a sharing pass whenever a session goes live or away, and every 30 s:
+
+- **Stable links.** `~/.ssh/ctl/<name>.sock` points at each live master: `aire`, `calder`, and on the rash route `rash` (the jump master). `scripts/hpc-session` and `ssh -S` use these.
+- **Alias links.** Every literal `Host` alias in `~/.ssh/config` (and the files it `Include`s) is resolved with `ssh -G <alias>`. That runs locally, never connects, and is cached until the config files change. An alias whose host, user and port 22 match a live master gets a symlink at its own `ControlPath` (`%C` and friends expanded by ssh). A plain `ssh aire` then multiplexes over the app's session: no password, no Duo. An alias with `ProxyJump rash` rides the shared rash session for its first hop as well.
+- **Never over someone else's live session.** A path where another live master listens is reported as held by your own session and left alone. That covers your own `ssh aire-rash`, or a link you made yourself. It is linked once that master has gone. A dead socket left behind is replaced, as ssh itself would unlink it. Links are created with `symlink(2)` only, never renamed over a path, so a master ssh binds there at the same moment is never clobbered.
+- **Cleaned up.** The links the app made are recorded with their targets in `~/.ssh/ctl/shared-sessions.json` (0600), which also lists every session's start time and each alias's state for the CLI. When a master goes away, or sharing is switched off, each recorded link that still points where the app put it is removed, so `ssh <alias>` can become a master of its own again. Links survive an app quit, like the masters.
+- A Reconnect binds the same socket path, so links keep working without a pass; a route change moves them.
+
+Passes run only once every enabled cluster's startup probe has answered, so a relaunch never removes links to masters that are fine. `scripts/hpc-session` (`status`, `check`, `wait`, `run <name> [--wait S] -- <command>`, `shell`) rides the stable links with `-F /dev/null`, `BatchMode` and `ProxyCommand=false`. It never prompts and never dials directly, and it exits 75 when a session is down or dropped mid-command.
+
+### Session ages and Renew all
+
+A master's age is its socket's birth time (`st_birthtime`). That is the moment the sign-in completed, for masters adopted from an earlier run too. The Sessions card shows each age (rash, AIRE, Calder), and so do the menu bar dropdown and `hpc-session status`. An age of 11 h or more turns orange: sessions have ended about 12 h after the VPN session began.
+
+**Renew all…** (Sessions card, and the Reconnect… menu) is a confirmed forced sign-in of every enabled cluster (`AppModel.renew`). On the rash route the first cluster's jump leg runs with `HPC_RENEW_JUMP_HOST=1`, so the shared jump master is replaced too. That drops every tunnelled cluster, which the same chain then signs in again over the new one. Cost: one Duo push per leg (rash, AIRE, Calder), one at a time. Everything riding the old sessions closes first, shared `ssh` commands included. If the 12 h limit comes from the VPN, renewing SSH does not extend the VPN itself; reconnect the VPN first, or use the rash route off-VPN.
+
+### Drops on a Mac that moves around
+
+- `ConnectivityMonitor` (wake notifications and `NWPathMonitor`) has every session checked a few seconds after wake or a network change, instead of at the next, possibly backed-off, refresh. Dead links go in the same pass.
+- A session that was live and loses its master, or stops answering three times, gets `ClusterSession.droppedAt`. A Disconnect, route change or failed sign-in never does. The app posts "<cluster> session dropped after N h" and the Sessions card shows when it dropped and how long it had lasted.
+- **Sign in again after a drop** (default on) lets `AutoReconnectPolicy` queue a plain sign-in, reusing any master that survived. Every condition must hold: a saved Keychain password that was not rejected, keyboard or mouse input in the last two minutes, and a usable network. Each cluster gets at most three attempts per drop, 150 s apart (ssh closes a dead master within five minutes). After a declined or unanswered push, a rejected or expired password, a rash failure or Cancel sign-in, nothing is retried until the user signs in themselves.
+
 ## Runtime Layout
 
 All paths are relative to the project root unless they start with `~`.
@@ -401,6 +439,17 @@ Control sockets live in `~/.ssh/ctl/` (mode 700) with short SHA-256-based names.
 
 See [MONITORING_PROTOTYPE.md](MONITORING_PROTOTYPE.md) for the collector's command list and JSON details.
 
+## Job Resource Use
+
+With **Sample** on (Jobs → Resource use; default on), a refresh adds the collector's `--job-usage` section once a minute while one of the user's jobs runs (`ClusterSession.wantsJobUsage`; a manual Refresh always). The section lists running jobs (`squeue -t R -o '%A|%i|%N'`) and their per-node allocation (`scontrol -d show job`: `CPU_IDs`, `Mem`, GRES `IDX`). It then reaches each node with ssh from the login node, in parallel and bounded at 12 s each, at most 24 nodes. `pam_slurm_adopt` admits the user only where they have a job and adopts the session into one of them. On the node a short probe:
+
+- reads every listed job's cgroup v2 counters twice, a second apart: `cpu.stat` `usage_usec` for CPUs busy, `memory.stat` `anon`, `memory.current`, `memory.peak` and `memory.max`;
+- runs one `nvidia-smi --query-gpu=minor_number,...` query in between.
+
+GPUs are attributed by minor number against Slurm's IDX. Only the adopted job's GPUs are visible, so on a node running several of the user's jobs the others' GPU figures are reported as missing, with a note. Nothing is started in a job (no `srun` steps) and nothing is written on the node. The probe's `nvidia-smi` and `sleep` run about a second inside the adopted job's cgroup (tens of MB). The section is never part of `collector.json`, so the widget's own collections stay on the login node.
+
+`snapshot.job_usage` holds one row per (job, node): `null` when not sampled, `[]` when sampled with nothing running. The session keeps the rows itself (`jobUsage`, keyed by `Job.jobId`) with a two-hour trend per job (`JobUsageHistory`). The Jobs tab shows a card per running job: a verdict (well used, N of M GPUs idle, partly used, mostly idle), GPU utilisation, GPU memory, CPUs busy against allocated, memory against the limit, and the trend. The job sheet adds per-node and per-GPU rows (memory, power, temperature) and a chart. Sampling off clears the figures.
+
 ## Terminal
 
 The Terminal tab of each cluster embeds real SSH sessions (SwiftTerm's `LocalProcessTerminalView`). Sessions are plain `/usr/bin/ssh -tt` child processes that **multiplex over that cluster's ControlMaster**, so opening a terminal never re-authenticates and never prompts for a password or Duo:
@@ -414,7 +463,7 @@ Before starting a session, the app pre-flights the master with `ssh -O check`. I
 Each cluster has its own `TerminalManager`, so an AIRE shell can never ride on Calder's session or the other way round. Its tabs survive switching dashboard tabs and switching clusters, and the cluster's accent colour tints the chrome.
 
 - **Session cap.** At most 6 running tabs per cluster (`TerminalManager.maxConcurrentSessions`): sshd's MaxSessions, assumed to be OpenSSH's default of 10, minus one collector session, one file-browser command and two concurrent transfers. A seventh tab is not started; a banner says so and offers to close running log tails.
-- Quick-command chips come from the profile: `squeue --me`, `sinfo`, Quota, `sinfo -N -p <gpuPartition>` (only if the profile has a GPU partition), and `htop || top`. The Quota command is built from the profile's storage specs, the same ones the collector gets: `quota -s` for the NFS home, and for each Lustre space its candidates in order with the collector's rule (project quota when the directory has a non-zero project id, else the user quota). A chip types into the active live shell when that is safe and the shell belongs to the same cluster, and otherwise runs in its own reused tab. `htop` always gets its own session.
+- Quick-command chips come from the profile: `squeue --me`, `sinfo`, Quota, `sinfo -N -p <gpuPartition>`, and `htop || top`. The GPU chip keeps the profile's `gpuPartition` while the latest snapshot lists it, or before the first snapshot, when it appears only if the profile names a GPU partition. Otherwise, for example after a scheduler renamed the partition, the chip lists the snapshot's GPU partition with the most GPUs (ties go to the first name). With no GPU partition in the snapshot there is no chip (`TerminalQuickCommand.gpuPartition(for:partitions:)`). The Quota command is built from the profile's storage specs, the same ones the collector gets: `quota -s` for the NFS home, and for each Lustre space its candidates in order with the collector's rule (project quota when the directory has a non-zero project id, else the user quota). A chip types into the active live shell when that is safe and the shell belongs to the same cluster, and otherwise runs in its own reused tab. `htop` always gets its own session.
 - The Jobs detail sheet offers **Tail output**, which opens `tail -n 200 -F '<stdout path>'` on the job's cluster (reusing that job's tab; disabled while the job is pending and absent for an array's pending remainder), and **Cancel job** ("Cancel queued tasks" for a remainder), which runs `scancel` on that cluster only, after a confirmation, with the result shown inline.
 - The Nodes tab offers **Open shell on login node**, which focuses an existing live shell or opens one.
 - An exited session can be restarted with the cluster's current settings. **Closing a session terminates its ssh child**, so closed tabs never leave orphaned `ssh` processes behind; closing a connected shell or command asks first (with a "Don't ask again" option), while a log tail closes without asking.
@@ -463,15 +512,79 @@ The overview is the default landing page (`OverviewDashboard`). Two rules shape 
 
 ## Menu Bar Monitor
 
-While the main app runs, it installs a native AppKit status item (`StatusBarMonitorController`) that summarises every enabled cluster:
+While the main app runs, it installs a native AppKit status item (`StatusBarMonitorController`). The item and its menu are built from one `MenuBarDigest`, so they never disagree.
 
-- **Title.** Built from **live** clusters only; cached or paused figures may describe jobs that ended hours ago, so they are named, with their time, in the tooltip instead. A live cluster whose Slurm is failing (`schedulerIssue`) counts as not live here, because its figures are only carried forward. `C · train 9h 29m` (monogram, job name middle-truncated to fit, elapsed) when exactly one job is running across live clusters; `3 jobs` when several are; otherwise each live cluster's largest GPU pool, such as `A 6 · C 27+` (`A ?` while nothing is known idle only because allocation is unknown; `+` when another model also has idle GPUs, which a pool of unknown allocation never earns; pools are never summed); otherwise a state word (`Signing in`, `Checking`, `Syncing`, `Ready`, `Slurm error`, `Cached`, `Paused`, `Offline`, `Off`). The width is reserved from a digit-stable template, so the item does not jitter on every tick.
-- **Icon tint** shows combined health: green when every enabled cluster is live with Slurm answering; orange when only some are (a Slurm error included), or a check, sign-in or first collection is running; red when nothing is live or shown and a cluster reports an error; dimmed when only cached or paused figures exist, or nothing is connected. With every cluster off, it is a plain template icon.
-- **Tooltip**: one block per cluster (connection state, sign-in progress, job counts with held jobs named apart from pending ones, one line per GPU pool such as "H200: 0 of 56 idle · 34 in use · 7 stranded · 15 unavailable", storage pressure; figures that are not live carry their collection time, and a Slurm-error cluster's counts are marked "(not current)"), then the shared home quota once.
-- **Dropdown** (`MenuBarMonitorView`): a combined header, then one compact section per cluster with its state pill, a single action (Connect, a plain sign-in; Resume; or turn monitoring on), the job counts ("9 running · 1 pending · 11 held") over the first three jobs, then "+N more", or "+37 more jobs in 16 rows" once a hidden array remainder stands for several tasks, so the rows and the count line add up, then GPU pool and storage meters. A GPU row reads "K of M idle" in the shared pool tone beside the overview's segmented capacity meter, with the GPUs that are not idle under it ("34 in use · 7 stranded · 15 unavailable"); when nothing is known idle only because allocation is unknown it reads "? of 9 idle" in grey over "9 unknown". A Slurm-error cluster's section hides "Updated N ago", greys its figures and shows a warning row ("… — showing the previous figures"). Storage rows use the Storage tab's tone: warning from 75 %, critical from 90 % or over quota, judged on the larger of space and file count. The shared home appears once below the sections, then any app-level error, then footer actions: Refresh all (enabled only when some cluster can refresh), Dashboard, Widget and Quit (which still goes through the quit prompt).
-- **Opening the menu** calls `refreshAllQuietly()`, which honours pause, skips clusters never signed in or signed out with Disconnect, and never surfaces an error, so a glance shows data at most a few seconds old without starting a sign-in.
+### The status item
 
-The status item and the dropdown are both built from one `MenuBarDigest`, so the title and the panel beneath it never disagree. The item is only touched when its visible signature changes, and the dropdown re-renders only while it is open.
+- **Glyph.** One shape in every state: the app's rack emblem (`server.rack`), drawn as a template image (`StatusItemGlyph`), so AppKit draws it correctly in each of these cases:
+  - light and dark menu bars;
+  - the open (highlighted) state;
+  - Increase Contrast and Reduce Transparency.
+- **Dimmed and badged.** The glyph is dimmed (`appearsDisabled`) while no enabled cluster is live with Slurm answering: checking, signing in, not connected, cached, paused or off. It carries a small knocked-out "!" badge only when something needs the user (`MenuBarDigest.attention`):
+  - a session dropped on its own (`ClusterSession.droppedAt`, so never after a Disconnect);
+  - a sign-in failed and is not being retried;
+  - Slurm is not answering.
+
+  Not connected, off, paused, an ageing session, storage and GPU verdicts never badge; the menu shows them.
+- **Title.** The user chooses it under **Show in Menu Bar** (`StatusTitleMode`, saved in preferences):
+  - **Running Jobs** (the default): "7 running", the live running count, or nothing (just the glyph) while nothing runs.
+  - **Idle GPUs**: each live cluster's largest pool, such as `A 4 · C 16+`. `A ?` means allocation is unknown. `+` means another model has idle GPUs. Pools are never summed.
+  - **Icon Only**: no title.
+
+  Only live clusters feed a title: cached, paused or Slurm-error figures may describe jobs that ended hours ago. State words, job names and elapsed times never appear in it.
+- **Width.** The width is reserved per class (`StatusWidthClass`):
+  - glyph only: the system's square;
+  - "88 running" for 1–99 running jobs (at most 104 pt);
+  - the digit-stable GPU template (at most 130 pt).
+
+  It changes only when the class does, never on a refresh tick.
+- **Tooltip and VoiceOver.** The tooltip has, in order:
+  1. a headline ("7 jobs running — AIRE 2, Calder 5");
+  2. one "Needs a look: …" line per badge reason;
+  3. one block per cluster (connection, job counts with "(as of 14:05)" or "(not current)", one line per GPU pool, storage pressure);
+  4. the shared home, only under pressure.
+
+  VoiceOver reads a sentence that starts "Leeds HPC Monitor: …".
+
+### The menu
+
+The menu is a real NSMenu (`StatusMenuBuilder`), built from `MenuBarMenuLayout`, a pure list of `MenuEntry` values:
+- **Native items** carry everything you act on, so they get the system highlight, arrow keys, type-select and native scrolling.
+- **Disabled hosted SwiftUI rows** carry what needs a meter or a tone colour: cluster headers, GPU pools, storage warnings and notes. They draw no background or material of their own.
+- **Open-menu updates.** An open menu is updated in place by entry id, so the highlight never jumps.
+- **Native titles** carry no colour, so they still invert when highlighted. Trailing figures sit at a right-aligned tab stop. A long name is shortened in the middle, never its job id.
+
+Per cluster, in catalog order:
+- **Live**: a header (badge, name, "up 3 h 13 min", orange from 11 h) and the counts row ("2 running · 61 pending ▸"). Then up to three running jobs ("1h 08m of 4h"), with jobs whose GPUs sit idle listed first and marked ⚠︎. Then one GPU row per pool: the meter, "16 of 56 idle", and the reason when none is idle. Then storage rows only from 75 %.
+- **Slurm not answering**: a note and the counts row marked "(not current)"; no jobs, GPU or storage rows.
+- **Checking or collecting the first snapshot**: the header alone, never a Connect.
+- **Waiting or signing in**: the progress note ("Waiting for Duo approval on your phone") and Cancel.
+- **Dropped**: "Dropped 14:05", the shared `SessionDropNote` ("Lasted 11 h 52 min · sign in to continue"), and Connect.
+- **Sign-in failed**: the error's first line and Connect.
+- **Not connected**: Connect.
+- **Cached**: "Cached · 14:05", Connect, and "As of 14:05: …".
+- **Paused**: Resume.
+- **Off**: Turn On.
+
+The counts row's submenu lists every queued job under Running, Pending and Held, at most 20 rows, then "+N more", which adds up with the counts. It ends with Open … in Dashboard.
+
+Below the clusters come, when present: the shared home (only under pressure), an app error, and a "Signed in 11 h ago" note once the oldest live leg is 11 h old (the rash jump session counts). Then the footer:
+- Open Dashboard;
+- Open Desktop Widget;
+- Renew All Sessions…;
+- Show in Menu Bar ▸;
+- Quit Leeds HPC Monitor.
+
+Behaviour:
+- **Job rows** open the job's sheet (`AppModel.showJob`).
+- **Connect** is a plain sign-in, which reuses an open session.
+- **Renew All Sessions…** asks first, in an `SessionActionAlert` built from the same `SessionActionConfirmation` the sidebar uses. It checks again on confirm that no sign-in has started meanwhile.
+- **Never in the menu**: Reconnect, Disconnect, Pause and route changes. They stay in the dashboard behind its confirmations.
+- **Quit** still goes through the app's quit prompt.
+- **Commands run after the menu closes.**
+- **Opening the menu** builds it from the latest digest and calls `refreshAllQuietly()`, which never starts a sign-in or paints an error.
+
+An NSMenu cannot be rendered offscreen, so the renders (`scripts/render_previews.sh`, the README image) use `MenuBarMenuPreview`. It is a test-only stand-in that draws the same entries with the same rows: close to the real menu, but not identical.
 
 ## Current Views
 
@@ -486,13 +599,13 @@ The dashboard window is a `NavigationSplitView` with a minimum size of 1000 × 6
 Tabs:
 
 - **Jobs**: summary metrics (Pending leaves held jobs out and adds them beside it, "+11 held") and job cards by state; a detail sheet (timeline, array, resources, paths) from `squeue --json`, with `scontrol show job` only on the collector's pipe fallback, plus Tail output, Browse workdir and Cancel job
-- **Partitions**: cards styled from the profile's partition hints, counted by unique node, GPU capacity per model ("56 H200 + 3 L40"), node-state bars, time limits
+- **Partitions**: cards styled from the profile's partition hints, counted by unique node, GPU capacity per model ("56 H200 + 3 L40"), node-state bars, time limits. Slurm's default partition (the collector's `is_default`) carries a **Default** mark, drawn as a warning when none of its nodes accepts work (`PartitionGroup.isDefaultWithoutUsableNodes`: a job submitted without `--partition` would wait there, as on Calder since 2026-11-11). The details table shows sinfo's own `*`
 - **Nodes**: GPU-first dashboard (allocation, idle GPUs by model, mixed and unavailable GPU nodes, slot-level occupancy) plus CPU, high-memory and teaching node classes where the cluster has them; while node details are missing (allocation unknown), the ring shows a dash instead of a share in use, a caption names the unknown GPUs and the GPU section's subtitle reads "? idle L40S"
 - **Trends**: this cluster's own history over 1 h, 6 h or 24 h (a window shared with Storage): GPU availability and allocation with a per-model capacity signal (green with room; orange when tight or full, never red; grey when no node accepts work or the verdict cannot be judged), queue pressure (the headline is the current snapshot's "9 running · 1 pending · 11 held"; history points record only running and queued, so the line counts held jobs as queued), unavailable GPU nodes, and home, scratch and flash pressure in the Storage tab's tone. Each history point records GPUs of unknown allocation (`gpuUnknown`); while some are unknown the GPU charts leave a gap, the cards read "unknown" or "at least N idle", and the capacity signal reads "Allocation unknown" in grey whenever those GPUs could change its verdict (never "GPU full" merely because nothing is known idle)
 - **Storage**: one card per reported space, with used percentage, headroom, limit, file-count pressure, and how it is measured (NFS quota, Lustre project or user quota, or filesystem totals from `df`)
 - **Files** and **Terminal**, as above
 
-Detail tables are hidden by default behind `Show Details`. State classification, GPU counting and time handling come from HPCCore; `SlurmFormatting.swift` holds the app-side state colours and formatting. Sizes are binary: storage (`formatGB`) reads "12.3 GiB", whole GiB from 100 GiB up to 10 TiB ("2,458 GiB"), then TiB, and node memory on the Nodes and Partitions cards (`formatMemoryGB`) switches to TiB at 1 TiB ("754 GiB", "1.5 TiB"). Nodes that accept no work (down, drained, maintenance) are grey everywhere, and so is a partition with no usable node; red is reserved for faults (failed jobs, critical storage, a partition Slurm reports down or inactive) and orange for warnings. Occupancy is capacity, not a status: allocated nodes are blue and mixed ones a paler blue, never orange. A GPU pool has one tone on every surface (`GPUPool.idleTone`: the overview tile, the cluster header chip, the menu bar row): green while some GPU is idle, orange when the pool is known to be full, never red, and grey when every node is unavailable or nothing is known idle only because allocation is unknown. The Trends capacity signal agrees (adding orange for tight capacity), and the Nodes ring is capped at orange. The visual language uses macOS system materials for the sidebar, cards, menu panel and widget shell, with each cluster's accent colour (AIRE green, Calder violet) on its badge, tabs and terminal chrome. Motion is restrained: hover lift on cards, smooth meter changes, and animated detail surfaces.
+Detail tables are hidden by default behind `Show Details`. State classification, GPU counting and time handling come from HPCCore; `SlurmFormatting.swift` holds the app-side state colours and formatting. Sizes are binary: storage (`formatGB`) reads "12.3 GiB", whole GiB from 100 GiB up to 10 TiB ("2,458 GiB"), then TiB, and node memory on the Nodes and Partitions cards (`formatMemoryGB`) switches to TiB at 1 TiB ("754 GiB", "1.5 TiB"). Nodes that accept no work (down, drained, maintenance) are grey everywhere, and so is a partition with no usable node; red is reserved for faults (failed jobs, critical storage, a partition Slurm reports down or inactive) and orange for warnings. Occupancy is capacity, not a status: allocated nodes are blue and mixed ones a paler blue, never orange. A GPU pool has one tone on every surface (`GPUPool.idleTone`: the overview tile, the cluster header chip, the menu bar row): green while some GPU is idle, orange when the pool is known to be full, never red, and grey when every node is unavailable or nothing is known idle only because allocation is unknown. The Trends capacity signal agrees (adding orange for tight capacity), and the Nodes ring is capped at orange. The visual language uses macOS system materials for the sidebar, cards and widget shell, with each cluster's accent colour (AIRE green, Calder violet) on its badge, tabs and terminal chrome. Motion is restrained: hover lift on cards, smooth meter changes, and animated detail surfaces.
 
 ## Branding
 
@@ -523,7 +636,7 @@ python3 scripts/tests/test_login_flow.py                 # login scripts against
 scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 ```
 
-- The Swift tests use swift-testing, because XCTest does not exist on a Mac with only the Command Line Tools. `run_tests.sh` builds in its own scratch directory (`hpc-monitor-tests-build` under the per-user temp dir; override with `HPC_TEST_BUILD_DIR`). On a Command Line Tools-only machine it adds `-F` and an rpath for the CLT's `Testing.framework`; without them SwiftPM's generated runner compiles its swift-testing entry point out and reports a "pass" with zero tests. `Package.swift` disables cross-import overlays for the test target only and links the test bundle for macOS 14; the app and widget still target macOS 13. With Xcode selected, the wrapper is equivalent to `swift test`.
+- The Swift tests use swift-testing, because XCTest does not exist on a Mac with only the Command Line Tools. `run_tests.sh` builds in its own scratch directory (`hpc-monitor-tests-build` under the per-user temp dir; override with `HPC_TEST_BUILD_DIR`). On a Command Line Tools-only machine it adds `-F` and an rpath for the CLT's `Testing.framework`; without them SwiftPM's generated runner compiles its swift-testing entry point out and reports a "pass" with zero tests. `Package.swift` disables cross-import overlays for the test target only and links the test bundle for macOS 14; the app and widget still target macOS 13. It also selects the native build system and, where the Command Line Tools need it, the 26.5 SDK (see **Build system and SDK on the Command Line Tools**). With Xcode selected, the wrapper is `swift test --build-system native`.
 - The tests link the app and HPCCore, not the widget (`test_all.sh` builds the widget separately). They need no network, Keychain or `~/.ssh`: sessions run on a fake `ClusterBackend` and a hand-driven `RefreshScheduling`, the file manager on a scripted remote runner, and files go to temporary directories.
 - The "Minimum window layout" suite hosts every tab, sign-in screen, the overview and the status strip at the minimum detail column and fails on overflow. It needs a window server, so it runs in a logged-in session or on a CI macOS runner and is skipped elsewhere.
 - `InstallTests` cover the checkout discovery (`HPCProjectRoot` included) and the install record. They also run the real `install_app.sh` in a throwaway checkout against small ad-hoc-signed fake bundles: install, unchanged and changed updates, a running copy that does not quit (and `--force`), a foreign bundle under the app's name, `--uninstall`, the same folder under another spelling, a failed first install, a failed swap (put back, or kept), the write-access check, reopening after a failure, leftover staging folders and the `~/Applications` fallback. The fake bundles' executable is a small compiled sleeper, so a running copy really runs from its bundle. They also cover running copies found through a link (to the folder or to the executable itself), another letter case, the recorded spelling, a folder with a non-ASCII name in the C locale, or only by the executable the kernel runs (started under a bare name), and processes that are not copies: a `tail -f` of the path, or one that only maps the executable. They cover `--uninstall` with a running copy, of a bundle the account cannot delete (locked, an ACL, a read-only folder inside: nothing changes, nothing is asked to quit), with a copy starting while the bundle is moved out of the way (put back, for `--uninstall` and for an update), after a run killed between its two moves and with only a leftover staging folder, an old install that cannot be deleted after a move (left whole), a live staging folder from another checkout, owner files of ended or reused process ids, a folder appearing at the install mid-swap, both kinds of exit 75, and what LaunchServices would list: the lsregister stub logs each bundle's inode, and replaying its `-f` and `-u` calls must leave exactly the installed copy (or, after `--uninstall`, the `.runtime/` bundle), with `.runtime/` unregistered last and only once nothing runs from it. The real `build_bundle.sh` runs with a fake `swift` to check its install-source mode. `HPC_INSTALL_DIR` (or `HPC_INSTALL_DEFAULT_DIR` and `HOME`) points at a temp folder, and `HPC_LSREGISTER`, `open` and `swift` are stubs, so they never touch `/Applications`, `~/Applications` or LaunchServices. A syntax check runs `bash -n`/`zsh -n` over every script.
@@ -540,21 +653,26 @@ scripts/render_previews.sh [output-dir] [data-dir]       # offscreen PNG renders
 | `AppModel.swift` | coordinator: sign-in chain, Keychain, preferences, project root, lease heartbeat, widget launcher |
 | `ClusterSession.swift`, `FoundationRefreshRules.swift`, `ClusterPresentation.swift` | one cluster's lifecycle; refresh classification and merges; the shared phase and wording |
 | `ClusterBackend.swift`, `MonitorService.swift`, `SSHMuxOptions.swift` | the process boundary: helpers, collector, remote commands, scp, stop and adopt; client options for anything riding a master |
+| `DetachedHelper.swift` | runs the login helpers as one-shot launchd jobs, so the SSH masters they start survive a quit or Force Quit of the app |
 | `ClusterCacheWriter.swift`, `SnapshotCache.swift` | runtime files: background writer, snapshot, history, job baseline, lease, preferences, migration |
 | `ClusterProfile.swift`, `KeychainPasswordStore.swift`, `Logging.swift` | profiles and catalog; the Keychain item; unified-log categories |
-| `JobStateDiff.swift`, `JobNotifications.swift` | job events, notifications, GPU-free alert |
+| `JobStateDiff.swift`, `JobNotifications.swift` | job events, notifications, GPU-free alert, session-dropped alert |
+| `SessionSharing.swift`, `SessionContinuity.swift`, `SessionsCard.swift` | sharing the masters with `~/.ssh` aliases; wake/network handling, drops and `AutoReconnectPolicy`; the Sessions card |
+| `JobUsageViews.swift`, `Sources/HPCCore/JobUsage.swift` | per-job resource use: Resource use cards, the job sheet's section; the decoded rows, summaries and trend |
 | `ContentView.swift`, `Sidebar.swift`, `ClusterViews.swift`, `ShellStatusStrip.swift`, `Components.swift`, `Theme.swift` | window, sidebar, session menu and confirmations, status strip, shared components |
 | `OverviewDashboard.swift`, `OverviewModel.swift` | overview |
 | `JobsDashboard.swift`, `PartitionsDashboard.swift`, `NodesDashboard.swift`, `TrendsDashboard.swift`, `TrendSeries.swift`, `StorageDashboard.swift`, `SlurmFormatting.swift` | cluster tabs |
 | `FilesDashboard.swift`, `FileBrowserModel.swift`, `FileActivity.swift`, `FileActivityStrip.swift`, `FilePreviewSheet.swift`, `TrashSheet.swift`, `RemoteTrashModel.swift`, `RemoteFileService.swift`, `RemoteFileRules.swift`, `RemoteFileScripts.swift` | file manager |
 | `TerminalDashboard.swift`, `TerminalManager.swift`, `TerminalQuickCommands.swift` | terminal |
-| `StatusBarMonitorController.swift`, `StatusBarSummary.swift`, `MenuBarModel.swift`, `MenuBarMonitorView.swift` | menu bar |
+| `StatusBarMonitorController.swift`, `StatusBarSummary.swift`, `MenuBarModel.swift`, `MenuBarMenuLayout.swift`, `StatusMenuBuilder.swift` | menu bar: the status item, the digest, the menu as data, and the native menu |
 | `Sources/AIREDesktopWidget/` | widget: `WidgetModel` (discovery, opening the app), `ClusterFeed` (one cluster's feed), views |
 | `scripts/build_bundle.sh`, `run_macos_app.sh`, `run_desktop_widget.sh` | build, sign and launch the bundles in `.runtime/` |
 | `scripts/install_app.sh` | install, update or remove `Leeds HPC Monitor.app` in `/Applications` (or `HPC_INSTALL_DIR`, `~/Applications`) |
 | `scripts/hpc_ssh_login.expect`, `hpc_start_target_master.zsh`, `hpc_stop_master.zsh`, `hpc_ssh_askpass.sh`, `hpc_ssh_common.zsh` | jump leg, target master, sign-out, askpass, and the shared ssh option sets and kill rules (sourced, never executed) |
 | `scripts/hpc_snapshot.py` | the collector |
+| `scripts/hpc-session` | command line for other programs: `status`, `check`, `wait`, `run`, `shell` over the shared sessions |
 | `scripts/test_all.sh`, `render_previews.sh`, `scripts/tests/` | test runner, renders, Python suites and the fake ssh |
+| `scripts/render_readme_images.sh`, `docs/images/` | the README screenshots, drawn from fixtures and demo data (`ReadmeScreenshotTests`), scaled and compressed |
 | `Tests/AIREMonitorAppTests/`, `Tests/Fixtures/` | Swift tests and their runner, collector contract fixtures |
 
 ## Current Limitations

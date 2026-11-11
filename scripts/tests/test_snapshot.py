@@ -107,7 +107,7 @@ def _job_record(**overrides):
         "name": "",
         "node_count": _num(1),
         "nodes": "",
-        "partition": "calder-gpu-hopper",
+        "partition": "gpu_hopper",
         "standard_error": "",
         "standard_output": "",
         "start_time": _num(0),
@@ -207,16 +207,16 @@ CANNED_JOBS_JSON = "\n".join(line.lstrip() for line in CANNED_JOBS_JSON_PRETTY.s
 # The same queue as the pipe-format fallback prints it (squeue %i shows the
 # remainder as '35796_[3-58%4]'), and the scontrol records it joins.
 CANNED_JOBS_PIPE = "\n".join([
-    f"40188|calder-gpu-hopper|train-h200|{USER}|RUNNING|3:25:10|2-00:00:00|1|calder-h200-01",
-    f"35796_1|calder-gpu-hopper|sweep|{USER}|RUNNING|30:00|1-00:00:00|1|calder-h200-03",
-    f"35796_2|calder-gpu-hopper|sweep|{USER}|RUNNING|10:00|1-00:00:00|1|calder-h200-03",
-    f"35796_[3-58%4]|calder-gpu-hopper|sweep|{USER}|PENDING|0:00|1-00:00:00|1|(JobArrayTaskLimit)",
-    f"9918|calder-gpu-hopper|c3-c09-dump|{USER}|PENDING|0:00|12:00:00|1|(JobHeldUser)",
+    f"40188|gpu_hopper|train-h200|{USER}|RUNNING|3:25:10|2-00:00:00|1|calder-h200-01",
+    f"35796_1|gpu_hopper|sweep|{USER}|RUNNING|30:00|1-00:00:00|1|calder-h200-03",
+    f"35796_2|gpu_hopper|sweep|{USER}|RUNNING|10:00|1-00:00:00|1|calder-h200-03",
+    f"35796_[3-58%4]|gpu_hopper|sweep|{USER}|PENDING|0:00|1-00:00:00|1|(JobArrayTaskLimit)",
+    f"9918|gpu_hopper|c3-c09-dump|{USER}|PENDING|0:00|12:00:00|1|(JobHeldUser)",
 ])
 CANNED_JOB_DETAILS = "\n".join([
     f"JobId=40188 JobName=train-h200 UserId={USER}(1234) JobState=RUNNING Reason=None "
     "SubmitTime=2026-10-12T08:00:00 StartTime=2026-10-12T08:34:50 EndTime=2026-10-13T12:00:00 "
-    "Partition=calder-gpu-hopper NodeList=calder-h200-01 BatchHost=calder-h200-01 NumNodes=1 NumCPUs=12 "
+    "Partition=gpu_hopper NodeList=calder-h200-01 BatchHost=calder-h200-01 NumNodes=1 NumCPUs=12 "
     "NumTasks=1 ReqTRES=cpu=12,mem=180G,node=1,billing=12,gres/gpu=1 "
     "AllocTRES=cpu=12,mem=180G,node=1,billing=12,gres/gpu=1,gres/gpu:nvidia_h200=1 "
     f"Command=/users/{USER}/runs/train.sh --lr=0.1 WorkDir=/users/{USER}/runs "
@@ -237,31 +237,31 @@ CANNED_JOB_DETAILS = "\n".join([
 ])
 
 CANNED_PARTITIONS = "\n".join([
-    "calder-cpu-turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00",
-    "calder-gpu-hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00",
+    "cpu_turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00",
+    "gpu_hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00",
     "calder-gpu-lovelace|up|2|mix|gpu:l40s:4(S:0,2),mps:400|64|512000|(null)|1-00:00:00",
 ])
 NHC_REASON = "NHC: check_cmd_output: 'nvidia-smi -L | wc -l' returned 7"
 CANNED_NODES = "\n".join([
-    "calder-h200-01|calder-gpu-hopper|mix|64/64/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
-    "calder-h200-02|calder-gpu-hopper|idle|0/128/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
-    f"calder-h200-05|calder-gpu-hopper|drain|0/0/128/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|{NHC_REASON}",
+    "calder-h200-01|gpu_hopper|mix|64/64/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
+    "calder-h200-02|gpu_hopper|idle|0/128/0/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|none",
+    f"calder-h200-05|gpu_hopper|drain|0/0/128/128|1546664|gpu:nvidia_h200:8(S:0-1)|(null)|{NHC_REASON}",
     "calder-l40-01|calder-gpu-lovelace|mix|16/48/0/64|512000|gpu:l40s:4(S:0,2),mps:400|(null)|none",
-    "calder-cpu001|calder-cpu-turin|mix|100/28/0/128|772480|(null)|(null)|none",
+    "calder-cpu001|cpu_turin|mix|100/28/0/128|772480|(null)|(null)|none",
     "calder-cpu001|nodes|mix|100/28/0/128|772480|(null)|(null)|none",
 ])
 CANNED_NODE_DETAILS = "\n".join([
     "NodeName=calder-h200-01 Arch=x86_64 CPUAlloc=64 CPUTot=128 CPULoad=63.20 RealMemory=1546664 "
-    "AllocMem=983040 FreeMem=401234 State=MIXED Partitions=calder-gpu-hopper "
+    "AllocMem=983040 FreeMem=401234 State=MIXED Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 "
     "AllocTRES=cpu=64,mem=960G,gres/gpu=5,gres/gpu:nvidia_h200=5 CurrentWatts=2310 AveWatts=1980",
     # Idle: AllocTRES lists nothing at all, which means 0 GPUs in use.
     "NodeName=calder-h200-02 Arch=x86_64 CPUAlloc=0 CPUTot=128 CPULoad=0.04 RealMemory=1546664 "
-    "AllocMem=0 FreeMem=1501000 State=IDLE Partitions=calder-gpu-hopper "
+    "AllocMem=0 FreeMem=1501000 State=IDLE Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 AllocTRES= "
     "CurrentWatts=640 AveWatts=655",
     "NodeName=calder-h200-05 Arch=x86_64 CPUAlloc=0 CPUTot=128 CPULoad=0.01 RealMemory=1546664 "
-    "AllocMem=0 FreeMem=1500000 State=IDLE+DRAIN Partitions=calder-gpu-hopper "
+    "AllocMem=0 FreeMem=1500000 State=IDLE+DRAIN Partitions=gpu_hopper "
     "CfgTRES=cpu=128,mem=1546664M,billing=128,gres/gpu=8,gres/gpu:nvidia_h200=8 AllocTRES= "
     f"CurrentWatts=0 AveWatts=0 Reason={NHC_REASON} [root@2026-10-11T22:14:03]",
     # GPUs not accounted as TRES on this node: allocation is unknowable.
@@ -269,7 +269,7 @@ CANNED_NODE_DETAILS = "\n".join([
     "AllocMem=131072 FreeMem=350000 State=MIXED Partitions=calder-gpu-lovelace "
     "CfgTRES=cpu=64,mem=512000M,billing=64 AllocTRES=cpu=16,mem=128G CurrentWatts=0 AveWatts=0",
     "NodeName=calder-cpu001 Arch=x86_64 CPUAlloc=100 CPUTot=128 CPULoad=99.12 RealMemory=772480 "
-    "AllocMem=614400 FreeMem=120000 State=MIXED Partitions=calder-cpu-turin,nodes "
+    "AllocMem=614400 FreeMem=120000 State=MIXED Partitions=cpu_turin,nodes "
     "CfgTRES=cpu=128,mem=772480M,billing=128 AllocTRES=cpu=100,mem=600G CurrentWatts=0 AveWatts=0",
 ])
 CANNED_STORAGE = "\n".join([
@@ -568,19 +568,32 @@ class RemoteInfoTests(unittest.TestCase):
 class PartitionAndNodeTests(unittest.TestCase):
     def test_partitions(self):
         partitions = hs.parse_partitions(
-            "calder-cpu-turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00\n"
-            "calder-gpu-hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00\n"
+            "cpu_turin*|up|98|mix|(null)|128|772480|(null)|2-00:00:00\n"
+            "gpu_hopper|up|7|mix|gpu:nvidia_h200:8(S:0-1)|128|1546664|(null)|2-00:00:00\n"
             "nodes|up|52|mix|(null)|168|768000|(null)|infinite\n"
             "legacy|up|1|idle|(null)|8|1000|none\n"
         )
         self.assertEqual(len(partitions), 4)
         cpu, gpu, aire_nodes, legacy = partitions
-        self.assertEqual(cpu.partition, "calder-cpu-turin")
+        self.assertEqual(cpu.partition, "cpu_turin")
+        # sinfo's '*' leaves the name and becomes the default mark.
+        self.assertEqual([p.is_default for p in partitions], [True, False, False, False])
         self.assertEqual((cpu.time_limit, gpu.time_limit), ("2-00:00:00", "2-00:00:00"))
         self.assertEqual(aire_nodes.time_limit, "infinite")
         self.assertEqual((hs.parse_gres_gpu_total(gpu.gres), gpu.memory_mb_per_node), (8, 1546664))
         self.assertIsNone(legacy.time_limit)
         self.assertEqual(legacy.features, "none")
+
+    def test_default_partition_marks_every_row(self):
+        # Calder since 2026-11-11: the drained AIRE-generation partition is
+        # the default, and sinfo stars each of its state rows.
+        partitions = hs.parse_partitions(
+            "cpu_genoa*|up|1|drain$|(null)|168|734374|nodegroup_cpu_genoa|2-00:00:00\n"
+            "cpu_genoa*|up|6|drain|(null)|168|734374|nodegroup_cpu_genoa|2-00:00:00\n"
+            "cpu_turin|up|83|idle|(null)|128|733895|nodegroup_cpu_turin|2-00:00:00\n"
+        )
+        self.assertEqual([(p.partition, p.is_default) for p in partitions],
+                         [("cpu_genoa", True), ("cpu_genoa", True), ("cpu_turin", False)])
 
     def test_unreadable_lines_are_reported(self):
         rejects = []
@@ -593,7 +606,7 @@ class PartitionAndNodeTests(unittest.TestCase):
         self.assertEqual((nodes[0].gpu_total, nodes[0].gpu_allocated, nodes[0].gpu_idle), (3, None, None))
 
     def test_h200_reason(self):
-        nodes = hs.parse_nodes("calder-h200-05|calder-gpu-hopper|idle+drain|0/128/0/128|1546664|"
+        nodes = hs.parse_nodes("calder-h200-05|gpu_hopper|idle+drain|0/128/0/128|1546664|"
                                "gpu:nvidia_h200:8(S:0-1)|(null)|Kill task failed")
         self.assertEqual((nodes[0].gpu_total, nodes[0].reason), (8, "Kill task failed"))
 
@@ -613,7 +626,7 @@ class PartitionAndNodeTests(unittest.TestCase):
         self.assertEqual((idle.gpu_total, idle.gpu_allocated, idle.gpu_idle), (8, 0, 8))
         self.assertEqual((drained.gpu_allocated, drained.reason), (0, NHC_REASON))
         self.assertEqual((l40.gpu_total, l40.gpu_allocated, l40.gpu_idle), (4, None, None))
-        self.assertEqual(nodes["calder-cpu001"].partitions, ["calder-cpu-turin", "nodes"])
+        self.assertEqual(nodes["calder-cpu001"].partitions, ["cpu_turin", "nodes"])
         self.assertEqual((busy.memory_free_mb, busy.cpu_load, busy.current_watts), (401234, 63.2, 2310))
 
 
@@ -1185,7 +1198,8 @@ class AssembleTests(unittest.TestCase):
         self.assertEqual(keys[0], "schema_version")
         self.assertEqual(payload["schema_version"], hs.SCHEMA_VERSION)
         self.assertEqual(keys[1:], ["collected_at", "cluster", "remote", "jobs", "partitions", "nodes", "storage",
-                                    "errors", "warnings", "storage_skipped", "started_at", "duration_ms", "timings"])
+                                    "errors", "warnings", "storage_skipped", "started_at", "duration_ms", "timings",
+                                    "job_usage"])
         job_keys = list(payload["jobs"][0])
         self.assertEqual(job_keys[-4:], ["array_job_id", "array_pending_tasks", "array_throttle",
                                          "pending_task_count"])
@@ -1650,7 +1664,7 @@ class CollectorStubSSHTests(unittest.TestCase):
 
     def test_non_utf8_bytes(self):
         output = round_trip_output(jobs_json_status=1, pipe_jobs=(
-            f"777|calder-cpu-turin|caf@E9@-run|{USER}|RUNNING|0:10|2-00:00:00|1|calder-c001"))
+            f"777|cpu_turin|caf@E9@-run|{USER}|RUNNING|0:10|2-00:00:00|1|calder-c001"))
         stub = self.make_stub("ssh-latin1", output.encode("utf-8").replace(b"@E9@", b"\xe9"))
         snapshot = hs.collect_snapshot(self.config(stub, 10), CALDER, calder_volumes())
         self.assertEqual(snapshot.errors, [])
@@ -1847,6 +1861,191 @@ class ContractFixtureTests(unittest.TestCase):
         self.assertEqual([row["label"] for row in payload["storage"]], ["Home", "Scratch"])
         # Dates are rendered in UTC for the fixture, whatever the host's TZ.
         self.assertEqual(jobs["40188"]["start_time"], "2026-10-12T08:34:50")
+
+
+class JobUsageParsingTests(unittest.TestCase):
+    def test_hostlists_and_indices(self):
+        self.assertEqual(hs.expand_hostlist("calder-h200-[01-03,07]"),
+                         ["calder-h200-01", "calder-h200-02", "calder-h200-03", "calder-h200-07"])
+        self.assertEqual(hs.expand_hostlist("gpu001,cpu[9-10]"), ["gpu001", "cpu9", "cpu10"])
+        self.assertEqual(hs.parse_index_list("0-3,8,x,10-11"), [0, 1, 2, 3, 8, 10, 11])
+
+    def test_allocation_line(self):
+        allocation = hs.parse_job_allocation(
+            "Nodes=calder-h200-[01-02] CPU_IDs=0-31,64-95 Mem=256000 GRES=gpu:nvidia_h200:4(IDX:0-3)")
+        self.assertEqual(allocation, {"nodes": ["calder-h200-01", "calder-h200-02"], "cpus": 64,
+                                      "memory_mb": 256000, "gpu_indices": [0, 1, 2, 3]})
+        self.assertEqual(hs.parse_job_allocation("Nodes=cpu1 CPU_IDs=4 Mem=1000 GRES=")["gpu_indices"], [])
+
+    def test_gpu_rows(self):
+        row = hs.parse_gpu_usage_line("2, NVIDIA H200, 97, 41, 70123, 143771, 655.30, 700.00, 61")
+        self.assertEqual((row.index, row.name, row.utilization_percent, row.memory_used_mb, row.power_watts),
+                         (2, "NVIDIA H200", 97.0, 70123.0, 655.3))
+        self.assertIsNone(hs.parse_gpu_usage_line("0, NVIDIA L40S, [N/A], 0, 1, 2, [Not Supported], 3, 4")
+                          .utilization_percent)
+        self.assertIsNone(hs.parse_gpu_usage_line("No devices were found"))
+
+    def test_section(self):
+        text = "\n".join([
+            "job|500|500|gpu01",
+            "detail|500|Nodes=gpu01 CPU_IDs=0-7 Mem=64000 GRES=gpu:h200:2(IDX:0-1)",
+            "on|gpu01|500",
+            "job|501|77_3|gpu01",
+            "detail|501|Nodes=gpu01 CPU_IDs=8-15 Mem=64000 GRES=gpu:h200:2(IDX:2-3)",
+            "on|gpu01|501",
+            "job|502|502|gone01",
+            "on|gone01|502",
+            "job|503|503|slow01",
+            "on|slow01|503",
+            "node|gpu01|t|0|1000.0",
+            "node|gpu01|cg|0|500|1000000|0|0|0|max",
+            "node|gpu01|cg|0|501|5000000|0|0|0|max",
+            "node|gpu01|self|0::/system.slice/slurmstepd.scope/job_500/step_extern/user/task_special",
+            "node|gpu01|gpu|0, NVIDIA H200, 97, 40, 70000, 143771, 650, 700, 60",
+            "node|gpu01|gpu|1, NVIDIA H200, 12, 3, 9000, 143771, 120, 700, 41",
+            "node|gpu01|t|1|1001.0",
+            "node|gpu01|cg|1|500|7000000|2147483648|4294967296|5368709120|68719476736",
+            "node|gpu01|cg|1|501|5100000|1048576|1048576|1048576|max",
+            "node|gpu01|rc|0",
+            "node|gone01|Access denied: user alice (uid=1) has no active jobs on this node.",
+            "node|gone01|rc|255",
+            "node|slow01|rc|124",
+        ])
+        usage = {(row.job_id, row.node): row for row in hs.parse_job_usage(text)}
+        first = usage[("500", "gpu01")]
+        self.assertEqual(first.cpus_allocated, 8)
+        self.assertEqual(first.cpus_busy, 6.0)
+        self.assertEqual((first.memory_used_mb, first.memory_charged_mb, first.memory_peak_mb, first.memory_limit_mb),
+                         (2048.0, 4096.0, 5120.0, 65536.0))
+        self.assertEqual([gpu.index for gpu in first.gpus], [0, 1])
+        self.assertIsNone(first.note)
+        second = usage[("501", "gpu01")]
+        self.assertEqual(second.display_id, "77_3")
+        self.assertEqual(second.cpus_busy, 0.1)
+        self.assertEqual(second.memory_limit_mb, 64000.0)
+        self.assertEqual(second.gpus, [])
+        self.assertIn("come from your job 500", second.note)
+        self.assertIn("ended before", usage[("502", "gone01")].note)
+        self.assertIn("in time", usage[("503", "slow01")].note)
+
+    def test_not_requested_means_not_sampled(self):
+        snapshot = assemble(round_trip_output())
+        self.assertIsNone(snapshot.job_usage)
+        self.assertFalse(any("job_usage" in warning for warning in snapshot.warnings))
+
+
+@unittest.skipUnless(os.path.exists("/bin/sh") and shutil.which("awk"), "needs /bin/sh and awk")
+class JobUsageScriptTests(unittest.TestCase):
+    """The job_usage section run for real, in every available shell, with
+    stub squeue/scontrol/ssh/nvidia-smi/date/sleep and fake cgroup files.
+    The ssh stub runs the probe locally as if on the named node."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="hpc-usage-test.")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        root = hs.shell_single_quote(self.root)
+        _write_stub(self.bin, "squeue", 'printf "500|500|gpu01\\n501|77_3|cpu[01-02]\\n502|502|gone01\\n"\n')
+        _write_stub(self.bin, "scontrol", (
+            'if [ "$1" = show ] && [ "$2" = hostnames ]; then\n'
+            '  case "$3" in "cpu[01-02]") printf "cpu01\\ncpu02\\n" ;; *) printf "%s\\n" "$3" ;; esac; exit 0\n'
+            'fi\n'
+            'case "$4" in\n'
+            '500) printf "JobId=500 JobName=train\\n   Nodes=gpu01 CPU_IDs=0-3 Mem=8000 GRES=gpu:h200:2(IDX:0-1)\\n" ;;\n'
+            '501) printf "JobId=501\\n   Nodes=cpu[01-02] CPU_IDs=0-1 Mem=2000 GRES=\\n" ;;\n'
+            '502) printf "JobId=502\\n   Nodes=gone01 CPU_IDs=0 Mem=100 GRES=\\n" ;;\n'
+            'esac\n'
+        ))
+        _write_stub(self.bin, "timeout", 'shift\nexec "$@"\n')
+        _write_stub(self.bin, "ssh", (
+            'while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -T|-x) shift ;; *) break ;; esac; done\n'
+            'host=$1; shift\n'
+            'if [ "$host" = gone01 ]; then echo "Access denied: user alice (uid=1) has no active jobs on this node." >&2; exit 1; fi\n'
+            'HPC_TEST_NODE=$host; HPC_CGROUP_ROOT=' + root + '/cg/$host; HPC_SELF_CGROUP=' + root + '/cg/$host/self\n'
+            'export HPC_TEST_NODE HPC_CGROUP_ROOT HPC_SELF_CGROUP\n'
+            'exec "$@"\n'
+        ))
+        # Each node's clock: date prints it, sleep advances it by one second
+        # and charges the jobs' cgroups 2 s (gpu01) or 0.5 s (cpu nodes) of CPU.
+        _write_stub(self.bin, "date", 'cat "$HPC_CGROUP_ROOT/clock" 2>/dev/null || echo 1000.0\n')
+        _write_stub(self.bin, "sleep", (
+            '[ -n "${HPC_CGROUP_ROOT:-}" ] || exit 0\n'
+            'echo 1001.0 > "$HPC_CGROUP_ROOT/clock"\n'
+            'for f in "$HPC_CGROUP_ROOT"/system.slice/slurmstepd.scope/job_*/cpu.stat; do\n'
+            '  read -r key value < "$f"; printf "usage_usec %s\\n" $((value + $(cat "$HPC_CGROUP_ROOT/charge"))) > "$f"\n'
+            'done\n'
+        ))
+        _write_stub(self.bin, "nvidia-smi", (
+            'case "$HPC_TEST_NODE" in\n'
+            'gpu01) printf "0, NVIDIA H200, 95, 40, 70000, 143771, 650.5, 700.0, 60\\n1, NVIDIA H200, 15, 2, 4000, 143771, 120.0, 700.0, 40\\n" ;;\n'
+            '*) echo "NVIDIA-SMI has failed because it couldn\'t communicate with the NVIDIA driver."; exit 9 ;;\n'
+            'esac\n'
+        ))
+        self.env = {"PATH": self.bin + os.pathsep + "/usr/bin:/bin", "USER": "alice", "HOME": self.root,
+                    "LC_ALL": "C"}
+        for node, jobs, charge in (("gpu01", ["500"], 2000000), ("cpu01", ["501"], 500000), ("cpu02", ["501"], 500000)):
+            base = os.path.join(self.root, "cg", node)
+            for job in jobs:
+                directory = os.path.join(base, "system.slice", "slurmstepd.scope", "job_" + job)
+                os.makedirs(directory)
+                for name, content in (("cpu.stat", "usage_usec 1000000\n"),
+                                      ("memory.stat", "anon 1073741824\nfile 5\n"),
+                                      ("memory.current", "2147483648\n"), ("memory.peak", "3221225472\n"),
+                                      ("memory.max", "max\n")):
+                    with open(os.path.join(directory, name), "w") as handle:
+                        handle.write(content)
+            with open(os.path.join(base, "charge"), "w") as handle:
+                handle.write(str(charge))
+            with open(os.path.join(base, "clock"), "w") as handle:
+                handle.write("1000.0\n")
+            with open(os.path.join(base, "self"), "w") as handle:
+                handle.write("0::/system.slice/slurmstepd.scope/job_%s/step_extern/user/task_special\n" % jobs[0])
+
+    def reset_clocks(self):
+        for node in ("gpu01", "cpu01", "cpu02"):
+            base = os.path.join(self.root, "cg", node)
+            with open(os.path.join(base, "clock"), "w") as handle:
+                handle.write("1000.0\n")
+            for job in os.listdir(os.path.join(base, "system.slice", "slurmstepd.scope")):
+                with open(os.path.join(base, "system.slice", "slurmstepd.scope", job, "cpu.stat"), "w") as handle:
+                    handle.write("usage_usec 1000000\n")
+
+    def test_section_in_every_shell(self):
+        script = hs.build_remote_script([], include_storage=False, include_job_usage=True)
+        for shell in available_shells():
+            with self.subTest(shell=shell):
+                self.reset_clocks()
+                completed = subprocess.run([shell, "-c", script], check=False, capture_output=True, text=True,
+                                           env=self.env, cwd=self.root, stdin=subprocess.DEVNULL, timeout=60)
+                sections, statuses = hs.split_sections(completed.stdout)
+                self.assertEqual(statuses.get("job_usage"), 0, completed.stdout + completed.stderr)
+                usage = {(row.job_id, row.node): row for row in hs.parse_job_usage(sections["job_usage"])}
+                self.assertEqual(sorted(usage), [("500", "gpu01"), ("501", "cpu01"), ("501", "cpu02"),
+                                                 ("502", "gone01")])
+                gpu = usage[("500", "gpu01")]
+                self.assertEqual((gpu.cpus_allocated, gpu.cpus_busy), (4, 2.0))
+                self.assertEqual((gpu.memory_used_mb, gpu.memory_charged_mb, gpu.memory_peak_mb, gpu.memory_limit_mb),
+                                 (1024.0, 2048.0, 3072.0, 8000.0))
+                self.assertEqual([(g.index, g.utilization_percent) for g in gpu.gpus], [(0, 95.0), (1, 15.0)])
+                self.assertIsNone(gpu.note)
+                cpu = usage[("501", "cpu02")]
+                self.assertEqual((cpu.display_id, cpu.cpus_busy, cpu.gpus, cpu.note), ("77_3", 0.5, [], None))
+                self.assertIn("ended before", usage[("502", "gone01")].note)
+
+    def test_snapshot_carries_usage_only_when_asked(self):
+        script = hs.build_remote_script([], include_storage=False, include_job_usage=True)
+        completed = subprocess.run(["/bin/sh", "-c", script], check=False, capture_output=True, text=True,
+                                   env=self.env, cwd=self.root, stdin=subprocess.DEVNULL, timeout=60)
+        config = calder_config(username="alice")
+        asked = hs.assemble_snapshot(config, CALDER, [], "now", completed.stdout, None, False,
+                                     skip_storage=True, job_usage=True)
+        self.assertEqual(len(asked.job_usage), 4)
+        payload = json.loads(json.dumps(hs.snapshot_payload(asked)))
+        self.assertEqual(payload["job_usage"][0]["gpus"][0]["name"], "NVIDIA H200")
+        not_asked = hs.assemble_snapshot(config, CALDER, [], "now", completed.stdout, None, False,
+                                         skip_storage=True, job_usage=False)
+        self.assertIsNone(not_asked.job_usage)
 
 
 def main(argv=None):

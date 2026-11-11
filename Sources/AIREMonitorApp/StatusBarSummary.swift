@@ -1,20 +1,44 @@
 import HPCCore
 import AppKit
 
+/// What the status item shows next to its glyph ("Show in Menu Bar").
+enum StatusTitleMode: String, Codable, CaseIterable, Equatable {
+    /// "7 running", or just the glyph while nothing runs. The app's own
+    /// word, as in "2 running · 61 pending".
+    case runningJobs
+    /// Idle GPUs per live cluster: "A 4 · C 16+".
+    case idleGPUs
+    /// The glyph alone.
+    case iconOnly
+
+    var menuTitle: String {
+        switch self {
+        case .runningJobs: return "Running Jobs"
+        case .idleGPUs: return "Idle GPUs"
+        case .iconOnly: return "Icon Only"
+        }
+    }
+}
+
 /// Geometry of the menu-bar status item, shared by the controller (which
-/// sizes the item) and `StatusBarSummary` (which fits the title into it).
+/// sizes the item) and `StatusBarSummary` (which picks the width).
 enum StatusItemLayout {
-    static let iconWidth: CGFloat = 20
-    static let padding: CGFloat = 16
-    static let minLength: CGFloat = 56
-    /// The cap keeps the item from crowding other menu extras (on a notched
+    static let iconWidth: CGFloat = 18
+    /// Between the glyph and the title.
+    static let gap: CGFloat = 4
+    /// Left and right insets together.
+    static let padding: CGFloat = 10
+    /// The caps keep the item from crowding other menu extras (on a notched
     /// display, items that do not fit simply disappear).
-    static let maxLength: CGFloat = 160
+    static let maxRunningLength: CGFloat = 104
+    static let maxGPULength: CGFloat = 130
 
-    /// Room for the title once the icon and padding are reserved.
-    static var maxTextWidth: CGFloat { maxLength - iconWidth - padding }
-
-    @MainActor static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+    /// The menu bar's own size, at the clock's weight, with digits of one
+    /// width so a changing count never shifts the text.
+    @MainActor static let font = NSFont.monospacedDigitSystemFont(
+        ofSize: NSFont.menuBarFont(ofSize: 0).pointSize,
+        weight: .regular
+    )
 
     /// Rendered width of `text` in the status item's font.
     @MainActor
@@ -23,276 +47,142 @@ enum StatusItemLayout {
     }
 }
 
+/// The width the item reserves. It changes only when the class changes —
+/// jobs appear or all end, 100 is crossed, the live clusters change in GPU
+/// mode, or the user picks another mode — never on a refresh tick.
+enum StatusWidthClass: Equatable {
+    case glyph
+    /// Room for "88 running" (1–99) or "888 running".
+    case running(digits: Int)
+    /// Room for the digit-stable GPU template, e.g. "A 88 · C 88+".
+    case gpus(template: String)
+}
+
 /// What the status item shows, derived from the shared menu bar digest.
 ///
-/// Job counts, elapsed times and idle GPUs come from LIVE clusters only. A
-/// cached or paused snapshot (after a VPN drop, a sleep, a master expiry, or
-/// at launch before the first probe) may describe jobs that ended hours
-/// ago, so it never feeds the title; it is named, with its time, in the
-/// tooltip instead. The same goes for a live cluster whose Slurm is not
-/// answering (`MenuBarClusterDigest.isDegraded`): its job list is only
-/// carried forward from the last good refresh.
+/// Job counts and idle GPUs come from LIVE clusters only. A cached or paused
+/// snapshot (after a VPN drop, a sleep, a master expiry, or at launch before
+/// the first probe) may describe jobs that ended hours ago, so it never
+/// feeds the title; the tooltip names it with its time. The same goes for a
+/// live cluster whose Slurm is not answering (`isDegraded`).
 @MainActor
 struct StatusBarSummary {
     typealias Measure = @MainActor (String) -> CGFloat
 
     let digest: MenuBarDigest
-    let mode: Mode
+    let mode: StatusTitleMode
+    /// "" when the item shows its glyph alone.
     let title: String
-    /// `title` with every changing digit replaced by a fixed-width
-    /// placeholder, so the reserved width only changes when the job or the
-    /// cluster set changes — not on every refresh.
-    let widthTemplateTitle: String
+    /// `title` padded with figure spaces (U+2007, as wide as a digit) to its
+    /// width class's template. The status bar button centres its glyph and
+    /// title together, so an unpadded "7 running" in a slot sized for "88
+    /// running" would move the glyph whenever the digit count changes.
+    let displayTitle: String
+    let widthClass: StatusWidthClass
     private let measure: Measure
 
-    enum Mode {
-        /// Exactly one running job across all live clusters.
-        case singleJob(cluster: MenuBarClusterDigest, job: Job)
-        /// Several running jobs (on one or more live clusters).
-        case multipleJobs(count: Int)
-        /// No running jobs: idle GPUs of each live cluster with GPU nodes.
-        case idleGPUs([MenuBarClusterDigest])
-        case idle(IdleState)
-    }
-
-    enum IdleState: Equatable {
-        case off
-        case signingIn
-        case checking
-        case syncing
-        case ready
-        /// Connected, but Slurm is not answering, so nothing is current.
-        case slurmError
-        case paused
-        case cached
-        case offline
-
-        var title: String {
-            switch self {
-            case .off: return "Off"
-            case .signingIn: return "Signing in"
-            case .checking: return "Checking"
-            case .syncing: return "Syncing"
-            case .ready: return "Ready"
-            case .slurmError: return "Slurm error"
-            case .paused: return "Paused"
-            case .cached: return "Cached"
-            case .offline: return "Offline"
-            }
-        }
-    }
-
-    init(digest: MenuBarDigest, measure: @escaping Measure = StatusItemLayout.textWidth) {
+    init(digest: MenuBarDigest, mode: StatusTitleMode = .runningJobs, measure: @escaping Measure = StatusItemLayout.textWidth) {
         self.digest = digest
-        self.measure = measure
-        let live = digest.live
-        let running = digest.runningCount
-        let mode: Mode
-        if running == 1, let primary = digest.primaryRunningJob {
-            mode = .singleJob(cluster: primary.cluster, job: primary.job)
-        } else if running > 1 {
-            mode = .multipleJobs(count: running)
-        } else {
-            let withGPUs = live.filter { !$0.gpuPools.isEmpty }
-            mode = withGPUs.isEmpty ? .idle(Self.idleState(for: digest)) : .idleGPUs(withGPUs)
-        }
         self.mode = mode
-
+        self.measure = measure
         switch mode {
-        case .singleJob(let cluster, let job):
-            let titles = Self.singleJobTitles(cluster: cluster, job: job, measure: measure)
-            title = titles.title
-            widthTemplateTitle = titles.template
-        case .multipleJobs(let count):
-            title = "\(count) jobs"
-            widthTemplateTitle = title
-        case .idleGPUs(let clusters):
-            title = clusters.map { Self.idleGPUText($0, template: false) }.joined(separator: " · ")
-            widthTemplateTitle = clusters.map { Self.idleGPUText($0, template: true) }.joined(separator: " · ")
-        case .idle(let state):
-            title = state.title
-            widthTemplateTitle = title
+        case .runningJobs:
+            let running = digest.runningCount
+            if running > 0 {
+                let digits = running >= 100 ? 3 : 2
+                title = "\(running) running"
+                displayTitle = title + String(repeating: Self.figureSpace, count: max(0, digits - String(running).count))
+                widthClass = .running(digits: digits)
+            } else {
+                title = ""
+                displayTitle = ""
+                widthClass = .glyph
+            }
+        case .idleGPUs:
+            let clusters = digest.live.filter { !$0.gpuPools.isEmpty }
+            if clusters.isEmpty {
+                title = ""
+                displayTitle = ""
+                widthClass = .glyph
+            } else {
+                title = clusters.map { Self.idleGPUText($0, template: false) }.joined(separator: " · ")
+                displayTitle = clusters.map { Self.idleGPUText($0, template: false, padded: true) }.joined(separator: " · ")
+                widthClass = .gpus(template: clusters.map { Self.idleGPUText($0, template: true) }.joined(separator: " · "))
+            }
+        case .iconOnly:
+            title = ""
+            displayTitle = ""
+            widthClass = .glyph
         }
     }
 
-    /// What to say when no live cluster has jobs or GPUs, most pressing
-    /// first.
-    private static func idleState(for digest: MenuBarDigest) -> IdleState {
-        let phases = digest.enabled.map(\.status.phase)
-        if phases.isEmpty {
-            return .off
-        }
-        if phases.contains(where: { $0 == .signingIn || $0 == .queued }) {
-            return .signingIn
-        }
-        if phases.contains(.checking) {
-            return .checking
-        }
-        if phases.contains(.loadingFirstSnapshot) {
-            return .syncing
-        }
-        if digest.enabled.contains(where: \.hasCurrentFigures) {
-            return .ready
-        }
-        if digest.enabled.contains(where: \.isDegraded) {
-            return .slurmError
-        }
-        if phases.contains(.stale) {
-            return .cached
-        }
-        if phases.contains(.paused) {
-            return .paused
-        }
-        return .offline
-    }
+    /// Nothing is live with Slurm answering: the glyph dims.
+    var isDimmed: Bool { digest.isDimmed }
 
-    // MARK: Title pieces
+    /// Something only the user can fix: the glyph carries a "!" badge.
+    var hasAttention: Bool { !digest.attention.isEmpty }
 
-    /// "A · c2-mi…sync 9h 29m". The name is fitted by measured width with
-    /// middle truncation, so the monogram and — above all — the elapsed
-    /// time, the part that changes, are never cut off by the item's cap.
-    private static func singleJobTitles(
-        cluster: MenuBarClusterDigest,
-        job: Job,
-        measure: Measure
-    ) -> (title: String, template: String) {
-        let monogram = cluster.profile.monogram
-        let prefix = "\(monogram) · "
-        let elapsed = StatusElapsedText.compact(job.elapsed)
-        let suffix = elapsed.map { " \($0)" } ?? ""
-        let suffixTemplate = elapsed.map { " \(digitTemplate($0))" } ?? ""
-        let budget = StatusItemLayout.maxTextWidth - measure(prefix) - measure(suffixTemplate)
-        let name = middleTruncated(jobTitleName(job), toFit: budget, measure: measure)
-        guard !name.isEmpty else {
-            // Not even "a…" fits: keep what matters, cluster and time.
-            return ("\(monogram)\(suffix)", "\(monogram)\(suffixTemplate)")
+    /// The item's length: the system's square for the glyph alone, else the
+    /// glyph, a gap and the class's template text within the cap.
+    func reservedLength() -> CGFloat {
+        let base = StatusItemLayout.iconWidth + StatusItemLayout.gap + StatusItemLayout.padding
+        switch widthClass {
+        case .glyph:
+            return NSStatusItem.squareLength
+        case .running(let digits):
+            let template = String(repeating: "8", count: digits) + " running"
+            return min(base + measure(template), StatusItemLayout.maxRunningLength)
+        case .gpus(let template):
+            return min(base + measure(template), StatusItemLayout.maxGPULength)
         }
-        return (prefix + name + suffix, prefix + name + suffixTemplate)
     }
 
     /// "A 1" — the cluster's primary (largest) GPU pool, with "+" when
     /// another model also has idle GPUs. Models are never added together;
-    /// the tooltip and the dropdown list every pool. The count is the
-    /// pool's `idleFigure`: "A ?" while nothing is known idle only because
-    /// node details are missing, as on the overview tile and the header
-    /// chip — "A 0" would claim a full pool. A pool of unknown allocation
-    /// is not one with idle GPUs, so it never earns the "+".
-    private static func idleGPUText(_ cluster: MenuBarClusterDigest, template: Bool) -> String {
+    /// the tooltip and the menu list every pool. The count is the pool's
+    /// `idleFigure`: "A ?" while nothing is known idle only because node
+    /// details are missing, as on the overview tile and the header chip —
+    /// "A 0" would claim a full pool. A pool of unknown allocation is not
+    /// one with idle GPUs, so it never earns the "+".
+    ///
+    /// The template reserves a "+" whenever the cluster has another model at
+    /// all, so a second pool's idle count crossing zero never resizes the
+    /// item; `padded` fills the visible title out to that template with
+    /// figure spaces.
+    private static func idleGPUText(_ cluster: MenuBarClusterDigest, template: Bool, padded: Bool = false) -> String {
         guard let primary = cluster.primaryGPUPool else {
             return cluster.profile.monogram
         }
         let othersIdle = cluster.gpuPools.dropFirst().contains { $0.pool.idle > 0 }
+        let canHavePlus = cluster.gpuPools.count > 1
         let figure = primary.pool.idleFigure
-        let count = template
-            ? String(repeating: "8", count: max(figure.count, 2))
-            : figure
-        return "\(cluster.profile.monogram) \(count)\(othersIdle ? "+" : "")"
-    }
-
-    private static func jobTitleName(_ job: Job) -> String {
-        let name = job.name.menuTrimmed
-        // A runaway name cannot fit anyway; bound the fitting loop.
-        return String((name.isEmpty ? "job" : name).prefix(64))
-    }
-
-    private static func jobDisplayName(_ job: Job) -> String {
-        let name = job.name.menuTrimmed
-        return name.isEmpty ? "Job \(job.displayJobID)" : name
-    }
-
-    /// Shortens `text` by dropping characters from the middle ("c2-mi…sync")
-    /// until it fits `width`; "" when not even one character and the
-    /// ellipsis fit.
-    static func middleTruncated(_ text: String, toFit width: CGFloat, measure: Measure) -> String {
-        guard measure(text) > width else {
-            return text
+        if template {
+            let count = String(repeating: "8", count: max(figure.count, 2))
+            return "\(cluster.profile.monogram) \(count)\(canHavePlus ? "+" : "")"
         }
-        let characters = Array(text)
-        var keep = characters.count - 1
-        while keep > 0 {
-            let head = (keep + 1) / 2
-            let tail = keep - head
-            let candidate = String(characters.prefix(head)) + "…" + String(characters.suffix(tail))
-            if measure(candidate) <= width {
-                return candidate
-            }
-            keep -= 1
+        guard padded else {
+            return "\(cluster.profile.monogram) \(figure)\(othersIdle ? "+" : "")"
         }
-        return ""
+        let figurePad = String(repeating: figureSpace, count: max(0, 2 - figure.count))
+        let plus = othersIdle ? "+" : (canHavePlus ? figureSpace : "")
+        return "\(cluster.profile.monogram) \(figure)\(figurePad)\(plus)"
     }
 
-    private static func digitTemplate(_ text: String) -> String {
-        String(text.map { $0.isNumber ? "8" : $0 })
-    }
-
-    // MARK: Item appearance
-
-    /// Width to reserve for the item: icon, template title and padding,
-    /// within the layout's bounds.
-    func reservedLength(hasIcon: Bool) -> CGFloat {
-        let iconWidth = hasIcon ? StatusItemLayout.iconWidth : 0
-        let length = iconWidth + measure(widthTemplateTitle) + StatusItemLayout.padding
-        return min(max(length, StatusItemLayout.minLength), StatusItemLayout.maxLength)
-    }
-
-    var iconName: String {
-        switch mode {
-        case .singleJob, .multipleJobs:
-            return "play.circle.fill"
-        case .idleGPUs:
-            return "bolt.horizontal.circle.fill"
-        case .idle(.off):
-            return "pause.circle"
-        case .idle(.paused):
-            return "pause.circle.fill"
-        case .idle(.signingIn), .idle(.checking), .idle(.syncing):
-            return "arrow.triangle.2.circlepath"
-        case .idle(.ready):
-            return "server.rack"
-        case .idle(.slurmError):
-            return "exclamationmark.triangle"
-        case .idle(.cached):
-            return "clock.arrow.circlepath"
-        case .idle(.offline):
-            return "wifi.slash"
-        }
-    }
-
-    /// Combined connection health: green when every enabled cluster is
-    /// live, orange while only some are (or a check, sign-in or first
-    /// collection runs), red when nothing is live or shown and a cluster
-    /// reports an error, dimmed when only cached figures exist or simply
-    /// offline. nil (template image) when monitoring is off everywhere, so
-    /// the icon blends in.
-    var tint: NSColor? {
-        switch digest.health {
-        case .off: return nil
-        case .allLive: return .systemGreen
-        case .partial, .connecting: return .systemOrange
-        case .failing: return .systemRed
-        case .stale, .offline: return .secondaryLabelColor
-        }
-    }
-
-    var image: NSImage? {
-        let base = NSImage(systemSymbolName: iconName, accessibilityDescription: "Leeds HPC Monitor status")
-        var configuration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
-        if let tint {
-            configuration = configuration.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-        }
-        let image = base?.withSymbolConfiguration(configuration)
-        image?.isTemplate = tint == nil
-        return image
-    }
+    /// U+2007 FIGURE SPACE: as wide as a digit in a monospaced-digit font.
+    static let figureSpace = "\u{2007}"
 
     // MARK: Tooltip and accessibility
 
-    /// One block per cluster, then the shared home quota once. Deliberately
-    /// free of relative ages: those would change the signature every second
-    /// and defeat the redraw skipping. Figures that are not live carry the
-    /// clock time they were collected at.
+    /// The headline, what needs a look, then one block per cluster and the
+    /// shared home when it is under pressure. Deliberately free of relative
+    /// ages: those would change the signature every minute and defeat the
+    /// redraw skipping. Figures that are not live carry the clock time they
+    /// were collected at.
     var tooltip: String {
         var lines = [headline]
+        for item in digest.attention {
+            lines.append("Needs a look: \(item.text)")
+        }
         for cluster in digest.clusters {
             lines.append("\(cluster.displayName) — \(cluster.connectionText)")
             if let signIn = cluster.signInText {
@@ -311,53 +201,65 @@ struct StatusBarSummary {
                 lines.append("  " + pressure.joined(separator: ", "))
             }
         }
-        if let home = digest.sharedHome, let pressure = home.row.pressureText {
+        if let home = digest.sharedHome, home.row.tone >= .warning, home.row.tone != .unavailable,
+           let pressure = home.row.pressureText {
             lines.append("\(pressure) (\(home.sharedByText), counted once)")
         }
         return lines.joined(separator: "\n")
     }
 
-    var accessibilityLabel: String {
-        switch mode {
-        case .singleJob(let cluster, let job):
-            return "\(Self.jobDisplayName(job)) running on \(cluster.displayName) for \(StatusElapsedText.spoken(job.elapsed))"
-        case .multipleJobs(let count):
-            return "\(count) running jobs: \(runningBreakdown)"
-        case .idleGPUs(let clusters):
-            let parts = clusters.map { cluster in
-                let pools = cluster.gpuPools.map(\.spokenIdleText)
-                return "\(cluster.displayName) \(pools.joined(separator: " and "))"
+    private var headline: String {
+        if mode == .idleGPUs, !title.isEmpty {
+            let parts = digest.live.filter { !$0.gpuPools.isEmpty }.map { cluster in
+                let pools = cluster.gpuPools.map { "\($0.pool.idleFigure) of \($0.pool.total) \($0.pool.label)" }
+                return "\(cluster.displayName) \(pools.joined(separator: ", "))"
             }
-            return "Idle GPUs: \(parts.joined(separator: ", "))"
-        case .idle(let state):
-            return "Leeds HPC Monitor: \(state.title)"
+            return "Idle GPUs — \(parts.joined(separator: "; "))"
         }
+        let running = digest.runningCount
+        if running > 0 {
+            return "\(running) job\(running == 1 ? "" : "s") running — \(runningBreakdown)"
+        }
+        if digest.live.isEmpty {
+            return "Leeds HPC Monitor — \(digest.headerStatusLine)"
+        }
+        return "No jobs running — \(digest.headerStatusLine)"
     }
 
+    var accessibilityLabel: String {
+        var sentence: String
+        let running = digest.runningCount
+        if mode == .idleGPUs, !title.isEmpty {
+            let parts = digest.live.filter { !$0.gpuPools.isEmpty }.map { cluster in
+                "\(cluster.displayName) \(cluster.gpuPools.map(\.spokenIdleText).joined(separator: " and "))"
+            }
+            sentence = "idle GPUs: \(parts.joined(separator: ", "))"
+        } else if running > 0 {
+            sentence = "\(running) job\(running == 1 ? "" : "s") running, \(runningBreakdown)"
+        } else if let busy = digest.busyCluster {
+            sentence = busy.status.phase == .queued ? "waiting to sign in to \(busy.displayName)" : "signing in to \(busy.displayName)"
+        } else if !digest.live.isEmpty {
+            sentence = "\(digest.live.map(\.displayName).joined(separator: " and ")) live, no jobs running"
+        } else {
+            sentence = digest.headerStatusLine
+        }
+        if !digest.attention.isEmpty {
+            sentence += "; needs a look: " + digest.attention.map(\.text).joined(separator: "; ")
+        }
+        return "Leeds HPC Monitor: \(sentence)"
+    }
+
+    /// The button is touched only when this changes.
     var signature: String {
         [
-            title,
-            widthTemplateTitle,
-            iconName,
-            tint?.description ?? "template",
+            displayTitle,
+            "\(widthClass)",
+            mode.rawValue,
+            isDimmed ? "dim" : "lit",
+            digest.attention.map(\.id).joined(separator: ","),
             tooltip,
             accessibilityLabel
         ].joined(separator: "|")
-    }
-
-    private var headline: String {
-        switch mode {
-        case .singleJob(let cluster, let job):
-            return "\(Self.jobDisplayName(job)) on \(cluster.displayName) has been running for \(job.elapsed)"
-        case .multipleJobs(let count):
-            var text = "\(count) running jobs — \(runningBreakdown)"
-            if let primary = digest.primaryRunningJob {
-                text += " (latest: \(Self.jobDisplayName(primary.job)) on \(primary.cluster.displayName))"
-            }
-            return text
-        case .idleGPUs, .idle:
-            return "Leeds HPC Monitor — \(digest.headerStatusLine)"
-        }
     }
 
     /// "AIRE 1, Calder 2": running jobs per live cluster, never one bare sum.
@@ -369,10 +271,79 @@ struct StatusBarSummary {
     }
 }
 
-/// Elapsed time for the status item. squeue's "9:29:15" carries seconds the
-/// title cannot keep current (it changes only on each refresh) and costs
-/// width the job name needs, so the title uses a compact form: "45s",
-/// "23m", "9h 29m", "1d 04h".
+/// The status item's glyph: the app's rack emblem, monochrome in every
+/// state (a template image, so AppKit draws it for light and dark menu bars,
+/// the open state, Increase Contrast and Reduce Transparency), with a
+/// knocked-out "!" badge when something needs a look. Its shape never
+/// changes with the state.
+enum StatusItemGlyph {
+    static let size = NSSize(width: 18, height: 16)
+
+    @MainActor private static var cache: [Bool: NSImage] = [:]
+
+    @MainActor
+    static func image(attention: Bool) -> NSImage {
+        if let cached = cache[attention] {
+            return cached
+        }
+        let symbol = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Leeds HPC Monitor")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+        let badge = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 8, weight: .bold))
+        let image = NSImage(size: size, flipped: false) { rect in
+            if let symbol {
+                let symbolSize = symbol.size
+                let origin = NSPoint(
+                    x: ((rect.width - symbolSize.width) / 2).rounded(),
+                    y: ((rect.height - symbolSize.height) / 2).rounded()
+                )
+                symbol.draw(in: NSRect(origin: origin, size: symbolSize))
+            }
+            if attention, let badge, let context = NSGraphicsContext.current {
+                let spot = NSRect(x: rect.maxX - 10, y: rect.minY - 1, width: 10, height: 10)
+                context.compositingOperation = .destinationOut
+                NSBezierPath(ovalIn: spot).fill()
+                context.compositingOperation = .sourceOver
+                badge.draw(in: spot.insetBy(dx: 1, dy: 1))
+            }
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Leeds HPC Monitor"
+        cache[attention] = image
+        return image
+    }
+}
+
+/// Fitting text into a fixed width.
+enum TextFitting {
+    /// Shortens `text` by dropping characters from the middle ("c2-mi…sync")
+    /// until it fits `width`; "" when not even one character and the
+    /// ellipsis fit.
+    @MainActor
+    static func middleTruncated(_ text: String, toFit width: CGFloat, measure: (String) -> CGFloat) -> String {
+        guard measure(text) > width else {
+            return text
+        }
+        let characters = Array(text)
+        var keep = characters.count - 1
+        while keep > 0 {
+            let head = (keep + 1) / 2
+            let tail = keep - head
+            let candidate = String(characters.prefix(head)) + "…" + String(characters.suffix(tail))
+            if measure(candidate) <= width {
+                return candidate
+            }
+            keep -= 1
+        }
+        return ""
+    }
+}
+
+/// Elapsed times and limits for the menu bar. squeue's "9:29:15" carries
+/// seconds no menu keeps current (it changes only on each refresh), so the
+/// menu uses compact forms: "45s", "23m", "9h 29m", "1d 04h"; limits "4h",
+/// "12h", "2d", "30m".
 enum StatusElapsedText {
     static func compact(_ raw: String) -> String? {
         let trimmed = raw.menuTrimmed
@@ -392,6 +363,27 @@ enum StatusElapsedText {
             return "\(seconds / 3600)h " + String(format: "%02dm", seconds % 3600 / 60)
         }
         return "\(seconds / 86_400)d " + String(format: "%02dh", seconds % 86_400 / 3600)
+    }
+
+    /// A time limit in its largest whole unit ("4h", "2d", "30m", "1d 12h");
+    /// nil for UNLIMITED or anything unparseable, which then shows the
+    /// elapsed time alone.
+    static func compactLimit(_ raw: String) -> String? {
+        let trimmed = raw.menuTrimmed
+        guard !trimmed.isEmpty, trimmed.uppercased() != "UNLIMITED", trimmed.uppercased() != "INFINITE",
+              let seconds = slurmElapsedSeconds(trimmed), seconds > 0 else {
+            return nil
+        }
+        let days = seconds / 86_400
+        let hours = seconds % 86_400 / 3600
+        let minutes = seconds % 3600 / 60
+        if days > 0 {
+            return hours == 0 ? "\(days)d" : "\(days)d \(hours)h"
+        }
+        if hours > 0 {
+            return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+        }
+        return "\(minutes)m"
     }
 
     /// "1 h 30 min" for VoiceOver.

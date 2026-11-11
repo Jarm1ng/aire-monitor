@@ -80,6 +80,7 @@ struct TerminalSSHArgumentTests {
     @Test("Shell quoting")
     func quoting() {
         #expect(SSHTerminalCommand.shellQuote("it's") == #"'it'\''s'"#)
+        #expect(SSHTerminalCommand.shellWord("gpu_hopper") == "gpu_hopper")
         #expect(SSHTerminalCommand.shellWord("calder-gpu-hopper") == "calder-gpu-hopper")
         #expect(SSHTerminalCommand.shellWord("gpu; rm -rf ~") == "'gpu; rm -rf ~'")
     }
@@ -172,9 +173,52 @@ struct TerminalQuickCommandTests {
     func chipsFollowProfile() {
         let bare = TerminalQuickCommand.items(storage: [], gpuPartition: nil)
         #expect(bare.map(\.title) == ["My jobs", "Cluster", "htop"])
-        let gpu = TerminalQuickCommand.items(storage: [], gpuPartition: " calder-gpu-hopper ")
-        #expect(gpu.first { $0.title == "GPU nodes" }?.command == "sinfo -N -p calder-gpu-hopper")
+        let gpu = TerminalQuickCommand.items(storage: [], gpuPartition: " gpu_hopper ")
+        #expect(gpu.first { $0.title == "GPU nodes" }?.command == "sinfo -N -p gpu_hopper")
         #expect(gpu.first { $0.title == "htop" }?.opensDedicatedSession == true)
+    }
+
+    @Test("The GPU chip keeps the profile's partition while the cluster still has it")
+    func gpuChipKeepsProfilePartition() {
+        // Before the first snapshot nothing is known: the profile stands.
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: nil) == "gpu_hopper")
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: []) == "gpu_hopper")
+        // A bigger GPU partition elsewhere does not displace it.
+        let live = [
+            PartitionSummary(partition: "gpu_hopper", nodeCount: 1, state: "mix", gres: "gpu:nvidia_h200:8"),
+            PartitionSummary(partition: "gpu_big", nodeCount: 9, state: "idle", gres: "gpu:a100:4")
+        ]
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: live) == "gpu_hopper")
+        let items = TerminalQuickCommand.items(for: .calder, partitions: live)
+        #expect(items.first { $0.title == "GPU nodes" }?.command == "sinfo -N -p gpu_hopper")
+    }
+
+    @Test("After a rename the GPU chip follows the snapshot's biggest GPU partition")
+    func gpuChipFollowsRename() {
+        // Calder before 2026-11-11, seen through a profile that already
+        // expects the new names: the chip must not run sinfo -p gpu_hopper.
+        let renamed = [
+            PartitionSummary(partition: "calder-cpu-turin", nodeCount: 98, state: "idle", isDefault: true),
+            PartitionSummary(partition: "aire-gpu-lovelace", nodeCount: 1, state: "drain*", gres: "gpu:nvidia_l40:3"),
+            PartitionSummary(partition: "calder-gpu-hopper", nodeCount: 4, state: "mix", gres: "gpu:nvidia_h200:8(S:0-1)"),
+            PartitionSummary(partition: "calder-gpu-hopper", nodeCount: 3, state: "idle", gres: "gpu:nvidia_h200:8(S:0-1)")
+        ]
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: renamed) == "calder-gpu-hopper")
+        // Equal GPU counts: the first name wins, whatever the row order.
+        let tie = [
+            PartitionSummary(partition: "gpu_b", nodeCount: 2, gres: "gpu:2"),
+            PartitionSummary(partition: "gpu_a", nodeCount: 1, gres: "gpu:4")
+        ]
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: tie) == "gpu_a")
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: Array(tie.reversed())) == "gpu_a")
+    }
+
+    @Test("A snapshot without any GPU partition hides the GPU chip")
+    func gpuChipHiddenWithoutGPUs() {
+        let cpuOnly = [PartitionSummary(partition: "cpu_turin", nodeCount: 95, state: "idle")]
+        #expect(TerminalQuickCommand.gpuPartition(for: .calder, partitions: cpuOnly) == nil)
+        let items = TerminalQuickCommand.items(for: .calder, partitions: cpuOnly)
+        #expect(!items.contains { $0.title == "GPU nodes" })
     }
 
     @Test("Spec paths keep $USER/$HOME live and everything else literal", arguments: [
