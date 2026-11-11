@@ -44,8 +44,11 @@
 # from .runtime/, is asked to quit the normal way, so its own confirmation
 # protects running terminals and transfers; if it is still running after
 # HPC_INSTALL_QUIT_TIMEOUT seconds, the script stops (exit 3) unless --force
-# was given. A running copy is recognised by the executable the kernel runs
-# it from (device and inode, or the path word for word for a bundle replaced
+# was given. Once a copy has quit, its bundle stays in place for
+# HPC_INSTALL_QUIT_SETTLE seconds before anything moves or deletes it, since
+# macOS reads it right after the quit (see settle_after_quit). A running
+# copy is recognised by the executable the kernel runs it from (device and
+# inode, or the path word for word for a bundle replaced
 # since), so one started through a symbolic link (to the bundle, a folder or
 # the executable itself) or under another spelling of the path counts too,
 # while a process that only reads or maps the file does not. A copy running
@@ -68,6 +71,8 @@
 #   HPC_INSTALL_DIR           Install folder (created when missing).
 #   HPC_INSTALL_NO_OPEN       1: do not open the app afterwards.
 #   HPC_INSTALL_QUIT_TIMEOUT  Seconds a running copy gets to quit (default 120).
+#   HPC_INSTALL_QUIT_SETTLE   Seconds the bundle of a copy that quit stays in
+#                             place before it is moved or deleted (default 2).
 #   HPC_INSTALL_LOCK_TIMEOUT  Seconds to wait for another install of this
 #                             checkout (default 1500).
 #   HPC_INSTALL_DEFAULT_DIR   The default folder in place of /Applications
@@ -479,8 +484,23 @@ quit_running_copies() {
     exit "$EXIT_STILL_RUNNING"
 }
 
+# Leaves the bundles of the copies that just quit in place for
+# QUIT_SETTLE_SECONDS. When an app quits while processes it started still
+# run, loginwindow asks Background Task Management, which reads the
+# bundle's code signature, whether the app may go on running in the
+# background, and about a second later ends those processes if the answer
+# is no. A bundle that is not there counts as no. SSH sessions signed in
+# from inside the app (by an older release, or from a checkout in a
+# privacy-protected folder) are such processes: on 2026-11-11 an update
+# moved the old install aside within 40 ms of the quit, and both of its SSH
+# sessions ended.
+settle_after_quit() {
+    [[ "$QUIT_SETTLE_SECONDS" =~ ^0+$ ]] || sleep "$QUIT_SETTLE_SECONDS"
+}
+
 # quit_running_copies, remembering which of the given bundles had a copy
-# running, so the app can be opened again when a later step fails.
+# running, so the app can be opened again when a later step fails. Returns
+# once settle_after_quit has passed.
 stop_copies() {
     local bundle had=()
     for bundle in "$@"; do
@@ -490,6 +510,7 @@ stop_copies() {
     (( ${#had[@]} > 0 )) || return 0
     quit_running_copies "$@"
     STOPPED_BUNDLES+=("${had[@]}")
+    settle_after_quit
 }
 
 was_stopped() {
@@ -1076,6 +1097,8 @@ if [[ "${HPC_INSTALL_NO_OPEN:-}" == 1 ]]; then
 fi
 QUIT_TIMEOUT="${HPC_INSTALL_QUIT_TIMEOUT:-120}"
 [[ "$QUIT_TIMEOUT" =~ ^[0-9]+$ ]] || usage_error "HPC_INSTALL_QUIT_TIMEOUT must be a whole number of seconds, not '$QUIT_TIMEOUT'"
+QUIT_SETTLE_SECONDS="${HPC_INSTALL_QUIT_SETTLE:-2}"
+[[ "$QUIT_SETTLE_SECONDS" =~ ^[0-9]+$ ]] || usage_error "HPC_INSTALL_QUIT_SETTLE must be a whole number of seconds, not '$QUIT_SETTLE_SECONDS'"
 [[ "$LOCK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || usage_error "HPC_INSTALL_LOCK_TIMEOUT must be a whole number of seconds, not '$LOCK_TIMEOUT_SECONDS'"
 
 if [[ ! -d "$RUNTIME_DIR" ]]; then

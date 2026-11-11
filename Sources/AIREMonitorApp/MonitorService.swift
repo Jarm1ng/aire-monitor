@@ -1086,8 +1086,8 @@ struct MonitorService: Sendable {
     }
 
     /// Runs a login helper, the one kind of process that starts SSH masters,
-    /// as a launchd job, so the masters outlive the app even when it is
-    /// force-quit (see `DetachedHelper`). A checkout in a privacy-protected
+    /// as a launchd job, so the masters outlive the app however it quits
+    /// (see `DetachedHelper`). A checkout in a privacy-protected
     /// folder, or a job launchd will not take or start, runs the helper as
     /// a child as before: the sign-in still works, but its master then
     /// shares the app's fate, which the log says.
@@ -1111,9 +1111,9 @@ struct MonitorService: Sendable {
             ) {
                 return result
             }
-            Log.login.error("launchd did not run the sign-in helper; running it from the app, so its SSH master ends if the app is force-quit")
+            Log.login.error("launchd did not run the sign-in helper; running it from the app, so its SSH master ends if the app is force-quit, or quits while macOS does not let it run in the background")
         } else {
-            Log.login.notice("the checkout is in a privacy-protected folder; running the sign-in helper from the app, so its SSH master ends if the app is force-quit")
+            Log.login.notice("the checkout is in a privacy-protected folder; running the sign-in helper from the app, so its SSH master ends if the app is force-quit, or quits while macOS does not let it run in the background")
         }
         return try await runProcess(
             executable: executable,
