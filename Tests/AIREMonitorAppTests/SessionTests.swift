@@ -1367,12 +1367,17 @@ struct SessionCancelJobTests {
             stderr: "Process timed out after 30s: /usr/bin/ssh",
             exitCode: MonitorService.processTimedOutExitCode
         ))
+        // cancelJob starts a follow-up refresh before it reports the
+        // timeout; a successful refresh clears the message, and on a slow
+        // runner it could finish before the message is read. Hold it.
+        harness.backend.holdCollections(true)
         await #expect(throws: MonitorError.self) {
             try await harness.session.cancelJob(Job(jobId: "42"))
         }
         let message = try #require(harness.session.errorMessage)
         #expect(message.contains("did not answer in time"))
         #expect(!message.contains("login"))
+        harness.backend.releaseCollections()
         try await waitUntil("follow-up refresh") { !harness.session.refreshInFlight }
     }
 }
