@@ -6,13 +6,17 @@ import HPCCore
 /// instead of as a child of the app.
 ///
 /// Every process the app starts stays in the app's coalition and keeps the
-/// app as its responsible process, even after it daemonizes. Force Quit
-/// (Activity Monitor, the Dock, the Force Quit window) takes down the whole
-/// coalition, so the SSH masters the helpers start died with the app: on
-/// 2026-11-11 a force quit during an update ended every session within
-/// 3 ms. Started by launchd, the helper and every master it starts belong
-/// to the job's own coalition and are responsible for themselves, so
-/// nothing that happens to the app reaches them.
+/// app as its responsible process, even after it daemonizes, and macOS
+/// ends what an app leaves there. Force Quit (Activity Monitor, the Dock,
+/// the Force Quit window) takes down the whole coalition: on 2026-11-11 a
+/// force quit during an update ended every session within 3 ms. After a
+/// normal quit, loginwindow asks Background Task Management whether the
+/// app may run in the background and ends the leftovers about 1 s later
+/// when it may not or the check fails: later that day an update moved the
+/// bundle aside as the app quit, the check could not read it, and both
+/// sessions ended. Started by launchd, the helper and every master it
+/// starts belong to the job's own coalition and are responsible for
+/// themselves, so nothing that happens to the app reaches them.
 ///
 /// The job is plumbed like a child process. The password goes in through
 /// a FIFO on stdin, never argv or the job's environment. stdout and stderr

@@ -636,6 +636,22 @@ struct InstallScriptTests {
             return folder
         }
 
+        /// A folder with a `perl` that writes the time (seconds since 1970)
+        /// at which rename_path first moves the install aside into a
+        /// staging folder, then runs /usr/bin/perl as usual.
+        func makeMoveClockShim(log: String) throws -> String {
+            let folder = base + "/shim-clock"
+            try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+            try writeExecutable(folder + "/perl", """
+            #!/bin/bash
+            if [[ "$1" == -e && "${@: -2:1}" == '\(target)' && "${@: -1}" == *'/.Leeds HPC Monitor.install.'*'/previous.app' && ! -e '\(log)' ]]; then
+                /usr/bin/perl -MTime::HiRes=time -e 'printf "%.3f\\n", time' > '\(log)'
+            fi
+            exec /usr/bin/perl "$@"
+            """)
+            return folder
+        }
+
         /// `environment` entries are set, or removed when nil, after the
         /// defaults. `pathPrefix` goes before the stubs on PATH.
         func startInstall(
@@ -649,6 +665,8 @@ struct InstallScriptTests {
             environment["HPC_INSTALL_DIR"] = directory ?? installDirectory
             environment["HPC_LSREGISTER"] = stubs.lsregister
             environment["HPC_INSTALL_QUIT_TIMEOUT"] = String(quitTimeout)
+            // Only settleAfterQuit waits out the pause after a quit.
+            environment["HPC_INSTALL_QUIT_SETTLE"] = "0"
             environment["PATH"] = ([pathPrefix, stubs.folder].compactMap { $0 } + [environment["PATH"] ?? "/usr/bin:/bin"])
                 .joined(separator: ":")
             for key in ["HPC_INSTALL_NO_OPEN", "HPC_INSTALL_DEFAULT_DIR", "HPC_INSTALL_LOCK_TIMEOUT", "HPC_INSTALL_APP_LOCKED"] {
@@ -786,6 +804,40 @@ struct InstallScriptTests {
         #expect(running.process.terminationStatus == SIGTERM)
     }
 
+    @Test("A copy that quit keeps its bundle in place for 2 s before the swap moves it")
+    func settleAfterQuit() throws {
+        let workspace = try Workspace()
+        defer { workspace.remove() }
+        try workspace.makeSource(stamp: "one")
+        #expect(try workspace.install(["--skip-build", "--no-open"]).status == 0)
+        try workspace.makeSource(stamp: "two")
+
+        // macOS reads a quit app's bundle right after the quit, to decide
+        // whether the processes the app left running may stay, so the move
+        // must wait. The copy quits by itself after 6 s: the script cannot
+        // send it the quit request (it is no app) and waits for it to go.
+        let clock = workspace.base + "/moved-at"
+        let shim = try workspace.makeMoveClockShim(log: clock)
+        let running = try FakeRunningCopy(bundle: workspace.target, seconds: 6)
+        defer { running.stop() }
+        let install = try workspace.startInstall(
+            ["--skip-build", "--no-open"],
+            quitTimeout: 30,
+            environment: ["HPC_INSTALL_QUIT_SETTLE": nil],
+            pathPrefix: shim
+        )
+        running.process.waitUntilExit()
+        let quitAt = Date().timeIntervalSince1970
+        let result = try install.wait()
+        #expect(result.status == 0, "\(result.stderr)")
+        #expect(result.stdout.contains("Asking Leeds HPC Monitor (pid"), "the copy quit before the script asked it to")
+        #expect(FakeAppBundle.stamp(at: workspace.target) == "two")
+        let text = try String(contentsOfFile: clock, encoding: .utf8)
+        let movedAt = try #require(Double(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        // 2 s by default; the margin only absorbs how the two clocks are read.
+        #expect(movedAt - quitAt >= 1.5, "the install was moved \(movedAt - quitAt) s after the copy quit")
+    }
+
     @Test("A copy still running from .runtime must quit even when the install is current")
     func runtimeCopy() throws {
         let workspace = try Workspace()
@@ -862,6 +914,9 @@ struct InstallScriptTests {
         defer { workspace.remove() }
         #expect(try workspace.install(["--bogus"]).status == 2)
         #expect(try workspace.install(["--help"]).stdout.contains("--installed-path"))
+        let badSettle = try workspace.install(["--skip-build", "--no-open"], environment: ["HPC_INSTALL_QUIT_SETTLE": "2s"])
+        #expect(badSettle.status == 2)
+        #expect(badSettle.stderr.contains("HPC_INSTALL_QUIT_SETTLE"))
     }
 
     @Test("The same folder under another spelling (letter case, a link, an old record) is never treated as a move")
@@ -1797,6 +1852,7 @@ struct BuildBundleInstallSourceTests {
         func install(_ arguments: [String], quitTimeout: Int) throws -> ProcessResult {
             var environment = environment
             environment["HPC_INSTALL_QUIT_TIMEOUT"] = String(quitTimeout)
+            environment["HPC_INSTALL_QUIT_SETTLE"] = "0"
             return try runCommand(
                 "/bin/bash",
                 [checkout + "/scripts/install_app.sh"] + arguments,
